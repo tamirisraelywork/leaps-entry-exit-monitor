@@ -15,7 +15,8 @@ DATASET = "leaps_exit_agent"
 
 @st.cache_resource
 def get_client() -> bigquery.Client:
-    sa_info = json.loads(st.secrets["SERVICE_ACCOUNT_JSON"])
+    raw = st.secrets["SERVICE_ACCOUNT_JSON"]
+    sa_info = json.loads(raw) if isinstance(raw, str) else dict(raw)
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/bigquery"],

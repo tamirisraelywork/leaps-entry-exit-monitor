@@ -1,14 +1,18 @@
 """
-The 5-Pillar Exit Engine.
+The 5-Pillar Exit Engine — Unified 5-10x Strategy.
 
-For each active position, evaluates five independent pillars and returns
-a list of Alert objects. Alerts are calibrated to the position's role:
-  MOONSHOT  — 10x target (far OTM, higher loss tolerance, different profit ladders)
-  CORE      — 3-5x target (standard LEAPS management)
-  TACTICAL  — smaller positions, faster profit-taking
+All positions target 5-10x asymmetric returns. No role categories.
+
+Strategy philosophy:
+  • Never exit 100% early — you bought LEAPS for the asymmetric tail.
+  • Graduated scaling locks in gains while keeping core exposure running.
+  • At 3-5x (the first milestone), trim AND roll: sell some contracts to lock
+    in gains, roll the remainder forward in time to stay in the trade.
+  • Inside 90 days DTE, rolling is rarely cost-effective — just take the gain.
+  • Hard stop at -60%: LEAPS can go from -60% to 0, but rarely from -60% to 10x.
 
 Each alert has:
-  type     — string code (e.g. ROLL_DELTA, PROFIT_100, EXIT_THESIS)
+  type     — string code (e.g. ROLL_DELTA, PROFIT_300, EXIT_THESIS)
   severity — RED / AMBER / BLUE / GREEN
   subject  — short email subject
   body     — full formatted email body
@@ -34,49 +38,28 @@ class Alert:
 
 
 # ---------------------------------------------------------------------------
-# Thresholds (tunable per role)
+# Unified thresholds — single set for all positions
 # ---------------------------------------------------------------------------
 
-_THRESHOLDS = {
-    "MOONSHOT": {
-        "stop_loss":         -70,   # -70% before exit alert (lottery tickets need room)
-        "profit_first":      200,   # +200% = 3x → first scale-out signal
-        "profit_second":     500,   # +500% = 6x → aggressive trim
-        "profit_final":      900,   # +900% ≈ 10x → full exit
-        "delta_high":        0.50,  # moonshots shouldn't go deep ITM
-        "delta_low":         0.07,  # if delta this low, nearly worthless
-        "dte_review":        270,   # suggest roll if profitable and time shrinking
-        "dte_urgent":         90,   # exit all losers
-        "dte_hard_stop":      60,   # exit everything
-    },
-    "CORE": {
-        "stop_loss":         -50,
-        "profit_first":       50,
-        "profit_second":     100,
-        "profit_third":      200,
-        "profit_final":      300,
-        "delta_high":        0.90,  # roll when delta this high
-        "delta_low":         0.25,  # check thesis if delta this low
-        "dte_review":        270,
-        "dte_urgent":         90,
-        "dte_hard_stop":      60,
-    },
-    "TACTICAL": {
-        "stop_loss":         -40,
-        "profit_first":       50,
-        "profit_final":      100,
-        "delta_high":        0.90,
-        "delta_low":         0.25,
-        "dte_review":        270,
-        "dte_urgent":         90,
-        "dte_hard_stop":      60,
-    },
+_T = {
+    # Risk management
+    "stop_loss":      -60,   # -60% max pain. Below here recovery is statistically rare.
+
+    # Profit scaling ladder (graduated — never sell all at once)
+    "profit_100":    100,   # 2x: recover initial cost basis. Sell ~20%.
+    "profit_300":    300,   # 4x: first major milestone. Trim 30% + consider rolling rest.
+    "profit_600":    600,   # 7x: deep in the money on the trade. Trim hard, trail rest.
+    "profit_900":    900,   # 10x: target hit. Exit everything remaining.
+
+    # Greeks
+    "delta_high":   0.90,   # above this = 1:1 stock exposure, option decay still hurts
+    "delta_low":    0.10,   # below this = option is near-worthless, reassess
+
+    # Time (DTE)
+    "dte_review":   270,    # 9 months: roll window opens when profitable
+    "dte_urgent":    90,    # 3 months: exit losers; profitable = take gains / roll now
+    "dte_hard_stop": 60,    # 2 months: emergency exit regardless of P&L
 }
-
-
-def _t(role: str, key: str):
-    """Get threshold for a role, falling back to CORE if role unknown."""
-    return _THRESHOLDS.get(role, _THRESHOLDS["CORE"]).get(key)
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +96,15 @@ def _header(pos: dict, market: dict) -> str:
     dte_days = market.get("dte")
     iv_rank  = market.get("iv_rank")
     score    = market.get("thesis_score")
-    ptype    = pos.get("position_type", "CORE")
-    target   = pos.get("target_return", "")
 
     pnl_str  = f"{pnl:+.1f}%" if pnl is not None else "N/A"
     mid_str  = f"${mid:.2f}" if mid else "N/A"
+    cost_basis = ""
+    try:
+        cb = float(entry_p) * float(qty) * 100
+        cost_basis = f"  Cost Basis:   ${cb:,.0f}\n"
+    except Exception:
+        pass
 
     score_emoji = "✅" if score and score >= 70 else ("⚠️" if score and score >= 60 else "❌")
 
@@ -127,8 +114,8 @@ def _header(pos: dict, market: dict) -> str:
         f"{'─'*50}\n"
         f"  Stock:        {ticker}\n"
         f"  Contract:     {exp} ${strike} Call  |  {qty} contracts\n"
-        f"  Role:         {ptype}  ({target} target)\n"
-        f"  Entry price:  ${entry_p}/share\n"
+        f"  Avg. Price:   ${entry_p}/share\n"
+        + cost_basis +
         f"  Current mid:  {mid_str}\n"
         f"  P&L:          {pnl_str}\n"
         f"{'─'*50}\n"
@@ -159,20 +146,20 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     Returns: list of Alert objects (zero or more).
     """
     alerts: list[Alert] = []
-    role = position.get("position_type", "CORE")
 
-    entry_price = position.get("entry_price")
-    ticker      = position.get("ticker", "?")
-    exp_date    = position.get("expiration_date")
+    entry_price  = position.get("entry_price")
+    ticker       = position.get("ticker", "?")
+    exp_date     = position.get("expiration_date")
+    qty          = position.get("quantity", 1)
 
-    mid         = market.get("mid")
-    delta       = market.get("delta")
-    dte_days    = market.get("dte") or _dte(exp_date)
-    iv_rank     = market.get("iv_rank")
-    thesis_score= market.get("thesis_score")
+    mid          = market.get("mid")
+    delta        = market.get("delta")
+    dte_days     = market.get("dte") or _dte(exp_date)
+    iv_rank      = market.get("iv_rank")
+    thesis_score = market.get("thesis_score")
 
-    pnl         = _pnl_pct(entry_price, mid)
-    hdr         = lambda: _header(position, {**market, "pnl_pct": pnl})
+    pnl  = _pnl_pct(entry_price, mid)
+    hdr  = lambda: _header(position, {**market, "pnl_pct": pnl})
 
     # -----------------------------------------------------------------------
     # PILLAR 1 — Fundamental: Is the thesis still intact?
@@ -186,11 +173,11 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     hdr()
                     + "SIGNAL: EXIT — THESIS BROKEN\n"
                     + f"{'─'*50}\n"
-                    + f"  Thesis score has fallen to {thesis_score}/100 (below 60 threshold).\n\n"
+                    + f"  Thesis score has fallen to {thesis_score}/100 (threshold: 60).\n\n"
                     + "  The fundamental reason for holding this LEAPS is gone.\n"
-                    + "  Even if the option is currently profitable, a broken thesis\n"
-                    + "  means the asymmetric upside that justified this position\n"
-                    + "  no longer exists. Exit now.\n\n"
+                    + "  A broken thesis means the asymmetric upside that justified\n"
+                    + "  this position no longer exists. P&L at entry time is irrelevant —\n"
+                    + "  exit before the market prices in the deterioration fully.\n\n"
                     + "  ACTION: Close the position at market open.\n"
                 ),
                 context=market,
@@ -200,90 +187,71 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # PILLAR 2 — Greeks: Is the leverage still working?
     # -----------------------------------------------------------------------
     if delta is not None:
-        delta_high = _t(role, "delta_high")
-        delta_low  = _t(role, "delta_low")
-
-        if role == "MOONSHOT":
-            # For moonshots, a RISING delta means the option went deep ITM —
-            # the lottery profile is gone and it now behaves like a stock.
-            if delta > delta_high:
-                action = (
-                    "Your moonshot has gone deep ITM (delta > 0.50).\n"
-                    "  It no longer has the asymmetric leverage profile of a lottery ticket.\n\n"
-                    f"  If the stock continues rising: the remaining upside is limited.\n"
-                    "  Consider: rolling to a higher, further-OTM strike to restore the 10x profile.\n"
-                    "  Or: take profits if P&L > 200% and redeploy."
-                )
+        if delta > _T["delta_high"]:
+            if pnl is not None and pnl < 0:
+                # Deep ITM AND underwater — worst of both worlds
                 alerts.append(Alert(
-                    type="ROLL_DELTA", severity="BLUE",
-                    subject=f"🔵 ROLL — Moonshot Went Deep ITM: {ticker}  Delta: {delta:.2f}",
-                    body=hdr() + "SIGNAL: ROLL — LEVERAGE PROFILE CHANGED\n" + f"{'─'*50}\n  {action}\n",
-                    context=market,
-                ))
-
-            elif delta < delta_low:
-                alerts.append(Alert(
-                    type="DELTA_WARN", severity="AMBER",
-                    subject=f"⚠️ WATCH — {ticker} Moonshot Going OTM  Delta: {delta:.2f}",
+                    type="ROLL_DELTA", severity="RED",
+                    subject=f"🔴 EXIT — Leverage Lost & Underwater: {ticker}  Δ {delta:.2f}  P&L: {pnl:+.1f}%",
                     body=(
                         hdr()
-                        + "SIGNAL: WATCH — DELTA VERY LOW\n"
+                        + "SIGNAL: EXIT — LEVERAGE LOST AND UNDERWATER\n"
                         + f"{'─'*50}\n"
-                        + f"  Delta has dropped to {delta:.2f}. The option is becoming very far OTM.\n"
-                        + "  This is normal for moonshots during stock pullbacks — but review\n"
-                        + "  whether the thesis is still intact and whether enough time remains.\n"
+                        + f"  Delta is {delta:.2f} (above 0.90) AND the position is at {pnl:+.1f}%.\n"
+                        + "  This is the worst combination for a long option:\n"
+                        + "  • You have stock-like downside exposure\n"
+                        + "  • You're still paying option-level time decay\n"
+                        + "  • You're already losing money\n\n"
+                        + "  Rolling this position locks in losses AND starts the decay\n"
+                        + "  clock again on the new contract. Do not roll.\n\n"
+                        + "  ACTION: Exit now. Re-evaluate thesis before re-entering.\n"
+                    ),
+                    context=market,
+                ))
+            else:
+                # Deep ITM but profitable — roll to restore leverage
+                alerts.append(Alert(
+                    type="ROLL_DELTA", severity="BLUE",
+                    subject=f"🔵 ROLL — Leverage Exhausted: {ticker}  Δ {delta:.2f}  P&L: {pnl:+.1f}%",
+                    body=(
+                        hdr()
+                        + "SIGNAL: ROLL — DELTA TOO HIGH\n"
+                        + f"{'─'*50}\n"
+                        + f"  Delta is {delta:.2f}. Above 0.90 you move 1-for-1 with the stock\n"
+                        + "  but still carry option time decay. The leverage is gone.\n\n"
+                        + "  RECOMMENDED ACTION:\n"
+                        + "  → Sell current contract (lock in gains)\n"
+                        + "  → Buy same expiry, higher strike (target Δ ~0.70)\n"
+                        + "  → This resets leverage and reduces capital at risk\n\n"
+                        + "  ROLL CHECK: Only roll if debit required is < 20% of your\n"
+                        + "  original premium paid. Otherwise take the full profit.\n"
                     ),
                     context=market,
                 ))
 
-        else:  # CORE or TACTICAL
-            if delta > delta_high:
-                if pnl is not None and pnl < 0:
-                    # Underwater AND deep ITM — the worst outcome for a long option
-                    alerts.append(Alert(
-                        type="ROLL_DELTA", severity="RED",
-                        subject=f"🔴 EXIT — Leverage Lost & Underwater: {ticker}  Delta: {delta:.2f}  P&L: {pnl:+.1f}%",
-                        body=(
-                            hdr()
-                            + "SIGNAL: EXIT — LEVERAGE LOST AND UNDERWATER\n"
-                            + f"{'─'*50}\n"
-                            + f"  Delta is {delta:.2f} (above 0.90) AND the position is at {pnl:+.1f}%.\n"
-                            + "  This is the worst combination for a long option:\n"
-                            + "  you have stock-like risk but option-level decay, and you're losing.\n\n"
-                            + "  Rolling this position amplifies the loss. Exit now.\n"
-                            + "  Re-evaluate the thesis before re-entering.\n"
-                        ),
-                        context=market,
-                    ))
-                else:
-                    alerts.append(Alert(
-                        type="ROLL_DELTA", severity="BLUE",
-                        subject=f"🔵 ROLL — Leverage Exhausted: {ticker}  Delta: {delta:.2f}",
-                        body=(
-                            hdr()
-                            + "SIGNAL: ROLL — DELTA TOO HIGH\n"
-                            + f"{'─'*50}\n"
-                            + f"  Delta is {delta:.2f}. At this level you move 1-for-1 with the stock\n"
-                            + "  but still carry option time decay. The leverage benefit is gone.\n\n"
-                            + "  RECOMMENDED ACTION:\n"
-                            + "  → Sell current contract\n"
-                            + "  → Buy same expiry, higher strike (target delta ~0.70)\n"
-                            + "  → This resets your leverage and reduces your capital at risk.\n\n"
-                            + "  Note: Only roll if the debit required is < 20% of your\n"
-                            + "  original premium paid. Otherwise, consider a full exit.\n"
-                        ),
-                        context=market,
-                    ))
+        elif delta < _T["delta_low"]:
+            alerts.append(Alert(
+                type="DELTA_WARN", severity="AMBER",
+                subject=f"⚠️ WATCH — {ticker} Far OTM  Δ {delta:.2f}",
+                body=(
+                    hdr()
+                    + "SIGNAL: WATCH — DELTA VERY LOW\n"
+                    + f"{'─'*50}\n"
+                    + f"  Delta has dropped to {delta:.2f}. The option is deep out-of-the-money\n"
+                    + "  and approaching near-worthless territory.\n\n"
+                    + "  Review:\n"
+                    + "  • Is the thesis still intact? (thesis score above)\n"
+                    + "  • How much DTE is left? (if < 180d and deep OTM, consider exiting)\n"
+                    + "  • Would the premium be better deployed in a fresh position?\n"
+                ),
+                context=market,
+            ))
 
     # -----------------------------------------------------------------------
     # PILLAR 3 — Time: Is theta becoming a threat?
     # -----------------------------------------------------------------------
     if dte_days is not None:
-        hard_stop  = _t(role, "dte_hard_stop")   # 60
-        urgent     = _t(role, "dte_urgent")       # 90
-        review     = _t(role, "dte_review")       # 270
-
-        if dte_days < hard_stop:
+        if dte_days < _T["dte_hard_stop"]:
             alerts.append(Alert(
                 type="EXIT_TIME_URGENT", severity="RED",
                 subject=f"🔴 EMERGENCY EXIT — DTE Critical: {ticker}  {dte_days} days left",
@@ -292,16 +260,15 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "SIGNAL: EMERGENCY EXIT — TIME CRITICAL\n"
                     + f"{'─'*50}\n"
                     + f"  Only {dte_days} days remain to expiration.\n"
-                    + "  Theta decay in the final 60 days is exponential and devastating\n"
-                    + "  for long options. Exit immediately regardless of P&L.\n\n"
-                    + "  If you still believe in the thesis, wait for the position to close,\n"
-                    + "  then re-enter with fresh LEAPS (>= 18 months out).\n\n"
-                    + "  ACTION: Close position at market open. No exceptions.\n"
+                    + "  Theta decay in the final 60 days is exponential and destroys\n"
+                    + "  premium regardless of underlying movement.\n\n"
+                    + "  ACTION: Exit immediately regardless of P&L. No exceptions.\n"
+                    + "  If thesis is still valid, re-enter with new LEAPS (>= 18 months).\n"
                 ),
                 context=market,
             ))
 
-        elif dte_days < urgent:
+        elif dte_days < _T["dte_urgent"]:
             if pnl is not None and pnl < 0:
                 alerts.append(Alert(
                     type="EXIT_TIME_URGENT", severity="RED",
@@ -311,13 +278,14 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "SIGNAL: EXIT — THETA DANGER ZONE\n"
                         + f"{'─'*50}\n"
                         + f"  {dte_days} days left and the position is at {pnl:+.1f}%.\n"
-                        + "  Inside 90 days, theta acceleration will compound losses rapidly.\n"
+                        + "  Inside 90 days, theta acceleration compounds losses rapidly.\n"
                         + "  There is not enough time left for a meaningful recovery.\n\n"
+                        + "  Do NOT roll a losing position inside 90 days — it amplifies losses.\n\n"
                         + "  ACTION: Exit to preserve remaining capital.\n"
                     ),
                     context=market,
                 ))
-            else:
+            elif pnl is not None:
                 # Profitable with < 90 days — take the gain, don't roll inside 3 months
                 alerts.append(Alert(
                     type="EXIT_TIME_URGENT", severity="RED",
@@ -327,17 +295,17 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "SIGNAL: TAKE PROFIT — DTE < 90 DAYS\n"
                         + f"{'─'*50}\n"
                         + f"  {dte_days} days left with a {pnl:+.1f}% gain.\n"
-                        + "  Inside 90 days, rolling is rarely cost-effective because the\n"
-                        + "  new contract will immediately experience the same theta decay.\n\n"
-                        + "  ACTION: Take the profit. Close the position now.\n"
-                        + "  If thesis is still strong, re-enter with fresh LEAPS.\n"
+                        + "  Inside 90 days, rolling is rarely cost-effective: the new\n"
+                        + "  contract starts decaying at the same accelerated rate.\n\n"
+                        + "  ACTION: Take the full profit. Close now.\n"
+                        + "  If thesis is still strong, re-enter fresh LEAPS (>= 18 months).\n"
                     ),
                     context=market,
                 ))
 
-        elif dte_days < review:
+        elif dte_days < _T["dte_review"]:
+            # 90-270 days — the roll window
             if pnl is not None and pnl > 0:
-                # Profitable + 90-270 days → ideal roll window
                 alerts.append(Alert(
                     type="ROLL_TIME", severity="BLUE",
                     subject=f"🔵 ROLL — Time Running Down: {ticker}  DTE: {dte_days}  P&L: {pnl:+.1f}%",
@@ -346,14 +314,14 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "SIGNAL: ROLL — TIME MANAGEMENT\n"
                         + f"{'─'*50}\n"
                         + f"  {dte_days} days remain and you are profitable at {pnl:+.1f}%.\n"
-                        + "  This is the ideal window to roll: you have time to act without\n"
+                        + "  This is the ideal window to roll: enough time to act without\n"
                         + "  urgency, and rolling while profitable locks in intrinsic gains.\n\n"
                         + "  RECOMMENDED ACTION:\n"
                         + "  → Sell current contract\n"
                         + "  → Buy same strike, + 12 months expiration\n"
-                        + "  → This extends your runway and preserves the trade thesis.\n\n"
+                        + "  → Extends your runway toward the 5-10x target\n\n"
                         + "  ROLL CHECK: Only proceed if the roll debit is < 20% of your\n"
-                        + "  original premium paid. Otherwise exit and redeploy.\n"
+                        + "  original Avg. Price. If the debit is higher, exit and redeploy.\n"
                     ),
                     context=market,
                 ))
@@ -366,9 +334,9 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "SIGNAL: WATCH — TIME + LOSS WARNING\n"
                         + f"{'─'*50}\n"
                         + f"  {dte_days} days left and position is at {pnl:+.1f}%.\n"
-                        + "  Do not roll a losing position — it amplifies losses.\n"
-                        + "  Monitor closely. If the thesis is still intact, hold.\n"
-                        + "  If thesis is weakening, plan your exit before DTE < 90.\n"
+                        + "  Do NOT roll a losing position — it amplifies losses.\n"
+                        + "  Monitor closely. If thesis is intact, hold and let it recover.\n"
+                        + "  If thesis is weakening, plan your exit before DTE hits 90.\n"
                     ),
                     context=market,
                 ))
@@ -377,159 +345,129 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # PILLAR 4 — Profit: Are you capturing the asymmetric return?
     # -----------------------------------------------------------------------
     if pnl is not None:
-        stop_loss = _t(role, "stop_loss")
 
-        if pnl <= stop_loss:
+        if pnl <= _T["stop_loss"]:
             alerts.append(Alert(
                 type="EXIT_STOP", severity="RED",
-                subject=f"🔴 STOP LOSS HIT: {ticker}  P&L: {pnl:+.1f}%  ({role})",
+                subject=f"🔴 STOP LOSS HIT: {ticker}  P&L: {pnl:+.1f}%",
                 body=(
                     hdr()
                     + "SIGNAL: STOP LOSS\n"
                     + f"{'─'*50}\n"
-                    + f"  Position is at {pnl:+.1f}% (stop loss: {stop_loss}%).\n"
-                    + "  Continued holding risks further capital destruction.\n\n"
+                    + f"  Position is at {pnl:+.1f}% (stop: {_T['stop_loss']}%).\n"
+                    + "  Below -60%, statistical recovery to breakeven is very unlikely\n"
+                    + "  within a reasonable timeframe.\n\n"
                     + "  ACTION: Exit the position. Preserve remaining capital.\n"
-                    + "  You can re-enter later if the thesis recovers.\n"
+                    + "  Thesis may still be valid — re-enter fresh LEAPS if it is.\n"
                 ),
                 context=market,
             ))
 
-        elif role == "MOONSHOT":
-            if pnl >= 900:
-                alerts.append(Alert(
-                    type="PROFIT_900", severity="RED",
-                    subject=f"🔴 SELL — Near 10x: {ticker}  P&L: {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: 10x TARGET REACHED — SELL\n"
-                        + f"{'─'*50}\n"
-                        + f"  Your moonshot is up {pnl:+.1f}% — near the 10x target!\n"
-                        + (f"  IV Rank is {iv_rank:.1f}% — market is hyping this stock now.\n" if iv_rank else "")
-                        + "  This is your exit window. Sell to someone else's FOMO.\n\n"
-                        + "  ACTION: Exit the full position.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 500:
-                alerts.append(Alert(
-                    type="PROFIT_500", severity="BLUE",
-                    subject=f"🔵 SCALE OUT — {ticker} Up 6x: {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: SCALE OUT — UP 6x\n"
-                        + f"{'─'*50}\n"
-                        + f"  Your moonshot is up {pnl:+.1f}%. This is a 6x return.\n"
-                        + "  Recommendation: Sell 50% of position now.\n"
-                        + "  Hold the remaining 50% for the 10x target.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 200:
-                alerts.append(Alert(
-                    type="PROFIT_200", severity="AMBER",
-                    subject=f"⚠️ SCALE — {ticker} Moonshot Up 3x: {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: SCALE OUT — UP 3x (FIRST TRIM)\n"
-                        + f"{'─'*50}\n"
-                        + f"  Your moonshot is up {pnl:+.1f}% — a 3x return.\n"
-                        + "  Recommendation: Sell 25% to recover part of your initial cost.\n"
-                        + "  Let the remaining 75% ride toward the 10x target.\n\n"
-                        + "  This locks in profit while keeping most exposure intact.\n"
-                    ),
-                    context=market,
-                ))
+        elif pnl >= _T["profit_900"]:
+            alerts.append(Alert(
+                type="PROFIT_900", severity="RED",
+                subject=f"🔴 10x TARGET HIT — EXIT ALL: {ticker}  P&L: {pnl:+.1f}%",
+                body=(
+                    hdr()
+                    + "SIGNAL: 10x TARGET REACHED — FULL EXIT\n"
+                    + f"{'─'*50}\n"
+                    + f"  Your position is up {pnl:+.1f}% — you've hit the 10x target!\n"
+                    + (f"  IV Rank is {iv_rank:.1f}% — market euphoria is at your back.\n" if iv_rank else "")
+                    + "\n"
+                    + "  This is your full exit. You are selling to someone else's FOMO.\n"
+                    + "  Do not wait for more — the final move from here has lower\n"
+                    + "  probability and you've already captured the asymmetric return.\n\n"
+                    + "  ACTION: Exit the entire remaining position.\n"
+                ),
+                context=market,
+            ))
 
-        elif role == "CORE":
-            if pnl >= 300:
-                iv_note = f"  IV Rank is {iv_rank:.1f}% — market FOMO is your buyer.\n" if iv_rank and iv_rank > 65 else ""
-                alerts.append(Alert(
-                    type="PROFIT_300", severity="RED" if (iv_rank and iv_rank > 65) else "BLUE",
-                    subject=f"{'🔴 SELL ALL' if (iv_rank and iv_rank > 65) else '🔵 CONSIDER EXIT'} — {ticker} Core Up {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: 4x RETURN — TARGET ZONE\n"
-                        + f"{'─'*50}\n"
-                        + f"  Core position is up {pnl:+.1f}%.\n"
-                        + iv_note
-                        + "  This is beyond your 3-5x target range.\n"
-                        + "  Recommendation: Exit the full position.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 200:
-                alerts.append(Alert(
-                    type="PROFIT_200", severity="BLUE",
-                    subject=f"🔵 TRIM HARD — {ticker} Core Up {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: 3x RETURN — AGGRESSIVE TRIM\n"
-                        + f"{'─'*50}\n"
-                        + f"  Core position is up {pnl:+.1f}% — a 3x return.\n"
-                        + "  Recommendation: Sell 75% of position. Trail the last 25%\n"
-                        + "  toward the 5x target.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 100:
-                alerts.append(Alert(
-                    type="PROFIT_100", severity="AMBER",
-                    subject=f"⚠️ SCALE — {ticker} Core Up {pnl:+.1f}%  (2x)",
-                    body=(
-                        hdr()
-                        + "SIGNAL: 2x RETURN — SCALE OUT\n"
-                        + f"{'─'*50}\n"
-                        + f"  Core position is up {pnl:+.1f}%.\n"
-                        + "  Recommendation: Sell another 25% (you should have\n"
-                        + "  already sold 25-33% at the 50% mark).\n"
-                        + "  Let the remaining position run toward 3-5x.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 50:
-                alerts.append(Alert(
-                    type="PROFIT_50", severity="AMBER",
-                    subject=f"⚠️ FIRST SCALE — {ticker} Core Up {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: FIRST PROFIT TARGET HIT\n"
-                        + f"{'─'*50}\n"
-                        + f"  Core position is up {pnl:+.1f}%.\n"
-                        + "  Recommendation: Sell 25-33% of position to lock in gains.\n"
-                        + "  Keep the majority invested — your target is 3-5x.\n"
-                    ),
-                    context=market,
-                ))
+        elif pnl >= _T["profit_600"]:
+            roll_note = (
+                "\n  TIME NOTE: You still have enough DTE to roll the trailing\n"
+                "  25% to a further-dated contract if you want to stay in the trade.\n"
+                if dte_days and dte_days > _T["dte_urgent"] else
+                "\n  TIME NOTE: DTE is short — exit the full position rather than rolling.\n"
+            )
+            alerts.append(Alert(
+                type="PROFIT_600", severity="BLUE",
+                subject=f"🔵 TRIM HARD — {ticker} Up 7x: {pnl:+.1f}%",
+                body=(
+                    hdr()
+                    + "SIGNAL: TRIM HARD — UP 7x\n"
+                    + f"{'─'*50}\n"
+                    + f"  Position is up {pnl:+.1f}% — a 7x return. Outstanding.\n\n"
+                    + "  RECOMMENDED ACTION:\n"
+                    + "  → Sell 75% of position now to lock in the 7x gains\n"
+                    + "  → Keep 25% trailing toward the 10x target\n"
+                    + "  → Set a mental stop on the trailing 25%: if it gives back\n"
+                    + "    50% of gains, exit the remainder\n"
+                    + roll_note
+                ),
+                context=market,
+            ))
 
-        elif role == "TACTICAL":
-            if pnl >= 100:
-                alerts.append(Alert(
-                    type="PROFIT_100", severity="RED",
-                    subject=f"🔴 EXIT — Tactical Target Hit: {ticker}  {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: TACTICAL EXIT TARGET\n"
-                        + f"{'─'*50}\n"
-                        + f"  Tactical position is up {pnl:+.1f}%.\n"
-                        + "  Recommendation: Exit the full position. A 2x on a tactical\n"
-                        + "  position is the primary target. Don't get greedy.\n"
-                    ),
-                    context=market,
-                ))
-            elif pnl >= 50:
-                alerts.append(Alert(
-                    type="PROFIT_50", severity="AMBER",
-                    subject=f"⚠️ SCALE — Tactical: {ticker}  Up {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: SCALE TACTICAL POSITION\n"
-                        + f"{'─'*50}\n"
-                        + f"  Tactical position is up {pnl:+.1f}%.\n"
-                        + "  Recommendation: Take 50% off the table now.\n"
-                    ),
-                    context=market,
-                ))
+        elif pnl >= _T["profit_300"]:
+            # 4x milestone — the 3-5x zone the user specifically mentioned
+            # Trim AND recommend rolling the remainder for maximum return capture
+            if dte_days and dte_days > _T["dte_urgent"]:
+                roll_action = (
+                    "  → For the remaining 50%:\n"
+                    f"    DTE = {dte_days} days. If < 270 days remain, consider rolling:\n"
+                    "    Sell current contract, buy same strike + 12 months.\n"
+                    "    This keeps you in the trade at reduced cost basis while\n"
+                    "    targeting the 7-10x level.\n"
+                    "    Roll check: debit must be < 20% of original Avg. Price.\n"
+                )
+            else:
+                roll_action = (
+                    "  → For the remaining 50%:\n"
+                    f"    DTE = {dte_days} days — too short to roll cost-effectively.\n"
+                    "    Exit the remainder and redeploy into fresh LEAPS if\n"
+                    "    thesis is still intact and you want more upside.\n"
+                )
+
+            alerts.append(Alert(
+                type="PROFIT_300", severity="AMBER",
+                subject=f"⚠️ TRIM & ROLL — {ticker} Up 4x: {pnl:+.1f}%",
+                body=(
+                    hdr()
+                    + "SIGNAL: TRIM & CONSIDER ROLLING — UP 4x\n"
+                    + f"{'─'*50}\n"
+                    + f"  Position is up {pnl:+.1f}% — a 4x return. You've hit your\n"
+                    + "  first major profit milestone (3-5x target zone).\n\n"
+                    + "  Strategy: Take serious profits while keeping upside exposure.\n\n"
+                    + "  RECOMMENDED ACTION:\n"
+                    + "  → Sell 50% of contracts now (lock in the 4x on half)\n"
+                    + roll_action
+                    + "\n"
+                    + "  This approach:\n"
+                    + "  ✓ Secures substantial gains that cannot be taken away\n"
+                    + "  ✓ Keeps exposure to the 7-10x move if thesis plays out\n"
+                    + "  ✓ Reduces capital at risk significantly\n"
+                ),
+                context=market,
+            ))
+
+        elif pnl >= _T["profit_100"]:
+            alerts.append(Alert(
+                type="PROFIT_100", severity="AMBER",
+                subject=f"⚠️ FIRST TRIM — {ticker} Up 2x: {pnl:+.1f}%",
+                body=(
+                    hdr()
+                    + "SIGNAL: FIRST PROFIT MILESTONE — UP 2x\n"
+                    + f"{'─'*50}\n"
+                    + f"  Position is up {pnl:+.1f}% — you've doubled your money.\n\n"
+                    + "  RECOMMENDED ACTION:\n"
+                    + "  → Sell 20-25% of position\n"
+                    + "  → This recovers your initial cost basis on those contracts\n"
+                    + "  → The majority stays on — your target is 5-10x, not 2x\n\n"
+                    + "  Do NOT sell the full position here. Selling at 2x is the\n"
+                    + "  most common mistake in LEAPS trading — it sacrifices the\n"
+                    + "  asymmetric return that justifies buying options in the first place.\n"
+                ),
+                context=market,
+            ))
 
     return alerts
 
@@ -590,8 +528,8 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
     body = (
         f"{'─'*50}\n"
         f"WATCHLIST TICKER:  {ticker}\n"
-        f"Current Price:     ${price:.2f}\n" if price else ""
-        f"Entry Score:       {score}/100\n"
+        + (f"Current Price:     ${price:.2f}\n" if price else "")
+        + f"Entry Score:       {score}/100\n"
         f"{'─'*50}\n"
         f"SIGNALS\n"
         + "\n".join(f"  ✓ {r}" for r in reasons)
@@ -599,9 +537,10 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
         f"RECOMMENDATION:  {action}\n\n"
         + (
             "  When buying, target:\n"
-            "  • Delta:    0.70-0.75  (for CORE)  |  0.10-0.20  (for MOONSHOT)\n"
-            "  • Strike:   20-25% OTM from current price\n"
-            "  • Expiry:   Furthest available >= 18 months\n"
+            "  • Delta:   0.25-0.40  (moderate OTM — balanced leverage / cost)\n"
+            "  • Strike:  15-25% OTM from current price\n"
+            "  • Expiry:  Furthest available >= 18 months\n"
+            "  • Target return: 5-10x from this entry\n"
             if score >= 60 else
             "  Keep monitoring. Alert again when score reaches 60+.\n"
         )

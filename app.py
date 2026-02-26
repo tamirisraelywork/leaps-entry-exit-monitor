@@ -153,10 +153,13 @@ if page == "Dashboard":
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Active Positions",   len(active))
     s2.metric("Watchlist",          len(watchlist))
-    moonshots = len([p for p in active if p.get("position_type") == "MOONSHOT"])
-    cores     = len([p for p in active if p.get("position_type") == "CORE"])
-    s3.metric("Moonshots (10x)",    moonshots)
-    s4.metric("Core (3-5x)",        cores)
+    # Portfolio cost basis
+    total_cost = sum(
+        (p.get("entry_price") or 0) * (p.get("quantity") or 0) * 100
+        for p in active
+    )
+    s3.metric("Portfolio Cost Basis", f"${total_cost:,.0f}" if total_cost else "N/A")
+    s4.metric("Avg Contracts/Position", f"{sum(p.get('quantity') or 0 for p in active) / len(active):.1f}" if active else "N/A")
 
     st.markdown("---")
 
@@ -171,10 +174,9 @@ if page == "Dashboard":
             exp      = pos.get("expiration_date", "?")
             qty      = pos.get("quantity", "?")
             ep       = pos.get("entry_price")
-            role     = pos.get("position_type", "CORE")
-            target   = pos.get("target_return", "")
             notes    = pos.get("notes", "")
             pos_id   = str(pos.get("id", ""))
+            cost_basis = (ep or 0) * (qty or 0) * 100
 
             with st.spinner(f"Loading {ticker}..."):
                 if force_check:
@@ -206,9 +208,9 @@ if page == "Dashboard":
             with st.container(border=True):
                 h1, h2 = st.columns([5, 1])
                 with h1:
+                    cb_str = f"  ·  Cost Basis ${cost_basis:,.0f}" if cost_basis else ""
                     st.markdown(
-                        f"### {ticker} — {exp} ${strike} Call  ·  {qty} contract{'s' if int(qty or 1) > 1 else ''}\n"
-                        f"**Role:** {role}  ({target} target)"
+                        f"### {ticker} — {exp} ${strike} Call  ·  {qty} contract{'s' if int(qty or 1) > 1 else ''}{cb_str}"
                     )
                 with h2:
                     st.markdown(
@@ -406,14 +408,22 @@ elif page == "Add Position":
                 exp_date   = st.date_input("Expiration Date *", min_value=date.today() + timedelta(days=30))
                 opt_type   = st.selectbox("Option Type", ["CALL", "PUT"])
             with c2:
-                entry_price_ex = st.number_input("Entry Price ($/share) *", min_value=0.01, step=0.01, format="%.2f",
-                                                  help="The premium you paid per share (multiply by 100 for total per contract)")
-                qty_ex     = st.number_input("Quantity (contracts) *", min_value=1, step=1, value=1)
+                entry_price_ex = st.number_input(
+                    "Avg. Price $/share *",
+                    min_value=0.01, step=0.01, format="%.2f",
+                    help="From IBKR 'Avg. Price' column — the premium you paid per share (× 100 = cost per contract)"
+                )
+                qty_ex     = st.number_input(
+                    "Pos (number of contracts) *",
+                    min_value=1, step=1, value=1,
+                    help="From IBKR 'Pos' column"
+                )
                 entry_date = st.date_input("Entry Date *", max_value=date.today())
-                role_ex    = st.selectbox("Position Role", ["CORE", "MOONSHOT", "TACTICAL"],
-                                          help="MOONSHOT = 10x target | CORE = 3-5x target | TACTICAL = shorter-term")
+                # Cost Basis computed display (read-only)
+                cb_display = entry_price_ex * qty_ex * 100 if entry_price_ex and qty_ex else 0
+                st.metric("Cost Basis (computed)", f"${cb_display:,.2f}",
+                          help="Pos × 100 × Avg. Price — verify this matches IBKR 'Cost Basis'")
 
-            target_map = {"MOONSHOT": "10x", "CORE": "3-5x", "TACTICAL": "tactical"}
             mode_ex    = st.radio("Mode", ["ACTIVE", "WATCHLIST"], horizontal=True,
                                   help="ACTIVE = monitoring with exit alerts | WATCHLIST = watching for entry signals")
             notes_ex   = st.text_area("Notes (optional)", placeholder="e.g. Bought on earnings dip")
@@ -446,8 +456,10 @@ elif page == "Add Position":
 
             # Run a quick pillar check on preview
             dummy_pos = {
-                "ticker":        ticker_ex, "entry_price": entry_price_ex,
-                "position_type": role_ex, "expiration_date": exp_date, "mode": mode_ex,
+                "ticker":           ticker_ex,
+                "entry_price":      entry_price_ex,
+                "expiration_date":  exp_date,
+                "mode":             mode_ex,
             }
             dummy_mkt = {"mid": mid, "delta": delta, "dte": dte_d, "iv_rank": None, "thesis_score": score}
             preview_alerts = evaluate(dummy_pos, dummy_mkt) if mode_ex == "ACTIVE" else []
@@ -471,8 +483,8 @@ elif page == "Add Position":
                     "entry_delta":        delta,
                     "entry_iv_rank":      None,
                     "entry_thesis_score": score,
-                    "position_type":      role_ex,
-                    "target_return":      target_map.get(role_ex, ""),
+                    "position_type":      "STANDARD",
+                    "target_return":      "5-10x",
                     "mode":               mode_ex,
                     "notes":              notes_ex,
                 })
@@ -576,13 +588,20 @@ elif page == "Settings":
 
     st.markdown(
         """
-        | Signal | MOONSHOT (10x) | CORE (3-5x) | TACTICAL |
-        |---|---|---|---|
-        | **Stop loss** | -70% | -50% | -40% |
-        | **First profit** | +200% (3x) | +50% | +50% |
-        | **Roll delta trigger** | Δ > 0.50 (went ITM) | Δ > 0.90 | Δ > 0.90 |
-        | **DTE roll window** | 270 days | 270 days | 270 days |
-        | **DTE hard exit** | 60 days | 60 days | 60 days |
+        All positions use a single unified threshold set targeting **5-10x returns**.
+
+        | Signal | Threshold | Action |
+        |---|---|---|
+        | **Stop loss** | -60% | Exit — recovery from here is statistically rare |
+        | **First trim** | +100% (2x) | Sell 20-25% — recover initial cost basis |
+        | **Trim & Roll** | +300% (4x) | Sell 50% to lock gains; roll remainder if DTE > 90 |
+        | **Trim hard** | +600% (7x) | Sell 75%; trail 25% toward 10x |
+        | **Full exit** | +900% (10x) | Exit everything — target hit |
+        | **Roll delta** | Δ > 0.90 | Leverage exhausted — roll to higher strike |
+        | **Delta warn** | Δ < 0.10 | Option near worthless — reassess |
+        | **DTE roll window** | < 270 days | Roll if profitable |
+        | **DTE urgent** | < 90 days | Exit losers; take profits if positive |
+        | **DTE hard exit** | < 60 days | Exit regardless of P&L |
         """
     )
 

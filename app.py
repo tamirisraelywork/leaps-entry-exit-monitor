@@ -428,25 +428,45 @@ elif page == "Add Position":
                                   help="ACTIVE = monitoring with exit alerts | WATCHLIST = watching for entry signals")
             notes_ex   = st.text_area("Notes (optional)", placeholder="e.g. Bought on earnings dip")
 
-            submitted = st.form_submit_button("Preview & Save", type="primary")
+            submitted = st.form_submit_button("Save Position", type="primary")
 
         if submitted and ticker_ex and strike_ex and exp_date and entry_price_ex:
             # Build OCC symbol
             contract_sym = options_data.to_occ(ticker_ex, exp_date, opt_type[0], strike_ex)
 
-            with st.spinner("Fetching live data..."):
-                snap = options_data.get_option_snapshot(ticker_ex, contract_sym) or {}
+            with st.spinner("Fetching live data and saving..."):
+                snap  = options_data.get_option_snapshot(ticker_ex, contract_sym) or {}
                 score = db.get_leaps_monitor_score(ticker_ex)
 
-            mid    = snap.get("mid")
-            delta  = snap.get("delta")
-            dte_d  = snap.get("dte")
-            pnl    = _pnl_pct(entry_price_ex, mid)
+            mid   = snap.get("mid")
+            delta = snap.get("delta")
+            dte_d = snap.get("dte")
+            pnl   = _pnl_pct(entry_price_ex, mid)
 
-            # Preview card
+            # Save immediately (no second click needed)
+            db.save_position({
+                "ticker":             ticker_ex,
+                "contract":           contract_sym,
+                "option_type":        opt_type,
+                "strike":             strike_ex,
+                "expiration_date":    exp_date,
+                "entry_date":         entry_date,
+                "entry_price":        entry_price_ex,
+                "quantity":           int(qty_ex),
+                "entry_delta":        delta,
+                "entry_iv_rank":      None,
+                "entry_thesis_score": score,
+                "position_type":      "STANDARD",
+                "target_return":      "5-10x",
+                "mode":               mode_ex,
+                "notes":              notes_ex,
+            })
+
+            st.success(f"✅ Position saved! {ticker_ex} {exp_date} ${strike_ex}C — go to **Dashboard** to monitor it.")
+
+            # Show snapshot after saving
             st.markdown("---")
-            st.subheader("Position Preview")
-
+            st.subheader("Position Snapshot")
             pr1, pr2, pr3, pr4, pr5 = st.columns(5)
             pr1.metric("Current Mid",  f"${mid:.2f}"  if mid    else "N/A")
             pr2.metric("P&L",          f"{pnl:+.1f}%" if pnl is not None else "N/A")
@@ -454,12 +474,12 @@ elif page == "Add Position":
             pr4.metric("DTE",          f"{dte_d}d"    if dte_d   else "N/A")
             pr5.metric("Thesis Score", f"{score}/100" if score   else "N/A")
 
-            # Run a quick pillar check on preview
+            # Run a quick pillar check
             dummy_pos = {
-                "ticker":           ticker_ex,
-                "entry_price":      entry_price_ex,
-                "expiration_date":  exp_date,
-                "mode":             mode_ex,
+                "ticker":          ticker_ex,
+                "entry_price":     entry_price_ex,
+                "expiration_date": exp_date,
+                "mode":            mode_ex,
             }
             dummy_mkt = {"mid": mid, "delta": delta, "dte": dte_d, "iv_rank": None, "thesis_score": score}
             preview_alerts = evaluate(dummy_pos, dummy_mkt) if mode_ex == "ACTIVE" else []
@@ -468,27 +488,7 @@ elif page == "Add Position":
                 worst = max(preview_alerts, key=lambda a: {"RED":3,"BLUE":2,"AMBER":1}.get(a.severity,0))
                 st.warning(f"Initial signal: {worst.subject}")
             else:
-                st.success("All pillars clear — position looks healthy.")
-
-            if st.button("Confirm & Save", type="primary"):
-                pos_id = db.save_position({
-                    "ticker":             ticker_ex,
-                    "contract":           contract_sym,
-                    "option_type":        opt_type,
-                    "strike":             strike_ex,
-                    "expiration_date":    exp_date,
-                    "entry_date":         entry_date,
-                    "entry_price":        entry_price_ex,
-                    "quantity":           int(qty_ex),
-                    "entry_delta":        delta,
-                    "entry_iv_rank":      None,
-                    "entry_thesis_score": score,
-                    "position_type":      "STANDARD",
-                    "target_return":      "5-10x",
-                    "mode":               mode_ex,
-                    "notes":              notes_ex,
-                })
-                st.success(f"Position saved! ({ticker_ex} {exp_date} ${strike_ex}C)  Go to **Dashboard** to monitor it.")
+                st.info("All pillars clear — position looks healthy.")
 
 
 # ===========================================================================

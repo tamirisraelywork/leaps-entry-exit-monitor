@@ -47,8 +47,8 @@ _T = {
 
     # Profit scaling ladder (graduated — never sell all at once)
     "profit_100":    100,   # 2x: recover initial cost basis. Sell ~20%.
-    "profit_300":    300,   # 4x: first major milestone. Trim 30% + consider rolling rest.
-    "profit_600":    600,   # 7x: deep in the money on the trade. Trim hard, trail rest.
+    "profit_300":    300,   # 4x: first major milestone. Trim 50% + consider rolling rest.
+    "profit_600":    600,   # 7x: deep in the money on the trade. Trim 75%, trail rest.
     "profit_900":    900,   # 10x: target hit. Exit everything remaining.
 
     # Greeks
@@ -150,13 +150,55 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     entry_price  = position.get("entry_price")
     ticker       = position.get("ticker", "?")
     exp_date     = position.get("expiration_date")
-    qty          = position.get("quantity", 1)
+    strike       = position.get("strike")
+    qty          = int(position.get("quantity") or 1)
+    contract     = position.get("contract", "")
 
     mid          = market.get("mid")
+    bid          = market.get("bid")
     delta        = market.get("delta")
     dte_days     = market.get("dte") or _dte(exp_date)
     iv_rank      = market.get("iv_rank")
     thesis_score = market.get("thesis_score")
+
+    # Concrete trade execution helpers
+    # Limit price: use bid (conservative fill) or 1% below mid if no bid
+    limit_px = (round(bid, 2) if bid and bid > 0
+                else round(mid * 0.99, 2) if mid
+                else None)
+
+    def _exit_order(n_contracts: int) -> str:
+        """Return a formatted SELL order line with limit price and estimated proceeds."""
+        if limit_px and bid and mid:
+            proceeds = limit_px * n_contracts * 100
+            return (
+                f"  ORDER: SELL {n_contracts} contract{'s' if n_contracts > 1 else ''} "
+                f"of {ticker} — limit ${limit_px:.2f}/share\n"
+                f"  Estimated proceeds: ~${proceeds:,.0f}  "
+                f"(bid ${bid:.2f} · mid ${mid:.2f})\n"
+            )
+        elif limit_px:
+            proceeds = limit_px * n_contracts * 100
+            return (
+                f"  ORDER: SELL {n_contracts} contract{'s' if n_contracts > 1 else ''} "
+                f"of {ticker} — limit ${limit_px:.2f}/share\n"
+                f"  Estimated proceeds: ~${proceeds:,.0f}\n"
+            )
+        return f"  ORDER: SELL {n_contracts} contract{'s' if n_contracts > 1 else ''} of {ticker} at market\n"
+
+    def _roll_target_exp() -> str:
+        """Return the roll target expiry string (stored exp + ~12 months)."""
+        if not exp_date:
+            return "next Jan LEAPS"
+        try:
+            exp = exp_date if isinstance(exp_date, date) else date.fromisoformat(str(exp_date))
+            roll_exp = exp.replace(year=exp.year + 1)
+            return roll_exp.strftime("%b %Y")
+        except Exception:
+            return "next Jan LEAPS"
+
+    def _divider(title: str = "") -> str:
+        return f"\n{'─'*50}\n{title + chr(10) if title else ''}{'─'*50}\n"
 
     pnl  = _pnl_pct(entry_price, mid)
     hdr  = lambda: _header(position, {**market, "pnl_pct": pnl})
@@ -177,8 +219,10 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  The fundamental reason for holding this LEAPS is gone.\n"
                     + "  A broken thesis means the asymmetric upside that justified\n"
                     + "  this position no longer exists. P&L at entry time is irrelevant —\n"
-                    + "  exit before the market prices in the deterioration fully.\n\n"
-                    + "  ACTION: Close the position at market open.\n"
+                    + "  exit before the market prices in the deterioration fully.\n"
+                    + _divider("TRADE INSTRUCTION")
+                    + _exit_order(qty)
+                    + "  Execute at market open tomorrow.\n"
                 ),
                 context=market,
             ))
@@ -202,14 +246,16 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  • You have stock-like downside exposure\n"
                         + "  • You're still paying option-level time decay\n"
                         + "  • You're already losing money\n\n"
-                        + "  Rolling this position locks in losses AND starts the decay\n"
-                        + "  clock again on the new contract. Do not roll.\n\n"
-                        + "  ACTION: Exit now. Re-evaluate thesis before re-entering.\n"
+                        + "  Rolling locks in losses AND restarts the decay clock. Do not roll.\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
                     ),
                     context=market,
                 ))
             else:
                 # Deep ITM but profitable — roll to restore leverage
+                roll_higher_lo = f"${strike * 1.10:.0f}" if strike else "~10%"
+                roll_higher_hi = f"${strike * 1.15:.0f}" if strike else "~15%"
                 alerts.append(Alert(
                     type="ROLL_DELTA", severity="BLUE",
                     subject=f"🔵 ROLL — Leverage Exhausted: {ticker}  Δ {delta:.2f}  P&L: {pnl:+.1f}%",
@@ -222,9 +268,18 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  RECOMMENDED ACTION:\n"
                         + "  → Sell current contract (lock in gains)\n"
                         + "  → Buy same expiry, higher strike (target Δ ~0.70)\n"
-                        + "  → This resets leverage and reduces capital at risk\n\n"
-                        + "  ROLL CHECK: Only roll if debit required is < 20% of your\n"
-                        + "  original premium paid. Otherwise take the full profit.\n"
+                        + "  → This resets leverage and reduces capital at risk\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + "  STEP 1 — SELL (close current position):\n"
+                        + _exit_order(qty)
+                        + "\n"
+                        + f"  STEP 2 — BUY (roll to higher strike, same expiry):\n"
+                        + f"  ORDER: BUY {qty} contract{'s' if qty > 1 else ''} of {ticker}\n"
+                        + f"  Target strike: {roll_higher_lo}–{roll_higher_hi}  (~10-15% above current ${strike})\n"
+                        + "  Target delta on new contract: ~0.70\n"
+                        + "  Same expiry as current contract.\n\n"
+                        + "  ROLL CHECK: Only proceed if net debit (Step 2 cost − Step 1 proceeds)\n"
+                        + "  is < 20% of your original Avg. Price. If higher, take full profit instead.\n"
                     ),
                     context=market,
                 ))
@@ -264,6 +319,9 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  premium regardless of underlying movement.\n\n"
                     + "  ACTION: Exit immediately regardless of P&L. No exceptions.\n"
                     + "  If thesis is still valid, re-enter with new LEAPS (>= 18 months).\n"
+                    + _divider("TRADE INSTRUCTION")
+                    + _exit_order(qty)
+                    + "  Execute as soon as market opens. Do not wait.\n"
                 ),
                 context=market,
             ))
@@ -280,8 +338,10 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + f"  {dte_days} days left and the position is at {pnl:+.1f}%.\n"
                         + "  Inside 90 days, theta acceleration compounds losses rapidly.\n"
                         + "  There is not enough time left for a meaningful recovery.\n\n"
-                        + "  Do NOT roll a losing position inside 90 days — it amplifies losses.\n\n"
-                        + "  ACTION: Exit to preserve remaining capital.\n"
+                        + "  Do NOT roll a losing position inside 90 days — it amplifies losses.\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
+                        + "  Exit to preserve remaining capital.\n"
                     ),
                     context=market,
                 ))
@@ -299,6 +359,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  contract starts decaying at the same accelerated rate.\n\n"
                         + "  ACTION: Take the full profit. Close now.\n"
                         + "  If thesis is still strong, re-enter fresh LEAPS (>= 18 months).\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
                     ),
                     context=market,
                 ))
@@ -319,9 +381,17 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  RECOMMENDED ACTION:\n"
                         + "  → Sell current contract\n"
                         + "  → Buy same strike, + 12 months expiration\n"
-                        + "  → Extends your runway toward the 5-10x target\n\n"
-                        + "  ROLL CHECK: Only proceed if the roll debit is < 20% of your\n"
-                        + "  original Avg. Price. If the debit is higher, exit and redeploy.\n"
+                        + "  → Extends your runway toward the 5-10x target\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + "  STEP 1 — SELL (close current position):\n"
+                        + _exit_order(qty)
+                        + "\n"
+                        + f"  STEP 2 — BUY (roll forward in time, same strike):\n"
+                        + f"  ORDER: BUY {qty} contract{'s' if qty > 1 else ''} of {ticker}\n"
+                        + f"  Same strike: ${strike}\n"
+                        + f"  Target expiry: {_roll_target_exp()}  (current expiry + 12 months)\n\n"
+                        + "  ROLL CHECK: Only proceed if net debit (Step 2 cost − Step 1 proceeds)\n"
+                        + "  is < 20% of your original Avg. Price. If debit is higher, exit and redeploy.\n"
                     ),
                     context=market,
                 ))
@@ -357,8 +427,10 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + f"  Position is at {pnl:+.1f}% (stop: {_T['stop_loss']}%).\n"
                     + "  Below -60%, statistical recovery to breakeven is very unlikely\n"
                     + "  within a reasonable timeframe.\n\n"
-                    + "  ACTION: Exit the position. Preserve remaining capital.\n"
                     + "  Thesis may still be valid — re-enter fresh LEAPS if it is.\n"
+                    + _divider("TRADE INSTRUCTION")
+                    + _exit_order(qty)
+                    + "  Exit the full position. Preserve remaining capital.\n"
                 ),
                 context=market,
             ))
@@ -376,16 +448,20 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "\n"
                     + "  This is your full exit. You are selling to someone else's FOMO.\n"
                     + "  Do not wait for more — the final move from here has lower\n"
-                    + "  probability and you've already captured the asymmetric return.\n\n"
-                    + "  ACTION: Exit the entire remaining position.\n"
+                    + "  probability and you've already captured the asymmetric return.\n"
+                    + _divider("TRADE INSTRUCTION")
+                    + _exit_order(qty)
+                    + "  Exit the entire remaining position.\n"
                 ),
                 context=market,
             ))
 
         elif pnl >= _T["profit_600"]:
+            n_trim = max(1, round(qty * 0.75))
+            n_hold = qty - n_trim
             roll_note = (
                 "\n  TIME NOTE: You still have enough DTE to roll the trailing\n"
-                "  25% to a further-dated contract if you want to stay in the trade.\n"
+                f"  {n_hold} contract{'s' if n_hold != 1 else ''} to a further-dated contract if you want to stay in the trade.\n"
                 if dte_days and dte_days > _T["dte_urgent"] else
                 "\n  TIME NOTE: DTE is short — exit the full position rather than rolling.\n"
             )
@@ -398,21 +474,25 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + f"{'─'*50}\n"
                     + f"  Position is up {pnl:+.1f}% — a 7x return. Outstanding.\n\n"
                     + "  RECOMMENDED ACTION:\n"
-                    + "  → Sell 75% of position now to lock in the 7x gains\n"
-                    + "  → Keep 25% trailing toward the 10x target\n"
-                    + "  → Set a mental stop on the trailing 25%: if it gives back\n"
+                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (75%) now to lock in the 7x gains\n"
+                    + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} (25%) trailing toward the 10x target\n" if n_hold > 0 else "")
+                    + "  → Set a mental stop on the trailing position: if it gives back\n"
                     + "    50% of gains, exit the remainder\n"
                     + roll_note
+                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 75% trim)")
+                    + _exit_order(n_trim)
+                    + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — trailing to 10x\n" if n_hold > 0 else "")
                 ),
                 context=market,
             ))
 
         elif pnl >= _T["profit_300"]:
-            # 4x milestone — the 3-5x zone the user specifically mentioned
-            # Trim AND recommend rolling the remainder for maximum return capture
+            # 4x milestone — the 3-5x zone
+            n_trim = max(1, round(qty * 0.50))
+            n_hold = qty - n_trim
             if dte_days and dte_days > _T["dte_urgent"]:
                 roll_action = (
-                    "  → For the remaining 50%:\n"
+                    f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
                     f"    DTE = {dte_days} days. If < 270 days remain, consider rolling:\n"
                     "    Sell current contract, buy same strike + 12 months.\n"
                     "    This keeps you in the trade at reduced cost basis while\n"
@@ -421,7 +501,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 )
             else:
                 roll_action = (
-                    "  → For the remaining 50%:\n"
+                    f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
                     f"    DTE = {dte_days} days — too short to roll cost-effectively.\n"
                     "    Exit the remainder and redeploy into fresh LEAPS if\n"
                     "    thesis is still intact and you want more upside.\n"
@@ -438,18 +518,23 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  first major profit milestone (3-5x target zone).\n\n"
                     + "  Strategy: Take serious profits while keeping upside exposure.\n\n"
                     + "  RECOMMENDED ACTION:\n"
-                    + "  → Sell 50% of contracts now (lock in the 4x on half)\n"
+                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (50%) now — lock in the 4x on half\n"
                     + roll_action
                     + "\n"
                     + "  This approach:\n"
                     + "  ✓ Secures substantial gains that cannot be taken away\n"
                     + "  ✓ Keeps exposure to the 7-10x move if thesis plays out\n"
                     + "  ✓ Reduces capital at risk significantly\n"
+                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 50% trim)")
+                    + _exit_order(n_trim)
+                    + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — targeting 7-10x\n" if n_hold > 0 else "")
                 ),
                 context=market,
             ))
 
         elif pnl >= _T["profit_100"]:
+            n_trim = max(1, round(qty * 0.20))
+            n_hold = qty - n_trim
             alerts.append(Alert(
                 type="PROFIT_100", severity="AMBER",
                 subject=f"⚠️ FIRST TRIM — {ticker} Up 2x: {pnl:+.1f}%",
@@ -459,12 +544,14 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + f"{'─'*50}\n"
                     + f"  Position is up {pnl:+.1f}% — you've doubled your money.\n\n"
                     + "  RECOMMENDED ACTION:\n"
-                    + "  → Sell 20-25% of position\n"
-                    + "  → This recovers your initial cost basis on those contracts\n"
-                    + "  → The majority stays on — your target is 5-10x, not 2x\n\n"
+                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (~20%) to recover initial cost basis\n"
+                    + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} running — your target is 5-10x, not 2x\n\n" if n_hold > 0 else "\n")
                     + "  Do NOT sell the full position here. Selling at 2x is the\n"
                     + "  most common mistake in LEAPS trading — it sacrifices the\n"
                     + "  asymmetric return that justifies buying options in the first place.\n"
+                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — ~20% trim)")
+                    + _exit_order(n_trim)
+                    + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — keep riding\n" if n_hold > 0 else "")
                 ),
                 context=market,
             ))

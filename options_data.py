@@ -144,16 +144,22 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         else:
             mid = None
 
-        iv = float(row.get("impliedVolatility") or 0) or None
+        raw_iv = float(row.get("impliedVolatility") or 0)
+        # yfinance sometimes returns absurdly high IV for illiquid options
+        # which causes Black-Scholes delta to collapse to 0 or 1. Cap at 2.0 (200%).
+        iv = min(raw_iv, 2.0) if raw_iv > 0 else None
 
-        # Black-Scholes delta
+        # Black-Scholes delta — requires stock price + reasonable IV
         delta = None
         try:
             fi = t.fast_info
             S = fi.last_price or fi.previous_close
-            if S and iv:
+            if S and iv and iv > 0.01:
                 T = max((actual_expiry - date.today()).days, 1) / 365.0
-                delta = _bs_delta(float(S), float(strike), T, 0.045, iv, option_type)
+                raw_delta = _bs_delta(float(S), float(strike), T, 0.045, iv, option_type)
+                # Sanity-check: if BS gives a degenerate value, discard it
+                if raw_delta is not None and 0.01 <= abs(raw_delta) <= 0.99:
+                    delta = raw_delta
         except Exception:
             pass
 

@@ -199,6 +199,8 @@ if page == "Dashboard":
                         pass
                     mkt = {
                         "mid":          snap.get("mid"),
+                        "bid":          snap.get("bid"),
+                        "ask":          snap.get("ask"),
                         "delta":        snap.get("delta"),
                         "dte":          snap.get("dte") or dte_fallback,
                         "iv_rank":      None,
@@ -255,7 +257,7 @@ if page == "Dashboard":
                         st.success("All pillars clear — HOLD.")
 
                 # Action buttons
-                b1, b2, b3 = st.columns([1, 1, 4])
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
                 with b1:
                     if st.button("Mark Closed", key=f"close_{pos_id}"):
                         db.update_position_mode(pos_id, "CLOSED")
@@ -264,9 +266,60 @@ if page == "Dashboard":
                     if st.button("Mark Rolled", key=f"roll_{pos_id}"):
                         db.update_position_mode(pos_id, "ROLLED")
                         st.rerun()
+                with b3:
+                    if st.button("✏️ Edit", key=f"edit_{pos_id}"):
+                        st.session_state["editing_pos_id"] = pos_id
 
                 if notes:
                     st.caption(f"Notes: {notes}")
+
+            # ---- Inline Edit Panel ----
+            if st.session_state.get("editing_pos_id") == pos_id:
+                with st.container(border=True):
+                    st.markdown("#### Edit Position")
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        new_ep  = st.number_input("Avg. Price $/share", value=float(ep or 0),
+                                                   min_value=0.01, step=0.01, format="%.2f",
+                                                   key=f"ep_{pos_id}")
+                        new_qty = st.number_input("Pos (contracts)", value=int(qty or 1),
+                                                   min_value=1, step=1, key=f"qty_{pos_id}")
+                    with ec2:
+                        has_entry_date = st.checkbox("I know my entry date",
+                                                      value=bool(pos.get("entry_date")),
+                                                      key=f"hed_{pos_id}")
+                        new_entry_date = None
+                        if has_entry_date:
+                            default_ed = pos.get("entry_date")
+                            if default_ed and not isinstance(default_ed, date):
+                                try:
+                                    default_ed = date.fromisoformat(str(default_ed))
+                                except Exception:
+                                    default_ed = date.today()
+                            new_entry_date = st.date_input("Entry Date", value=default_ed or date.today(),
+                                                            max_value=date.today(), key=f"ed_{pos_id}")
+                        new_mode  = st.selectbox("Mode", ["ACTIVE", "WATCHLIST"],
+                                                  index=0 if pos.get("mode") == "ACTIVE" else 1,
+                                                  key=f"mode_{pos_id}")
+                    new_notes = st.text_area("Notes", value=notes or "", key=f"notes_{pos_id}")
+                    sv1, sv2 = st.columns([1, 5])
+                    with sv1:
+                        if st.button("Save Changes", type="primary", key=f"save_{pos_id}"):
+                            updates = {
+                                "entry_price": new_ep,
+                                "quantity":    int(new_qty),
+                                "mode":        new_mode,
+                                "notes":       new_notes,
+                            }
+                            if new_entry_date:
+                                updates["entry_date"] = new_entry_date
+                            db.update_position(pos_id, updates)
+                            del st.session_state["editing_pos_id"]
+                            st.rerun()
+                    with sv2:
+                        if st.button("Cancel", key=f"cancel_{pos_id}"):
+                            del st.session_state["editing_pos_id"]
+                            st.rerun()
 
     # -----------------------------------------------------------------------
     # Watchlist
@@ -433,7 +486,10 @@ elif page == "Add Position":
                     min_value=1, step=1, value=1,
                     help="From IBKR 'Pos' column"
                 )
-                entry_date = st.date_input("Entry Date *", max_value=date.today())
+                know_entry_date = st.checkbox("I know my entry date", value=True)
+                entry_date = None
+                if know_entry_date:
+                    entry_date = st.date_input("Entry Date", max_value=date.today())
                 # Cost Basis computed display (read-only)
                 cb_display = entry_price_ex * qty_ex * 100 if entry_price_ex and qty_ex else 0
                 st.metric("Cost Basis (computed)", f"${cb_display:,.2f}",

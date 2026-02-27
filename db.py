@@ -128,6 +128,46 @@ def save_position(pos: dict) -> str:
     return pos["id"]
 
 
+def update_position(position_id: str, fields: dict):
+    """
+    Update editable fields on an existing position.
+    Only updates the keys provided in `fields`.
+    Allowed fields: entry_price, quantity, entry_date, expiration_date,
+                    strike, mode, notes, contract.
+    """
+    client = get_client()
+    allowed = {"entry_price", "quantity", "entry_date", "expiration_date",
+               "strike", "mode", "notes", "contract"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+
+    set_clauses = []
+    params = [bigquery.ScalarQueryParameter("id", "STRING", position_id)]
+    for i, (col, val) in enumerate(updates.items()):
+        param_name = f"p{i}"
+        if col in ("entry_date", "expiration_date"):
+            if isinstance(val, date):
+                val = val.isoformat()
+            bq_type = "DATE"
+        elif col in ("entry_price", "strike"):
+            bq_type = "FLOAT64"
+        elif col == "quantity":
+            bq_type = "INT64"
+        else:
+            bq_type = "STRING"
+        set_clauses.append(f"{col} = @{param_name}")
+        params.append(bigquery.ScalarQueryParameter(param_name, bq_type, val))
+
+    q = f"""
+        UPDATE `{client.project}.{DATASET}.positions`
+        SET {', '.join(set_clauses)}
+        WHERE id = @id
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    client.query(q, job_config=job_config).result()
+
+
 def update_position_mode(position_id: str, mode: str):
     client = get_client()
     q = f"""

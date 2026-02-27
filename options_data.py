@@ -34,19 +34,31 @@ def get_option_snapshot(ticker: str, contract: str) -> dict | None:
 
     Returns dict with: delta, gamma, theta, vega, implied_volatility,
                        bid, ask, mid, dte, expiration_date, strike,
-                       open_interest.  None on failure.
+                       open_interest, _error (on failure).
     """
+    key = _api_key()
+    if not key:
+        return {"_error": "No Polygon API key configured"}
+
     url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}/{contract}"
     try:
-        resp = requests.get(url, params={"apiKey": _api_key()}, timeout=15)
+        resp = requests.get(url, params={"apiKey": key}, timeout=15)
+        if resp.status_code == 403:
+            return {"_error": "Polygon API key does not have options access (upgrade required)"}
+        if resp.status_code == 404:
+            return {"_error": f"Contract not found on Polygon: {contract}"}
         if resp.status_code != 200:
-            return None
-        data = resp.json().get("results", {})
-        if not data:
-            return None
+            return {"_error": f"Polygon returned HTTP {resp.status_code}"}
 
-        greeks = data.get("greeks") or {}
-        quote = data.get("last_quote") or {}
+        body = resp.json()
+        data = body.get("results", {})
+        if not data:
+            # status field sometimes explains an empty result
+            status = body.get("status", "")
+            return {"_error": f"Polygon returned empty results (status: {status})"}
+
+        greeks  = data.get("greeks") or {}
+        quote   = data.get("last_quote") or {}
         details = data.get("details") or {}
 
         ask = quote.get("ask") or 0.0
@@ -75,8 +87,8 @@ def get_option_snapshot(ticker: str, contract: str) -> dict | None:
             "strike":             details.get("strike_price"),
             "open_interest":      data.get("open_interest"),
         }
-    except Exception:
-        return None
+    except Exception as e:
+        return {"_error": str(e)}
 
 
 def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:

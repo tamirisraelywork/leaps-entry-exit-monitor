@@ -185,11 +185,22 @@ if page == "Dashboard":
                 else:
                     # Quick fetch without IV rank (faster for dashboard)
                     contract = pos.get("contract", "")
-                    snap = options_data.get_option_snapshot(ticker, contract) or {} if contract else {}
+                    snap = options_data.get_option_snapshot(ticker, contract) if contract else {}
+                    snap = snap or {}
+                    polygon_error = snap.get("_error")
+                    # DTE fallback: compute from stored expiration_date when Polygon fails
+                    dte_fallback = None
+                    try:
+                        raw_exp = pos.get("expiration_date")
+                        if raw_exp:
+                            exp_d = raw_exp if isinstance(raw_exp, date) else date.fromisoformat(str(raw_exp))
+                            dte_fallback = (exp_d - date.today()).days
+                    except Exception:
+                        pass
                     mkt = {
                         "mid":          snap.get("mid"),
                         "delta":        snap.get("delta"),
-                        "dte":          snap.get("dte"),
+                        "dte":          snap.get("dte") or dte_fallback,
                         "iv_rank":      None,
                         "thesis_score": db.get_leaps_monitor_score(ticker),
                     }
@@ -200,6 +211,7 @@ if page == "Dashboard":
             iv_rank   = mkt.get("iv_rank")
             score     = mkt.get("thesis_score")
             pnl       = _pnl_pct(ep, mid)
+            polygon_error = snap.get("_error") if not force_check else None
 
             severity, posture_label = _posture(pos, mkt)
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
@@ -221,7 +233,7 @@ if page == "Dashboard":
                     )
 
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Entry Price",  f"${ep:.2f}"   if ep       else "N/A")
+                m1.metric("Avg. Price",   f"${ep:.2f}"   if ep       else "N/A")
                 m2.metric("Current Mid",  f"${mid:.2f}"  if mid      else "N/A")
                 m3.metric("P&L",
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
@@ -229,6 +241,9 @@ if page == "Dashboard":
                 m4.metric("Delta",        f"{delta:.2f}" if delta     else "N/A")
                 m5.metric("DTE",          f"{dte_days}d" if dte_days  else "N/A")
                 m6.metric("Thesis Score", f"{score}/100" if score     else "N/A")
+
+                if polygon_error:
+                    st.warning(f"⚠️ Live data unavailable: {polygon_error}")
 
                 # Show latest triggered signal (if any)
                 if force_check:
@@ -438,9 +453,10 @@ elif page == "Add Position":
                 snap  = options_data.get_option_snapshot(ticker_ex, contract_sym) or {}
                 score = db.get_leaps_monitor_score(ticker_ex)
 
+            snap_error = snap.get("_error")
             mid   = snap.get("mid")
             delta = snap.get("delta")
-            dte_d = snap.get("dte")
+            dte_d = snap.get("dte") or (exp_date - date.today()).days
             pnl   = _pnl_pct(entry_price_ex, mid)
 
             # Save immediately (no second click needed)
@@ -463,6 +479,9 @@ elif page == "Add Position":
             })
 
             st.success(f"✅ Position saved! {ticker_ex} {exp_date} ${strike_ex}C — go to **Dashboard** to monitor it.")
+
+            if snap_error:
+                st.warning(f"⚠️ Live data unavailable: {snap_error}  (DTE computed from expiration date)")
 
             # Show snapshot after saving
             st.markdown("---")

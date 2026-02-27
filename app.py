@@ -86,6 +86,8 @@ def _live_market(pos: dict) -> dict:
 
     return {
         "mid":          snapshot.get("mid"),
+        "bid":          snapshot.get("bid"),
+        "ask":          snapshot.get("ask"),
         "delta":        snapshot.get("delta"),
         "dte":          snapshot.get("dte"),
         "iv_rank":      iv_rank,
@@ -99,15 +101,8 @@ def _pnl_pct(entry_price, mid):
     return None
 
 
-def _posture(position: dict, mkt: dict) -> tuple[str, str]:
-    """Return (severity, posture_label) for a position."""
-    if position.get("mode") != "ACTIVE":
-        return "GREEN", "WATCHLIST"
-    alerts = evaluate(position, mkt)
-    if not alerts:
-        return "GREEN", "HOLD"
-    worst = max(alerts, key=lambda a: {"RED": 3, "BLUE": 2, "AMBER": 1, "GREEN": 0}.get(a.severity, 0))
-    return worst.severity, _POSTURE_LABEL.get(worst.severity, "HOLD")
+def _alert_priority(a) -> int:
+    return {"RED": 3, "BLUE": 2, "AMBER": 1, "GREEN": 0}.get(a.severity, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +177,14 @@ if page == "Dashboard":
                 if force_check:
                     mkt = _live_market(pos)
                     time.sleep(12)     # respect Polygon rate limit
+                    polygon_error = None
                 else:
                     # Quick fetch without IV rank (faster for dashboard)
                     contract = pos.get("contract", "")
                     snap = options_data.get_option_snapshot(ticker, contract) if contract else {}
                     snap = snap or {}
                     polygon_error = snap.get("_error")
-                    # DTE fallback: compute from stored expiration_date when Polygon fails
+                    # DTE fallback: compute from stored expiration_date when live data fails
                     dte_fallback = None
                     try:
                         raw_exp = pos.get("expiration_date")
@@ -207,15 +203,23 @@ if page == "Dashboard":
                         "thesis_score": db.get_leaps_monitor_score(ticker),
                     }
 
-            mid       = mkt.get("mid")
-            delta     = mkt.get("delta")
-            dte_days  = mkt.get("dte")
-            iv_rank   = mkt.get("iv_rank")
-            score     = mkt.get("thesis_score")
-            pnl       = _pnl_pct(ep, mid)
-            polygon_error = snap.get("_error") if not force_check else None
+            mid      = mkt.get("mid")
+            delta    = mkt.get("delta")
+            dte_days = mkt.get("dte")
+            score    = mkt.get("thesis_score")
+            pnl      = _pnl_pct(ep, mid)
 
-            severity, posture_label = _posture(pos, mkt)
+            # Run evaluation once — drives both badge AND inline recommendation
+            position_alerts = evaluate(pos, mkt)
+            if position_alerts:
+                worst_alert   = max(position_alerts, key=_alert_priority)
+                severity      = worst_alert.severity
+                posture_label = _POSTURE_LABEL.get(severity, "HOLD")
+            else:
+                worst_alert   = None
+                severity      = "GREEN"
+                posture_label = "HOLD"
+
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
             emoji = _POSTURE_EMOJI.get(severity, "🟢")
 
@@ -247,14 +251,25 @@ if page == "Dashboard":
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")
 
-                # Show latest triggered signal (if any)
-                if force_check:
-                    alerts = evaluate(pos, mkt)
-                    if alerts:
-                        worst = max(alerts, key=lambda a: {"RED":3,"BLUE":2,"AMBER":1,"GREEN":0}.get(a.severity,0))
-                        st.info(f"**Signal:** {worst.subject}")
-                    else:
-                        st.success("All pillars clear — HOLD.")
+                # ── Active signal — always visible on the card ──────────────
+                if worst_alert:
+                    sig_color = _SEVERITY_COLOR.get(worst_alert.severity, "#FFA500")
+                    st.markdown(
+                        f"<div style='background:{sig_color}22;border-left:4px solid {sig_color};"
+                        f"padding:10px 14px;border-radius:4px;margin:8px 0'>"
+                        f"<strong>Active Signal:</strong>&nbsp; {worst_alert.subject}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    with st.expander("📋 View recommendation & trade instruction"):
+                        st.code(worst_alert.body, language=None)
+                        # If multiple alerts fired, show the others too
+                        others = [a for a in position_alerts if a is not worst_alert]
+                        if others:
+                            st.caption(f"Additional signals ({len(others)}):")
+                            for a in sorted(others, key=_alert_priority, reverse=True):
+                                st.markdown(f"- {_POSTURE_EMOJI.get(a.severity,'•')} {a.subject}")
+                else:
+                    st.success("✅ All pillars clear — HOLD")
 
                 # Action buttons
                 b1, b2, b3, b4 = st.columns([1, 1, 1, 3])

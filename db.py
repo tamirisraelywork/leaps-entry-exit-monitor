@@ -112,19 +112,47 @@ def get_position_by_id(position_id: str) -> dict | None:
 
 
 def save_position(pos: dict) -> str:
-    """Insert a new position. Returns the new position id."""
+    """Insert a new position using DML INSERT (not streaming).
+
+    IMPORTANT: insert_rows_json uses the streaming buffer which blocks UPDATE/DELETE
+    for up to 90 minutes. DML INSERT commits immediately so the row can be edited
+    right away via update_position().
+    """
     client = get_client()
     pos = dict(pos)
     pos["id"] = str(uuid.uuid4())
-    pos["created_at"] = datetime.utcnow().isoformat()
-    # Convert date objects to strings for BigQuery JSON insert
+    pos["created_at"] = datetime.utcnow()   # datetime object for TIMESTAMP param
+
+    # Convert date objects to ISO strings for DATE parameters
     for k in ("expiration_date", "entry_date"):
         if isinstance(pos.get(k), date):
             pos[k] = pos[k].isoformat()
-    table_id = f"{client.project}.{DATASET}.positions"
-    errors = client.insert_rows_json(table_id, [pos])
-    if errors:
-        raise RuntimeError(f"BigQuery insert errors: {errors}")
+
+    # BigQuery parameter type for each column
+    _TYPE_MAP = {
+        "id": "STRING", "ticker": "STRING", "contract": "STRING",
+        "option_type": "STRING", "position_type": "STRING",
+        "target_return": "STRING", "mode": "STRING", "notes": "STRING",
+        "strike": "FLOAT64", "entry_price": "FLOAT64",
+        "entry_delta": "FLOAT64", "entry_iv_rank": "FLOAT64",
+        "expiration_date": "DATE", "entry_date": "DATE",
+        "created_at": "TIMESTAMP",
+        "quantity": "INT64", "entry_thesis_score": "INT64",
+    }
+
+    # Only include columns that have a value and are in the schema
+    col_names = [c for c in pos if c in _TYPE_MAP and pos[c] is not None]
+    params = [
+        bigquery.ScalarQueryParameter(c, _TYPE_MAP[c], pos[c])
+        for c in col_names
+    ]
+
+    table_ref = f"`{client.project}.{DATASET}.positions`"
+    cols_sql  = ", ".join(col_names)
+    vals_sql  = ", ".join(f"@{c}" for c in col_names)
+    q = f"INSERT INTO {table_ref} ({cols_sql}) VALUES ({vals_sql})"
+
+    client.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
     return pos["id"]
 
 

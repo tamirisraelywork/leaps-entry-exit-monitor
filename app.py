@@ -292,42 +292,63 @@ if page == "Dashboard":
             if st.session_state.get("editing_pos_id") == pos_id:
                 with st.container(border=True):
                     st.markdown("#### Edit Position")
-                    ec1, ec2 = st.columns(2)
+                    st.caption("Tip: Avg. Price = option premium per share from IBKR (NOT the stock price, NOT the strike)")
+                    ec1, ec2, ec3 = st.columns(3)
                     with ec1:
-                        new_ep  = st.number_input("Avg. Price $/share", value=float(ep or 0),
-                                                   min_value=0.01, step=0.01, format="%.2f",
-                                                   key=f"ep_{pos_id}")
-                        new_qty = st.number_input("Pos (contracts)", value=int(qty or 1),
-                                                   min_value=1, step=1, key=f"qty_{pos_id}")
+                        new_ep  = st.number_input(
+                            "Avg. Price $/share",
+                            value=float(ep or 0), min_value=0.01, step=0.01, format="%.2f",
+                            help="Option premium per share you paid (IBKR 'Avg. Price'). ×100 = cost per contract.",
+                            key=f"ep_{pos_id}")
+                        new_qty = st.number_input(
+                            "Pos (contracts)",
+                            value=int(qty or 1), min_value=1, step=1,
+                            help="Number of contracts (IBKR 'Pos')",
+                            key=f"qty_{pos_id}")
                     with ec2:
-                        has_entry_date = st.checkbox("I know my entry date",
-                                                      value=bool(pos.get("entry_date")),
-                                                      key=f"hed_{pos_id}")
-                        new_entry_date = None
-                        if has_entry_date:
-                            default_ed = pos.get("entry_date")
-                            if default_ed and not isinstance(default_ed, date):
-                                try:
-                                    default_ed = date.fromisoformat(str(default_ed))
-                                except Exception:
-                                    default_ed = date.today()
-                            new_entry_date = st.date_input("Entry Date", value=default_ed or date.today(),
-                                                            max_value=date.today(), key=f"ed_{pos_id}")
-                        new_mode  = st.selectbox("Mode", ["ACTIVE", "WATCHLIST"],
-                                                  index=0 if pos.get("mode") == "ACTIVE" else 1,
-                                                  key=f"mode_{pos_id}")
+                        # Parse stored strike for default
+                        _strike_default = float(pos.get("strike") or 0)
+                        new_strike = st.number_input(
+                            "Strike Price",
+                            value=_strike_default, min_value=0.01, step=0.5, format="%.2f",
+                            help="The strike price of the option contract (e.g. $15, $150)",
+                            key=f"strike_{pos_id}")
+                        # Parse stored expiry for default
+                        _exp_raw = pos.get("expiration_date")
+                        try:
+                            _exp_default = _exp_raw if isinstance(_exp_raw, date) else date.fromisoformat(str(_exp_raw))
+                        except Exception:
+                            _exp_default = date.today() + timedelta(days=540)
+                        new_exp = st.date_input(
+                            "Expiration Date",
+                            value=_exp_default,
+                            min_value=date.today(),
+                            key=f"exp_{pos_id}")
+                    with ec3:
+                        new_mode = st.selectbox(
+                            "Mode", ["ACTIVE", "WATCHLIST"],
+                            index=0 if pos.get("mode") == "ACTIVE" else 1,
+                            key=f"mode_{pos_id}")
+                        # Live cost basis preview
+                        cb_preview = new_ep * new_qty * 100
+                        st.metric("Cost Basis (preview)", f"${cb_preview:,.0f}",
+                                  help="Avg. Price × Pos × 100 — verify against IBKR")
                     new_notes = st.text_area("Notes", value=notes or "", key=f"notes_{pos_id}")
                     sv1, sv2 = st.columns([1, 5])
                     with sv1:
                         if st.button("Save Changes", type="primary", key=f"save_{pos_id}"):
+                            # Rebuild OCC contract symbol whenever strike or expiry changes
+                            opt_type_char = (pos.get("option_type") or "CALL")[0].upper()
+                            new_contract = options_data.to_occ(ticker, new_exp, opt_type_char, new_strike)
                             updates = {
-                                "entry_price": new_ep,
-                                "quantity":    int(new_qty),
-                                "mode":        new_mode,
-                                "notes":       new_notes,
+                                "entry_price":     new_ep,
+                                "quantity":        int(new_qty),
+                                "strike":          new_strike,
+                                "expiration_date": new_exp,
+                                "contract":        new_contract,
+                                "mode":            new_mode,
+                                "notes":           new_notes,
                             }
-                            if new_entry_date:
-                                updates["entry_date"] = new_entry_date
                             try:
                                 db.update_position(pos_id, updates)
                                 del st.session_state["editing_pos_id"]
@@ -486,32 +507,38 @@ elif page == "Add Position":
             "will immediately preview your current position health."
         )
 
+        st.info(
+            "**Field guide (from IBKR):**  "
+            "Strike = the option's strike price (e.g. $15)  ·  "
+            "Avg. Price = option premium per share you paid (e.g. $3.20)  ·  "
+            "Pos = number of contracts  ·  "
+            "Cost Basis = Avg. Price × Pos × 100"
+        )
         with st.form("add_existing_form"):
             c1, c2 = st.columns(2)
             with c1:
                 ticker_ex  = st.text_input("Stock Ticker *", placeholder="NVDA").upper().strip()
-                strike_ex  = st.number_input("Strike Price *", min_value=0.0, step=0.5, format="%.2f")
+                strike_ex  = st.number_input(
+                    "Strike Price * — the option's strike (e.g. $15, $150)",
+                    min_value=0.0, step=0.5, format="%.2f",
+                    help="This is NOT your avg price. It's the price level the option contract is written on.")
                 exp_date   = st.date_input("Expiration Date *", min_value=date.today() + timedelta(days=30))
                 opt_type   = st.selectbox("Option Type", ["CALL", "PUT"])
             with c2:
                 entry_price_ex = st.number_input(
-                    "Avg. Price $/share *",
+                    "Avg. Price $/share * — option premium you paid per share",
                     min_value=0.01, step=0.01, format="%.2f",
-                    help="From IBKR 'Avg. Price' column — the premium you paid per share (× 100 = cost per contract)"
+                    help="From IBKR 'Avg. Price' column. NOT the stock price, NOT the strike. × 100 = cost per contract."
                 )
                 qty_ex     = st.number_input(
                     "Pos (number of contracts) *",
                     min_value=1, step=1, value=1,
                     help="From IBKR 'Pos' column"
                 )
-                know_entry_date = st.checkbox("I know my entry date", value=True)
-                entry_date = None
-                if know_entry_date:
-                    entry_date = st.date_input("Entry Date", max_value=date.today())
                 # Cost Basis computed display (read-only)
                 cb_display = entry_price_ex * qty_ex * 100 if entry_price_ex and qty_ex else 0
                 st.metric("Cost Basis (computed)", f"${cb_display:,.2f}",
-                          help="Pos × 100 × Avg. Price — verify this matches IBKR 'Cost Basis'")
+                          help="Avg. Price × Pos × 100 — verify this matches IBKR 'Cost Basis'")
 
             mode_ex    = st.radio("Mode", ["ACTIVE", "WATCHLIST"], horizontal=True,
                                   help="ACTIVE = monitoring with exit alerts | WATCHLIST = watching for entry signals")
@@ -540,7 +567,6 @@ elif page == "Add Position":
                 "option_type":        opt_type,
                 "strike":             strike_ex,
                 "expiration_date":    exp_date,
-                "entry_date":         entry_date,
                 "entry_price":        entry_price_ex,
                 "quantity":           int(qty_ex),
                 "entry_delta":        delta,

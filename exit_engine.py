@@ -11,6 +11,13 @@ Strategy philosophy:
   • Inside 90 days DTE, rolling is rarely cost-effective — just take the gain.
   • Hard stop at -60%: LEAPS can go from -60% to 0, but rarely from -60% to 10x.
 
+IV Rank is woven into EVERY alert because it changes the urgency of everything:
+  > 70%  Options are expensive — SELL NOW, buyers are paying up (FOMO pricing)
+  50-70% IV elevated — good timing to execute exits and trims
+  25-50% Neutral range — other pillars drive the decision
+  < 25%  Options are CHEAP — great time to buy/roll new contracts;
+         if selling, consider waiting for IV expansion to maximize proceeds
+
 Each alert has:
   type     — string code (e.g. ROLL_DELTA, PROFIT_300, EXIT_THESIS)
   severity — RED / AMBER / BLUE / GREEN
@@ -63,7 +70,98 @@ _T = {
 
 
 # ---------------------------------------------------------------------------
-# Pillar helpers
+# IV Rank helpers  (the most underused edge in LEAPS timing)
+# ---------------------------------------------------------------------------
+
+def _iv_sell_context(iv_rank: float | None) -> str:
+    """
+    Context block for SELL / EXIT / TRIM alerts.
+    High IV = get out NOW, you're selling expensive paper.
+    Low IV  = consider waiting for IV expansion before selling.
+    """
+    if iv_rank is None:
+        return "  IV Rank:  N/A (run full check for IV context)\n"
+    if iv_rank >= 70:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  ★ PRIME TIME TO SELL ★\n"
+            f"  Options are in the top 30% of their historical volatility range.\n"
+            f"  Buyers are paying a fear/FOMO premium on top of intrinsic value.\n"
+            f"  This premium evaporates when IV normalizes — exit NOW to capture it.\n"
+        )
+    elif iv_rank >= 50:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  — IV elevated, good timing to sell.\n"
+            f"  You're getting above-average premium from buyers. Execute the trade.\n"
+        )
+    elif iv_rank >= 25:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  — neutral range. Timing is acceptable.\n"
+            f"  Not a particularly good or bad time from an IV perspective.\n"
+        )
+    else:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  — OPTIONS ARE CHEAP right now.\n"
+            f"  Buyers are NOT paying up — your extrinsic value is compressed.\n"
+            f"  If DTE allows, consider waiting for IV to rise before selling.\n"
+            f"  A spike to IV Rank 50%+ can add 10-30% to your option value.\n"
+        )
+
+
+def _iv_roll_context(iv_rank: float | None) -> str:
+    """
+    Context block for ROLL alerts.
+    Rolling = sell old contract (want high IV) + buy new contract (want low IV).
+    These are in tension. Net guidance:
+      - High IV: exit current position, re-enter later when IV drops
+      - Low IV:  ideal time to roll (buying the new contract cheaply)
+    """
+    if iv_rank is None:
+        return "  IV Rank:  N/A (run full check for IV timing context)\n"
+    if iv_rank >= 60:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  — ROLLING IS EXPENSIVE RIGHT NOW.\n"
+            f"  The new contract you'd be buying is priced at inflated IV.\n"
+            f"  Better path: SELL the current position (collect the high IV premium)\n"
+            f"  and wait for IV to drop below 35% before buying a new LEAPS.\n"
+            f"  This gets you the best of both: high IV exit + low IV entry.\n"
+        )
+    elif iv_rank >= 35:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  — acceptable rolling conditions.\n"
+            f"  Not ideal but not expensive either. Proceed if the roll debit\n"
+            f"  is within 20% of your original Avg. Price.\n"
+        )
+    else:
+        return (
+            f"  IV Rank:  {iv_rank:.0f}%  ★ IDEAL TIME TO ROLL ★\n"
+            f"  Options are cheap — the new contract you're buying is underpriced.\n"
+            f"  Rolling now locks in cheap forward exposure. Execute promptly.\n"
+        )
+
+
+def _iv_entry_context(iv_rank: float | None) -> str:
+    """IV context specifically for entry/re-entry guidance."""
+    if iv_rank is None:
+        return ""
+    if iv_rank >= 50:
+        return (
+            f"  ⚠️  IV Rank = {iv_rank:.0f}% — options are EXPENSIVE to buy right now.\n"
+            f"  Wait for IV to drop below 35% before entering a new LEAPS position.\n"
+            f"  Buying high-IV options means you pay extra for time premium that will\n"
+            f"  likely crush your position even if the stock moves in your favor.\n"
+        )
+    elif iv_rank >= 25:
+        return f"  IV Rank = {iv_rank:.0f}% — acceptable entry timing (neutral IV).\n"
+    else:
+        return (
+            f"  IV Rank = {iv_rank:.0f}% ★ — GREAT TIME TO BUY options.\n"
+            f"  You're paying minimal extrinsic value. Even if the stock stalls,\n"
+            f"  an IV expansion later will boost your option value independently.\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Other helpers
 # ---------------------------------------------------------------------------
 
 def _pnl_pct(entry_price: float, current_mid: float) -> float | None:
@@ -106,6 +204,7 @@ def _header(pos: dict, market: dict) -> str:
     except Exception:
         pass
 
+    iv_str     = f"{iv_rank:.0f}%" if iv_rank is not None else "N/A"
     score_emoji = "✅" if score and score >= 70 else ("⚠️" if score and score >= 60 else "❌")
 
     return (
@@ -123,10 +222,14 @@ def _header(pos: dict, market: dict) -> str:
         f"{'─'*50}\n"
         f"  Delta:        {delta if delta is not None else 'N/A'}\n"
         f"  DTE:          {dte_days if dte_days is not None else 'N/A'} days\n"
-        f"  IV Rank:      {f'{iv_rank:.1f}%' if iv_rank is not None else 'N/A'}\n"
+        f"  IV Rank:      {iv_str}\n"
         f"  Thesis Score: {score if score is not None else 'N/A'} {score_emoji}\n"
         f"{'─'*50}\n"
     )
+
+
+def _divider(title: str = "") -> str:
+    return f"\n{'─'*50}\n{title + chr(10) if title else ''}{'─'*50}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +243,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     Args:
         position: row from the positions table
         market:   live data dict with keys:
-                    mid, delta, dte, iv_rank, thesis_score
+                    mid, bid, delta, dte, iv_rank, thesis_score
                   (missing keys are handled gracefully)
 
     Returns: list of Alert objects (zero or more).
@@ -152,7 +255,6 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     exp_date     = position.get("expiration_date")
     strike       = position.get("strike")
     qty          = int(position.get("quantity") or 1)
-    contract     = position.get("contract", "")
 
     mid          = market.get("mid")
     bid          = market.get("bid")
@@ -197,9 +299,6 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
         except Exception:
             return "next Jan LEAPS"
 
-    def _divider(title: str = "") -> str:
-        return f"\n{'─'*50}\n{title + chr(10) if title else ''}{'─'*50}\n"
-
     pnl  = _pnl_pct(entry_price, mid)
     hdr  = lambda: _header(position, {**market, "pnl_pct": pnl})
 
@@ -208,6 +307,14 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # -----------------------------------------------------------------------
     if thesis_score is not None:
         if thesis_score < 60:
+            # IV context: if IV is high, extra urgency to exit before IV crushes AND price
+            iv_extra = ""
+            if iv_rank and iv_rank >= 60:
+                iv_extra = (
+                    f"\n  ★ IV Rank = {iv_rank:.0f}% — DOUBLY URGENT:\n"
+                    f"  Options are expensive AND the thesis is broken. Exit NOW to\n"
+                    f"  capture the inflated IV premium before both price AND IV drop.\n"
+                )
             alerts.append(Alert(
                 type="EXIT_THESIS", severity="RED",
                 subject=f"🔴 EXIT — Thesis Broken: {ticker}  (Score: {thesis_score}/100)",
@@ -220,6 +327,9 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  A broken thesis means the asymmetric upside that justified\n"
                     + "  this position no longer exists. P&L at entry time is irrelevant —\n"
                     + "  exit before the market prices in the deterioration fully.\n"
+                    + iv_extra
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
                     + _divider("TRADE INSTRUCTION")
                     + _exit_order(qty)
                     + "  Execute at market open tomorrow.\n"
@@ -247,13 +357,15 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  • You're still paying option-level time decay\n"
                         + "  • You're already losing money\n\n"
                         + "  Rolling locks in losses AND restarts the decay clock. Do not roll.\n"
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
                         + _divider("TRADE INSTRUCTION")
                         + _exit_order(qty)
                     ),
                     context=market,
                 ))
             else:
-                # Deep ITM but profitable — roll to restore leverage
+                # Deep ITM but profitable — roll to restore leverage (IV timing is crucial here)
                 roll_higher_lo = f"${strike * 1.10:.0f}" if strike else "~10%"
                 roll_higher_hi = f"${strike * 1.15:.0f}" if strike else "~15%"
                 alerts.append(Alert(
@@ -269,6 +381,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  → Sell current contract (lock in gains)\n"
                         + "  → Buy same expiry, higher strike (target Δ ~0.70)\n"
                         + "  → This resets leverage and reduces capital at risk\n"
+                        + _divider("IV TIMING — CRITICAL FOR ROLLS")
+                        + _iv_roll_context(iv_rank)
                         + _divider("TRADE INSTRUCTION")
                         + "  STEP 1 — SELL (close current position):\n"
                         + _exit_order(qty)
@@ -278,7 +392,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + f"  Target strike: {roll_higher_lo}–{roll_higher_hi}  (~10-15% above current ${strike})\n"
                         + "  Target delta on new contract: ~0.70\n"
                         + "  Same expiry as current contract.\n\n"
-                        + "  ROLL CHECK: Only proceed if net debit (Step 2 cost − Step 1 proceeds)\n"
+                        + "  ROLL CHECK: Only proceed if net debit (Step 2 − Step 1 proceeds)\n"
                         + "  is < 20% of your original Avg. Price. If higher, take full profit instead.\n"
                     ),
                     context=market,
@@ -298,6 +412,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  • Is the thesis still intact? (thesis score above)\n"
                     + "  • How much DTE is left? (if < 180d and deep OTM, consider exiting)\n"
                     + "  • Would the premium be better deployed in a fresh position?\n"
+                    + _divider("IV CONTEXT")
+                    + _iv_sell_context(iv_rank)
                 ),
                 context=market,
             ))
@@ -319,6 +435,12 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  premium regardless of underlying movement.\n\n"
                     + "  ACTION: Exit immediately regardless of P&L. No exceptions.\n"
                     + "  If thesis is still valid, re-enter with new LEAPS (>= 18 months).\n"
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
+                    + (
+                        f"\n  Note on re-entry: wait for IV to drop before buying the new LEAPS.\n"
+                        if iv_rank and iv_rank >= 50 else ""
+                    )
                     + _divider("TRADE INSTRUCTION")
                     + _exit_order(qty)
                     + "  Execute as soon as market opens. Do not wait.\n"
@@ -339,6 +461,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  Inside 90 days, theta acceleration compounds losses rapidly.\n"
                         + "  There is not enough time left for a meaningful recovery.\n\n"
                         + "  Do NOT roll a losing position inside 90 days — it amplifies losses.\n"
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
                         + _divider("TRADE INSTRUCTION")
                         + _exit_order(qty)
                         + "  Exit to preserve remaining capital.\n"
@@ -346,7 +470,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     context=market,
                 ))
             elif pnl is not None:
-                # Profitable with < 90 days — take the gain, don't roll inside 3 months
+                # Profitable with < 90 days — take the gain
                 alerts.append(Alert(
                     type="EXIT_TIME_URGENT", severity="RED",
                     subject=f"🔴 TAKE PROFIT — DTE < 90 Days: {ticker}  P&L: {pnl:+.1f}%",
@@ -359,6 +483,16 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  contract starts decaying at the same accelerated rate.\n\n"
                         + "  ACTION: Take the full profit. Close now.\n"
                         + "  If thesis is still strong, re-enter fresh LEAPS (>= 18 months).\n"
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
+                        + (
+                            f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — wait for IV to drop\n"
+                            f"  below 35% before buying the new LEAPS position.\n"
+                            if iv_rank and iv_rank >= 50 else
+                            f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — good conditions\n"
+                            f"  to buy back in after closing this position.\n"
+                            if iv_rank else ""
+                        )
                         + _divider("TRADE INSTRUCTION")
                         + _exit_order(qty)
                     ),
@@ -382,6 +516,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  → Sell current contract\n"
                         + "  → Buy same strike, + 12 months expiration\n"
                         + "  → Extends your runway toward the 5-10x target\n"
+                        + _divider("IV TIMING — CRITICAL FOR ROLLS")
+                        + _iv_roll_context(iv_rank)
                         + _divider("TRADE INSTRUCTION")
                         + "  STEP 1 — SELL (close current position):\n"
                         + _exit_order(qty)
@@ -390,7 +526,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + f"  ORDER: BUY {qty} contract{'s' if qty > 1 else ''} of {ticker}\n"
                         + f"  Same strike: ${strike}\n"
                         + f"  Target expiry: {_roll_target_exp()}  (current expiry + 12 months)\n\n"
-                        + "  ROLL CHECK: Only proceed if net debit (Step 2 cost − Step 1 proceeds)\n"
+                        + "  ROLL CHECK: Only proceed if net debit (Step 2 − Step 1 proceeds)\n"
                         + "  is < 20% of your original Avg. Price. If debit is higher, exit and redeploy.\n"
                     ),
                     context=market,
@@ -407,6 +543,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  Do NOT roll a losing position — it amplifies losses.\n"
                         + "  Monitor closely. If thesis is intact, hold and let it recover.\n"
                         + "  If thesis is weakening, plan your exit before DTE hits 90.\n"
+                        + _divider("IV CONTEXT")
+                        + _iv_sell_context(iv_rank)
                     ),
                     context=market,
                 ))
@@ -428,6 +566,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  Below -60%, statistical recovery to breakeven is very unlikely\n"
                     + "  within a reasonable timeframe.\n\n"
                     + "  Thesis may still be valid — re-enter fresh LEAPS if it is.\n"
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
+                    + (
+                        f"\n  Re-entry: IV is {iv_rank:.0f}% — wait for IV to normalize\n"
+                        f"  before buying back in.\n"
+                        if iv_rank and iv_rank >= 50 else ""
+                    )
                     + _divider("TRADE INSTRUCTION")
                     + _exit_order(qty)
                     + "  Exit the full position. Preserve remaining capital.\n"
@@ -436,6 +581,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
             ))
 
         elif pnl >= _T["profit_900"]:
+            iv_urgency = ""
+            if iv_rank and iv_rank >= 65:
+                iv_urgency = (
+                    f"\n  ★ IV Rank = {iv_rank:.0f}% — FOMO buyers are paying inflated prices.\n"
+                    f"  This is the optimal exit: 10x target + high IV = maximum proceeds.\n"
+                    f"  This combination rarely lasts. Execute today.\n"
+                )
             alerts.append(Alert(
                 type="PROFIT_900", severity="RED",
                 subject=f"🔴 10x TARGET HIT — EXIT ALL: {ticker}  P&L: {pnl:+.1f}%",
@@ -443,12 +595,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     hdr()
                     + "SIGNAL: 10x TARGET REACHED — FULL EXIT\n"
                     + f"{'─'*50}\n"
-                    + f"  Your position is up {pnl:+.1f}% — you've hit the 10x target!\n"
-                    + (f"  IV Rank is {iv_rank:.1f}% — market euphoria is at your back.\n" if iv_rank else "")
-                    + "\n"
+                    + f"  Your position is up {pnl:+.1f}% — you've hit the 10x target!\n\n"
                     + "  This is your full exit. You are selling to someone else's FOMO.\n"
                     + "  Do not wait for more — the final move from here has lower\n"
                     + "  probability and you've already captured the asymmetric return.\n"
+                    + iv_urgency
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
                     + _divider("TRADE INSTRUCTION")
                     + _exit_order(qty)
                     + "  Exit the entire remaining position.\n"
@@ -479,6 +632,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  → Set a mental stop on the trailing position: if it gives back\n"
                     + "    50% of gains, exit the remainder\n"
                     + roll_note
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
                     + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 75% trim)")
                     + _exit_order(n_trim)
                     + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — trailing to 10x\n" if n_hold > 0 else "")
@@ -487,24 +642,38 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
             ))
 
         elif pnl >= _T["profit_300"]:
-            # 4x milestone — the 3-5x zone
             n_trim = max(1, round(qty * 0.50))
             n_hold = qty - n_trim
+
+            # IV-adjusted roll guidance for the held portion
             if dte_days and dte_days > _T["dte_urgent"]:
-                roll_action = (
-                    f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
-                    f"    DTE = {dte_days} days. If < 270 days remain, consider rolling:\n"
-                    "    Sell current contract, buy same strike + 12 months.\n"
-                    "    This keeps you in the trade at reduced cost basis while\n"
-                    "    targeting the 7-10x level.\n"
-                    "    Roll check: debit must be < 20% of original Avg. Price.\n"
-                )
+                if iv_rank and iv_rank >= 60:
+                    roll_action = (
+                        f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
+                        f"    ⚠️  IV Rank = {iv_rank:.0f}% — rolling is expensive right now.\n"
+                        f"    Better: exit the remaining contracts too (collect high IV premium)\n"
+                        f"    and re-enter a fresh LEAPS when IV drops below 35%.\n"
+                    )
+                elif iv_rank and iv_rank < 30:
+                    roll_action = (
+                        f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
+                        f"    ★ IV Rank = {iv_rank:.0f}% — IDEAL TIME TO ROLL (cheap new contract).\n"
+                        f"    Roll: sell current, buy same strike + {_roll_target_exp()}.\n"
+                        f"    Roll check: debit < 20% of original Avg. Price.\n"
+                    )
+                else:
+                    roll_action = (
+                        f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
+                        f"    DTE = {dte_days} days. If < 270 days remain, consider rolling:\n"
+                        f"    Sell current, buy same strike + {_roll_target_exp()}.\n"
+                        f"    Roll check: debit < 20% of original Avg. Price.\n"
+                    )
             else:
                 roll_action = (
                     f"  → For the remaining {n_hold} contract{'s' if n_hold != 1 else ''}:\n"
                     f"    DTE = {dte_days} days — too short to roll cost-effectively.\n"
-                    "    Exit the remainder and redeploy into fresh LEAPS if\n"
-                    "    thesis is still intact and you want more upside.\n"
+                    f"    Exit the remainder and redeploy into fresh LEAPS if\n"
+                    f"    thesis is still intact and you want more upside.\n"
                 )
 
             alerts.append(Alert(
@@ -525,6 +694,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  ✓ Secures substantial gains that cannot be taken away\n"
                     + "  ✓ Keeps exposure to the 7-10x move if thesis plays out\n"
                     + "  ✓ Reduces capital at risk significantly\n"
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
                     + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 50% trim)")
                     + _exit_order(n_trim)
                     + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — targeting 7-10x\n" if n_hold > 0 else "")
@@ -535,6 +706,22 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
         elif pnl >= _T["profit_100"]:
             n_trim = max(1, round(qty * 0.20))
             n_hold = qty - n_trim
+
+            # IV adjusts urgency: high IV = sell now, low IV = can wait a bit
+            iv_note = ""
+            if iv_rank and iv_rank >= 65:
+                iv_note = (
+                    f"\n  ★ IV Rank = {iv_rank:.0f}% — this is a great time to take the trim.\n"
+                    f"  You're selling expensive paper. Execute the 20% now.\n"
+                )
+            elif iv_rank and iv_rank < 25:
+                iv_note = (
+                    f"\n  IV Rank = {iv_rank:.0f}% — options are cheap right now.\n"
+                    f"  You're at the 2x milestone but IV is compressed. If DTE > 270,\n"
+                    f"  consider waiting for an IV spike before trimming to maximize proceeds.\n"
+                    f"  If DTE < 270, take the trim regardless.\n"
+                )
+
             alerts.append(Alert(
                 type="PROFIT_100", severity="AMBER",
                 subject=f"⚠️ FIRST TRIM — {ticker} Up 2x: {pnl:+.1f}%",
@@ -549,6 +736,9 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + "  Do NOT sell the full position here. Selling at 2x is the\n"
                     + "  most common mistake in LEAPS trading — it sacrifices the\n"
                     + "  asymmetric return that justifies buying options in the first place.\n"
+                    + iv_note
+                    + _divider("IV TIMING")
+                    + _iv_sell_context(iv_rank)
                     + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — ~20% trim)")
                     + _exit_order(n_trim)
                     + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — keep riding\n" if n_hold > 0 else "")
@@ -588,14 +778,20 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
             score += 20
             reasons.append(f"Weekly RSI = {weekly_rsi:.1f} (approaching oversold)")
 
-    # IV Rank signal (cheap options)
+    # IV Rank signal — the most important timing factor for option buyers
     if iv_rank is not None:
-        if iv_rank < 25:
-            score += 30
-            reasons.append(f"IV Rank = {iv_rank:.1f}% (options are cheap — good to buy premium)")
-        elif iv_rank < 35:
-            score += 15
-            reasons.append(f"IV Rank = {iv_rank:.1f}% (options reasonably priced)")
+        if iv_rank < 20:
+            score += 35   # Extra weight: exceptionally cheap options
+            reasons.append(f"IV Rank = {iv_rank:.1f}% ★ — options are VERY cheap (top timing signal)")
+        elif iv_rank < 30:
+            score += 25
+            reasons.append(f"IV Rank = {iv_rank:.1f}% — options are cheap, good time to buy premium")
+        elif iv_rank < 40:
+            score += 10
+            reasons.append(f"IV Rank = {iv_rank:.1f}% — options are reasonably priced")
+        elif iv_rank >= 60:
+            score -= 20   # Penalty: buying expensive options is a drag on LEAPS returns
+            reasons.append(f"IV Rank = {iv_rank:.1f}% ⚠️ — options are expensive, reduces entry quality")
 
     # Price vs 52-week range
     if pct_from_low is not None:
@@ -627,9 +823,11 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
             "  • Delta:   0.25-0.40  (moderate OTM — balanced leverage / cost)\n"
             "  • Strike:  15-25% OTM from current price\n"
             "  • Expiry:  Furthest available >= 18 months\n"
-            "  • Target return: 5-10x from this entry\n"
+            "  • Target return: 5-10x from this entry\n\n"
+            + _iv_entry_context(iv_rank)
             if score >= 60 else
-            "  Keep monitoring. Alert again when score reaches 60+.\n"
+            "  Keep monitoring. Alert again when score reaches 60+.\n\n"
+            + _iv_entry_context(iv_rank)
         )
     )
 
@@ -637,7 +835,8 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
     return Alert(
         type     = "ENTRY_SIGNAL" if score >= 60 else "ENTRY_WATCH",
         severity = severity,
-        subject  = f"{emoji} {action}: {ticker}  Entry Score {score}/100",
+        subject  = f"{emoji} {action}: {ticker}  Entry Score {score}/100"
+                   + (f"  IV Rank {iv_rank:.0f}%" if iv_rank is not None else ""),
         body     = body,
         context  = {"entry_score": score, "weekly_rsi": weekly_rsi,
                     "iv_rank": iv_rank, "pct_from_low": pct_from_low},

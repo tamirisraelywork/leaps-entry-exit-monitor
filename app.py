@@ -66,6 +66,20 @@ _POSTURE_EMOJI = {
 }
 
 
+@st.cache_data(ttl=3600)
+def _get_iv_rank_cached(ticker: str) -> float | None:
+    """Fetch IV rank for a ticker and cache for 1 hour (slow API call)."""
+    try:
+        from iv_rank import get_iv_rank_advanced
+        result = get_iv_rank_advanced(ticker)
+        if result and "Success" in result:
+            m = re.search(r"([\d.]+)", result.split("is:")[-1])
+            return float(m.group(1)) if m else None
+    except Exception:
+        pass
+    return None
+
+
 def _live_market(pos: dict) -> dict:
     """Fetch live market data for a single position (with IV Rank)."""
     ticker   = pos.get("ticker", "")
@@ -74,23 +88,13 @@ def _live_market(pos: dict) -> dict:
     if contract:
         snapshot = options_data.get_option_snapshot(ticker, contract) or {}
 
-    iv_rank = None
-    try:
-        from iv_rank import get_iv_rank_advanced
-        result = get_iv_rank_advanced(ticker)
-        if result and "Success" in result:
-            m = re.search(r"([\d.]+)", result.split("is:")[-1])
-            iv_rank = float(m.group(1)) if m else None
-    except Exception:
-        pass
-
     return {
         "mid":          snapshot.get("mid"),
         "bid":          snapshot.get("bid"),
         "ask":          snapshot.get("ask"),
         "delta":        snapshot.get("delta"),
         "dte":          snapshot.get("dte"),
-        "iv_rank":      iv_rank,
+        "iv_rank":      _get_iv_rank_cached(ticker),
         "thesis_score": db.get_leaps_monitor_score(ticker),
     }
 
@@ -199,7 +203,7 @@ if page == "Dashboard":
                         "ask":          snap.get("ask"),
                         "delta":        snap.get("delta"),
                         "dte":          snap.get("dte") or dte_fallback,
-                        "iv_rank":      None,
+                        "iv_rank":      _get_iv_rank_cached(ticker),
                         "thesis_score": db.get_leaps_monitor_score(ticker),
                     }
 
@@ -247,6 +251,8 @@ if page == "Dashboard":
                 m4.metric("Delta",        f"{delta:.2f}" if delta     else "N/A")
                 m5.metric("DTE",          f"{dte_days}d" if dte_days  else "N/A")
                 m6.metric("Thesis Score", f"{score}/100" if score     else "N/A")
+                if score is None:
+                    m6.caption("[Analyze ↗](https://leaps-evaluator.streamlit.app/)")
 
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")

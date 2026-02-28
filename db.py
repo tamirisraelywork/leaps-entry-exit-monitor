@@ -270,14 +270,31 @@ def get_alerts(ticker: str = None, limit: int = 200) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def get_leaps_monitor_score(ticker: str) -> int | None:
-    """Pull latest thesis score from the existing LEAPS Monitor BigQuery table."""
+    """Pull latest thesis score from the existing LEAPS Monitor BigQuery table.
+
+    Tries DATASET_ID first (the secret name used by the LEAPS Monitor itself),
+    then falls back to LEAPS_MONITOR_DATASET. Handles dataset IDs that already
+    include a project prefix (e.g. "myproject.leaps_monitor").
+    """
     try:
         client = get_client()
-        dataset = st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+        # DATASET_ID matches the LEAPS Monitor's own secret naming convention
+        raw_dataset = (
+            st.secrets.get("DATASET_ID")
+            or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+        )
         table = st.secrets.get("LEAPS_MONITOR_TABLE", "master_table")
+
+        # If DATASET_ID already includes a project prefix (e.g. "proj.dataset"),
+        # use it as-is; otherwise prepend the current project.
+        if "." in str(raw_dataset):
+            full_table = f"`{raw_dataset}.{table}`"
+        else:
+            full_table = f"`{client.project}.{raw_dataset}.{table}`"
+
         q = f"""
             SELECT Score
-            FROM `{client.project}.{dataset}.{table}`
+            FROM {full_table}
             WHERE UPPER(Ticker) = UPPER(@ticker)
             ORDER BY date DESC
             LIMIT 1

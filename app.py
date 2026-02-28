@@ -636,10 +636,19 @@ elif page == "Alert History":
     with fc3:
         filter_type = st.multiselect(
             "Alert type",
-            ["EXIT_THESIS", "EXIT_STOP", "EXIT_TIME_URGENT", "EXIT_TIME_WARNING",
-             "ROLL_DELTA", "ROLL_TIME", "PROFIT_50", "PROFIT_100", "PROFIT_200",
-             "PROFIT_300", "PROFIT_500", "PROFIT_900", "ENTRY_SIGNAL", "ENTRY_WATCH",
-             "DAILY_SUMMARY", "DELTA_WARN"],
+            [
+                # Threshold-based (Pillars 1-5)
+                "EXIT_THESIS", "EXIT_STOP", "EXIT_TIME_URGENT", "EXIT_TIME_WARNING",
+                "ROLL_DELTA", "ROLL_TIME",
+                "PROFIT_100", "PROFIT_300", "PROFIT_600", "PROFIT_900",
+                "ENTRY_SIGNAL", "ENTRY_WATCH", "DELTA_WARN",
+                # IV Timing (Pillar 6) — fires when IV window is optimal
+                "IV_EXIT_NOW", "IV_TRIM_NOW",
+                "IV_ROLL_SELL_NOW", "IV_ROLL_BUY_NOW",
+                "IV_ENTRY_OPTIMAL",
+                # System
+                "DAILY_SUMMARY",
+            ],
             placeholder="All types",
         )
 

@@ -746,6 +746,157 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 context=market,
             ))
 
+    # -----------------------------------------------------------------------
+    # PILLAR 6 — IV Timing: Strike while the iron is hot
+    # -----------------------------------------------------------------------
+    # These fire ON TOP OF Pillars 1-5 when IV rank creates an especially
+    # favorable execution window. Each has its own alert type for independent
+    # deduplication — so you may get both ROLL_DELTA and IV_ROLL_SELL_NOW on
+    # the same day. They answer: "I know I need to act — but is TODAY optimal?"
+    if iv_rank is not None:
+        posture_types = {a.type for a in alerts}
+        has_exit = bool({"EXIT_THESIS", "EXIT_STOP", "EXIT_TIME_URGENT"} & posture_types)
+        has_roll = bool({"ROLL_DELTA", "ROLL_TIME"} & posture_types)
+        has_trim = bool({"PROFIT_100", "PROFIT_300", "PROFIT_600", "PROFIT_900"} & posture_types)
+
+        # ── IV HIGH (≥ 65%): prime selling window ───────────────────────────
+        if iv_rank >= 65:
+
+            if has_exit and pnl is not None:
+                alerts.append(Alert(
+                    type="IV_EXIT_NOW", severity="RED",
+                    subject=(
+                        f"🔴 IV PRIME — EXIT NOW: {ticker}  "
+                        f"IV Rank {iv_rank:.0f}%  P&L: {pnl:+.1f}%"
+                    ),
+                    body=(
+                        hdr()
+                        + "SIGNAL: IV PRIME — EXECUTE YOUR EXIT TODAY\n"
+                        + f"{'─'*50}\n"
+                        + f"  IV Rank = {iv_rank:.0f}%. Options are in the top "
+                        + f"{100 - iv_rank:.0f}% of their\n"
+                        + "  historical volatility range. Buyers are paying a\n"
+                        + "  fear/FOMO premium on top of every contract right now.\n\n"
+                        + "  You already have an exit signal from the position analysis.\n"
+                        + "  IV at this level maximizes your proceeds. This window is\n"
+                        + "  temporary — IV normalizes fast when sentiment shifts.\n"
+                        + "  Execute today. Do not wait for a 'better' price.\n"
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
+                        + "  Set limit at bid or 1% below mid. You will get filled.\n"
+                    ),
+                    context=market,
+                ))
+
+            if has_roll and not has_exit:
+                alerts.append(Alert(
+                    type="IV_ROLL_SELL_NOW", severity="BLUE",
+                    subject=(
+                        f"🔵 IV HIGH — SELL CURRENT CONTRACT NOW: {ticker}  "
+                        f"IV {iv_rank:.0f}%  |  Wait for IV < 35% to buy new"
+                    ),
+                    body=(
+                        hdr()
+                        + "SIGNAL: IV HIGH — EXECUTE THE SELL LEG OF YOUR ROLL NOW\n"
+                        + f"{'─'*50}\n"
+                        + f"  IV Rank = {iv_rank:.0f}%. Your position needs a roll.\n"
+                        + "  With IV this elevated, your current contract is near its\n"
+                        + "  maximum extrinsic value. Selling now collects that premium.\n\n"
+                        + "  ⚡ DO NOT buy the new contract yet.\n"
+                        + "  Wait until IV drops below 35%, then buy the new LEAPS\n"
+                        + "  cheaply. You will receive an IV_ROLL_BUY_NOW alert when\n"
+                        + "  that window opens.\n\n"
+                        + "  Split execution typically saves 15-25% on the cost of\n"
+                        + "  the new contract vs. rolling in one session.\n"
+                        + _divider("STEP 1 — SELL CURRENT CONTRACT (execute today)")
+                        + _exit_order(qty)
+                        + "\n"
+                        + f"  STEP 2 — BUY NEW CONTRACT (execute LATER when IV < 35%):\n"
+                        + f"  ORDER: BUY {qty} contract{'s' if qty > 1 else ''} of {ticker}\n"
+                        + f"  Strike: ${strike}  |  Target expiry: {_roll_target_exp()}\n"
+                        + "  Target delta: ~0.70  |  Wait for IV_ROLL_BUY_NOW alert\n"
+                    ),
+                    context=market,
+                ))
+
+            if has_trim and not has_exit and pnl is not None:
+                # Match trim size to whichever profit level is active
+                if "PROFIT_600" in posture_types or "PROFIT_900" in posture_types:
+                    iv_n_trim = max(1, round(qty * 0.75))
+                elif "PROFIT_300" in posture_types:
+                    iv_n_trim = max(1, round(qty * 0.50))
+                else:   # PROFIT_100
+                    iv_n_trim = max(1, round(qty * 0.20))
+                iv_n_hold = qty - iv_n_trim
+                alerts.append(Alert(
+                    type="IV_TRIM_NOW", severity="BLUE",
+                    subject=(
+                        f"🔵 IV PRIME — TRIM NOW: {ticker}  "
+                        f"IV {iv_rank:.0f}%  P&L: {pnl:+.1f}%"
+                    ),
+                    body=(
+                        hdr()
+                        + "SIGNAL: IV PRIME — BEST MOMENT TO EXECUTE YOUR TRIM\n"
+                        + f"{'─'*50}\n"
+                        + f"  IV Rank = {iv_rank:.0f}%. You have a profit milestone\n"
+                        + "  AND options are priced at an elevated volatility premium.\n\n"
+                        + "  This combination is rare:\n"
+                        + "  ✓ P&L target has been hit (profit alert already sent)\n"
+                        + "  ✓ High IV adds extra extrinsic premium on top of gains\n"
+                        + "  ✓ Buyers are paying a fear/FOMO premium right now\n\n"
+                        + "  Executing today captures intrinsic + inflated extrinsic.\n"
+                        + "  When IV normalizes, that extrinsic premium disappears.\n"
+                        + _divider(f"TRADE INSTRUCTION  ({iv_n_trim}/{qty} contracts)")
+                        + _exit_order(iv_n_trim)
+                        + (
+                            f"  Keep remaining: {iv_n_hold} contract"
+                            + f"{'s' if iv_n_hold != 1 else ''} — trailing to target\n"
+                            if iv_n_hold > 0 else ""
+                        )
+                    ),
+                    context=market,
+                ))
+
+        # ── IV LOW (≤ 30%): prime buying window for the new contract ────────
+        if iv_rank <= 30 and has_roll and not has_exit:
+            alerts.append(Alert(
+                type="IV_ROLL_BUY_NOW", severity="GREEN",
+                subject=(
+                    f"🟢 IV LOW — BUY NEW LEAPS NOW: {ticker}  "
+                    f"IV {iv_rank:.0f}%  (roll step 2 / re-entry)"
+                ),
+                body=(
+                    hdr()
+                    + "SIGNAL: IV LOW — OPTIMAL WINDOW TO ENTER THE NEW CONTRACT\n"
+                    + f"{'─'*50}\n"
+                    + f"  IV Rank = {iv_rank:.0f}%. Options are CHEAP right now.\n"
+                    + "  This is the optimal window to buy your new LEAPS contract.\n\n"
+                    + "  SCENARIO A — You already sold your current contract:\n"
+                    + "  → BUY NOW. IV this low means you pay minimal extrinsic value.\n"
+                    + "    Your new position starts with a structural cost advantage.\n"
+                    + "    Any future IV expansion will boost your value immediately.\n\n"
+                    + "  SCENARIO B — You still hold the current contract:\n"
+                    + f"  → IV at {iv_rank:.0f}% is not ideal for the sell side,\n"
+                    + "    but the buy discount may offset it. Consider rolling today:\n"
+                    + "    Net roll debit < 20% of original Avg. Price → proceed.\n"
+                    + "    Net roll debit ≥ 20% → wait for IV to rise, sell first.\n"
+                    + _divider("BUY INSTRUCTION (the new contract)")
+                    + f"  ORDER: BUY {qty} contract{'s' if qty > 1 else ''} of {ticker}\n"
+                    + f"  Strike: ${strike}  (same as current)\n"
+                    + f"  Target expiry: {_roll_target_exp()}  (current expiry + 12 months)\n"
+                    + "  Target delta on new contract: ~0.70\n\n"
+                    + "  Set limit at ask or 1% above mid. Fill promptly.\n"
+                    + (
+                        f"  Roll check: net debit should be < "
+                        f"${entry_price * 0.20:.2f}/share "
+                        f"(20% of your ${entry_price}/share Avg. Price).\n"
+                        if entry_price else
+                        "  Roll check: net debit < 20% of your original Avg. Price.\n"
+                    )
+                ),
+                context=market,
+            ))
+
     return alerts
 
 
@@ -803,6 +954,37 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
             reasons.append(f"Stock is in lower third of 52-week range ({pct_from_low*100:.0f}% from low)")
 
     if score < 40:
+        # Still fire if IV is at floor — cheap options is a standalone signal
+        # even when RSI and price position aren't fully aligned yet.
+        if iv_rank is not None and iv_rank <= 25:
+            return Alert(
+                type="IV_ENTRY_OPTIMAL", severity="GREEN",
+                subject=f"🟢 IV AT FLOOR — BUY LEAPS CHEAP: {ticker}  IV Rank {iv_rank:.0f}%",
+                body=(
+                    f"{'─'*50}\n"
+                    f"WATCHLIST TICKER:  {ticker}\n"
+                    + (f"Current Price:     ${price:.2f}\n" if price else "")
+                    + f"IV Rank:           {iv_rank:.0f}% ★ FLOOR LEVEL\n"
+                    + f"Entry Score:       {score}/100  (other signals not yet aligned)\n"
+                    + f"{'─'*50}\n"
+                    + "SIGNAL: OPTIONS ARE AT THEIR CHEAPEST\n\n"
+                    + f"  IV Rank = {iv_rank:.0f}% means options on {ticker} are cheaper\n"
+                    + "  than they've been during 75%+ of the past year.\n\n"
+                    + "  Other entry signals (RSI, 52-week position) aren't fully\n"
+                    + "  aligned yet — but IV this cheap is a standalone reason to\n"
+                    + "  consider entering. Even if the stock stalls for weeks, an\n"
+                    + "  IV expansion alone can boost your option value 15-30%.\n\n"
+                    + "  WHEN TO ACT:\n"
+                    + "  → Buy now if you have conviction in the thesis.\n"
+                    + "  → Target delta:  0.25-0.40\n"
+                    + "  → Strike:        15-25% OTM from current price\n"
+                    + "  → Expiry:        Furthest available >= 18 months\n\n"
+                    + "  This IV floor window typically lasts 1-5 trading days.\n"
+                    + "  Act promptly once you decide — IV can spike overnight.\n"
+                    + (f"\n  Current price: ${price:.2f}\n" if price else "")
+                ),
+                context={"iv_rank": iv_rank, "entry_score": score, "ticker": ticker},
+            )
         return None  # not close enough to optimal entry
 
     severity = "GREEN" if score >= 60 else "AMBER"

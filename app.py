@@ -328,9 +328,12 @@ if page == "Dashboard":
                             }
                             if new_entry_date:
                                 updates["entry_date"] = new_entry_date
-                            db.update_position(pos_id, updates)
-                            del st.session_state["editing_pos_id"]
-                            st.rerun()
+                            try:
+                                db.update_position(pos_id, updates)
+                                del st.session_state["editing_pos_id"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Save failed: {e}")
                     with sv2:
                         if st.button("Cancel", key=f"cancel_{pos_id}"):
                             del st.session_state["editing_pos_id"]

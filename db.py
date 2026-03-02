@@ -81,6 +81,23 @@ def ensure_tables():
         except Exception:
             client.create_table(bigquery.Table(tbl_ref, schema=schema))
 
+    # ── Column migrations (add new columns to existing tables) ──────────────
+    # BigQuery ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent — safe to
+    # run on every startup.  Only the positions table needs new columns here.
+    _migrate_cols = [
+        ("quantity_trimmed",   "INT64"),
+        ("proceeds_from_trims", "FLOAT64"),
+    ]
+    pos_tbl_ref = f"`{client.project}.{DATASET}.positions`"
+    for col_name, col_type in _migrate_cols:
+        try:
+            client.query(
+                f"ALTER TABLE {pos_tbl_ref} "
+                f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+            ).result()
+        except Exception:
+            pass   # column already exists or DDL not supported — ignore
+
 
 # ---------------------------------------------------------------------------
 # Positions
@@ -165,7 +182,8 @@ def update_position(position_id: str, fields: dict):
     """
     client = get_client()
     allowed = {"entry_price", "quantity", "entry_date", "expiration_date",
-               "strike", "mode", "notes", "contract"}
+               "strike", "mode", "notes", "contract",
+               "quantity_trimmed", "proceeds_from_trims"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
@@ -178,9 +196,9 @@ def update_position(position_id: str, fields: dict):
             if isinstance(val, date):
                 val = val.isoformat()
             bq_type = "DATE"
-        elif col in ("entry_price", "strike"):
+        elif col in ("entry_price", "strike", "proceeds_from_trims"):
             bq_type = "FLOAT64"
-        elif col == "quantity":
+        elif col in ("quantity", "quantity_trimmed"):
             bq_type = "INT64"
         else:
             bq_type = "STRING"
@@ -308,3 +326,41 @@ def get_leaps_monitor_score(ticker: str) -> int | None:
     except Exception:
         pass
     return None
+
+
+def get_leaps_monitor_score_with_age(ticker: str) -> tuple[int | None, int | None]:
+    """Return (score, days_since_last_scored) or (None, None) if not found."""
+    try:
+        client = get_client()
+        raw_dataset = (
+            st.secrets.get("DATASET_ID")
+            or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+        )
+        table = st.secrets.get("LEAPS_MONITOR_TABLE", "master_table")
+        if "." in str(raw_dataset):
+            full_table = f"`{raw_dataset}.{table}`"
+        else:
+            full_table = f"`{client.project}.{raw_dataset}.{table}`"
+        q = f"""
+            SELECT Score, date
+            FROM {full_table}
+            WHERE UPPER(Ticker) = UPPER(@ticker)
+            ORDER BY date DESC
+            LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+        )
+        rows = list(client.query(q, job_config=job_config).result())
+        if rows:
+            score = int(float(rows[0]["Score"]))
+            d = rows[0]["date"]
+            try:
+                last_date = date.fromisoformat(str(d)[:10])
+                days_old = (date.today() - last_date).days
+            except Exception:
+                days_old = None
+            return score, days_old
+    except Exception:
+        pass
+    return None, None

@@ -186,7 +186,9 @@ def _header(pos: dict, market: dict) -> str:
     ticker   = pos.get("ticker", "?")
     strike   = pos.get("strike", "?")
     exp      = pos.get("expiration_date", "?")
-    qty      = pos.get("quantity", "?")
+    qty_total_h  = pos.get("quantity", "?")
+    qty_trimmed_h = int(pos.get("quantity_trimmed") or 0)
+    qty_remaining_h = (int(qty_total_h) - qty_trimmed_h) if str(qty_total_h).isdigit() else qty_total_h
     entry_p  = pos.get("entry_price", "?")
     mid      = market.get("mid")
     pnl      = market.get("pnl_pct")
@@ -198,9 +200,16 @@ def _header(pos: dict, market: dict) -> str:
     pnl_str  = f"{pnl:+.1f}%" if pnl is not None else "N/A"
     mid_str  = f"${mid:.2f}" if mid else "N/A"
     cost_basis = ""
+    proceeds_line = ""
     try:
-        cb = float(entry_p) * float(qty) * 100
+        cb = float(entry_p) * float(qty_total_h) * 100
         cost_basis = f"  Cost Basis:   ${cb:,.0f}\n"
+        prec = float(pos.get("proceeds_from_trims") or 0)
+        if qty_trimmed_h > 0:
+            cost_basis = (
+                f"  Cost Basis:   ${cb:,.0f} original  "
+                f"({qty_trimmed_h} trimmed, ${prec:,.0f} recovered)\n"
+            )
     except Exception:
         pass
 
@@ -212,7 +221,7 @@ def _header(pos: dict, market: dict) -> str:
         f"POSITION\n"
         f"{'─'*50}\n"
         f"  Stock:        {ticker}\n"
-        f"  Contract:     {exp} ${strike} Call  |  {qty} contracts\n"
+        f"  Contract:     {exp} ${strike} Call  |  {qty_remaining_h}/{qty_total_h} contracts remaining\n"
         f"  Avg. Price:   ${entry_p}/share\n"
         + cost_basis +
         f"  Current mid:  {mid_str}\n"
@@ -254,7 +263,15 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     ticker       = position.get("ticker", "?")
     exp_date     = position.get("expiration_date")
     strike       = position.get("strike")
-    qty          = int(position.get("quantity") or 1)
+
+    # Total original contracts purchased
+    qty_total    = int(position.get("quantity") or 1)
+    # Contracts already sold/trimmed
+    qty_trimmed  = int(position.get("quantity_trimmed") or 0)
+    # Effective quantity for ALL order calculations going forward
+    qty          = max(1, qty_total - qty_trimmed)
+    # Dollar proceeds already recovered from trims
+    proceeds_recovered = float(position.get("proceeds_from_trims") or 0.0)
 
     mid          = market.get("mid")
     bid          = market.get("bid")

@@ -19,6 +19,7 @@ import pytz
 import db
 import options_data
 import email_alerts
+import score_thesis
 from exit_engine import evaluate, evaluate_entry
 from technical import get_price_and_range, get_weekly_rsi
 
@@ -169,6 +170,44 @@ def run_watchlist_checks():
             logger.error(f"Error checking watchlist position {pos.get('ticker')}: {e}")
 
 
+def run_thesis_refresh():
+    """
+    Re-score thesis for every active ticker whose score is stale.
+
+    Staleness thresholds (expert recommendation):
+      Normal months:   > 30 days since last score
+      Earnings months: >  7 days since last score  (Feb / May / Aug / Nov)
+
+    Runs daily at 6 AM ET so the score going into each trading day is fresh.
+    Each ticker takes ~20-40 seconds (yfinance + one Gemini call).
+    """
+    logger.info("Running thesis refresh check...")
+    try:
+        positions = db.get_positions(mode="ACTIVE")
+    except Exception as e:
+        logger.error(f"Thesis refresh: could not fetch positions: {e}")
+        return
+
+    seen = set()   # deduplicate tickers (multiple contracts on same stock)
+    for pos in positions:
+        ticker = pos.get("ticker", "")
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        try:
+            if score_thesis.needs_refresh(ticker):
+                logger.info(f"Thesis refresh: scoring {ticker}")
+                score, verdict = score_thesis.compute_and_save_score(ticker)
+                if score is not None:
+                    logger.info(f"Thesis refresh: {ticker} → {score} ({verdict})")
+                else:
+                    logger.warning(f"Thesis refresh: scoring failed for {ticker}")
+            else:
+                logger.info(f"Thesis refresh: {ticker} score is fresh — skipping")
+        except Exception as e:
+            logger.error(f"Thesis refresh error for {ticker}: {e}")
+
+
 def send_morning_summary():
     """Build and send the daily portfolio summary email."""
     logger.info("Sending daily summary...")
@@ -239,6 +278,21 @@ def start_scheduler():
             timezone=ET,
         ),
         id="daily_summary",
+        replace_existing=True,
+    )
+
+    # Thesis refresh — 6:00 AM ET, Mon-Fri
+    # Re-scores stale tickers before the trading day opens.
+    # Staleness = 30 days normally, 7 days in earnings months (Feb/May/Aug/Nov).
+    scheduler.add_job(
+        run_thesis_refresh,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=6,
+            minute=0,
+            timezone=ET,
+        ),
+        id="thesis_refresh",
         replace_existing=True,
     )
 

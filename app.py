@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 import db
 import options_data
 import email_alerts
+import score_thesis
 from recommender import recommend_options, format_recommendation
 from technical import get_price_and_range, get_weekly_rsi
 from exit_engine import evaluate, evaluate_entry
@@ -89,13 +90,15 @@ def _live_market(pos: dict) -> dict:
         snapshot = options_data.get_option_snapshot(ticker, contract) or {}
 
     return {
-        "mid":          snapshot.get("mid"),
-        "bid":          snapshot.get("bid"),
-        "ask":          snapshot.get("ask"),
-        "delta":        snapshot.get("delta"),
-        "dte":          snapshot.get("dte"),
-        "iv_rank":      _get_iv_rank_cached(ticker),
-        "thesis_score": db.get_leaps_monitor_score(ticker),
+        "mid":     snapshot.get("mid"),
+        "bid":     snapshot.get("bid"),
+        "ask":     snapshot.get("ask"),
+        "delta":   snapshot.get("delta"),
+        "dte":     snapshot.get("dte"),
+        "iv_rank": _get_iv_rank_cached(ticker),
+        # thesis_score injected separately in the dashboard loop
+        # so we can also show the score age
+        "thesis_score": None,
     }
 
 
@@ -204,14 +207,19 @@ if page == "Dashboard":
                         "delta":        snap.get("delta"),
                         "dte":          snap.get("dte") or dte_fallback,
                         "iv_rank":      _get_iv_rank_cached(ticker),
-                        "thesis_score": db.get_leaps_monitor_score(ticker),
+                        "thesis_score": None,  # injected below from get_leaps_monitor_score_with_age
                     }
 
             mid      = mkt.get("mid")
             delta    = mkt.get("delta")
             dte_days = mkt.get("dte")
-            score    = mkt.get("thesis_score")
             pnl      = _pnl_pct(ep, mid)
+
+            # Thesis score + age (for staleness display)
+            score, score_age = db.get_leaps_monitor_score_with_age(ticker)
+
+            # Inject thesis score into mkt so evaluate() sees it
+            mkt["thesis_score"] = score
 
             # Run evaluation once — drives both badge AND inline recommendation
             position_alerts = evaluate(pos, mkt)
@@ -227,12 +235,25 @@ if page == "Dashboard":
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
             emoji = _POSTURE_EMOJI.get(severity, "🟢")
 
+            qty_trimmed = int(pos.get("quantity_trimmed") or 0)
+            proceeds    = float(pos.get("proceeds_from_trims") or 0.0)
+            qty_remaining = int(qty or 0) - qty_trimmed
+
             with st.container(border=True):
                 h1, h2 = st.columns([5, 1])
                 with h1:
                     cb_str = f"  ·  Cost Basis ${cost_basis:,.0f}" if cost_basis else ""
+                    trim_str = ""
+                    if qty_trimmed > 0:
+                        trim_str = (
+                            f"  ·  {qty_remaining} remaining ({qty_trimmed} trimmed"
+                            + (f", ${proceeds:,.0f} recovered" if proceeds else "")
+                            + ")"
+                        )
                     st.markdown(
-                        f"### {ticker} — {exp} ${strike} Call  ·  {qty} contract{'s' if int(qty or 1) > 1 else ''}{cb_str}"
+                        f"### {ticker} — {exp} ${strike} Call  ·  "
+                        f"{qty} contract{'s' if int(qty or 1) > 1 else ''}"
+                        f"{cb_str}{trim_str}"
                     )
                 with h2:
                     st.markdown(
@@ -250,9 +271,25 @@ if page == "Dashboard":
                           delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"))
                 m4.metric("Delta",        f"{delta:.2f}" if delta     else "N/A")
                 m5.metric("DTE",          f"{dte_days}d" if dte_days  else "N/A")
-                m6.metric("Thesis Score", f"{score}/100" if score     else "N/A")
-                if score is None:
-                    m6.caption("[Analyze ↗](https://leaps-evaluator.streamlit.app/)")
+                # Thesis score with age indicator
+                if score is not None:
+                    age_label = f" ({score_age}d ago)" if score_age is not None else ""
+                    stale = score_age is not None and score_age > 30
+                    m6.metric("Thesis Score", f"{score}/100{age_label}",
+                              delta="⚠️ stale" if stale else None,
+                              delta_color="inverse" if stale else "normal")
+                else:
+                    m6.metric("Thesis Score", "N/A")
+                with m6:
+                    if st.button("↻ Re-score", key=f"rescore_{pos_id}",
+                                 help="Re-compute thesis score now using yfinance + Gemini"):
+                        with st.spinner(f"Scoring {ticker} thesis (~30s)..."):
+                            new_score, new_verdict = score_thesis.compute_and_save_score(ticker)
+                        if new_score is not None:
+                            st.success(f"Score updated: {new_score}/100 ({new_verdict})")
+                            st.rerun()
+                        else:
+                            st.error("Scoring failed — check logs")
 
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")
@@ -339,6 +376,36 @@ if page == "Dashboard":
                         cb_preview = new_ep * new_qty * 100
                         st.metric("Cost Basis (preview)", f"${cb_preview:,.0f}",
                                   help="Avg. Price × Pos × 100 — verify against IBKR")
+
+                    # Trim tracking row
+                    st.markdown("**Trim tracking** — record contracts you've already sold")
+                    tr1, tr2 = st.columns(2)
+                    with tr1:
+                        new_qty_trimmed = st.number_input(
+                            "Contracts sold so far (trimmed)",
+                            value=int(pos.get("quantity_trimmed") or 0),
+                            min_value=0, max_value=int(new_qty), step=1,
+                            help="How many contracts you've already sold from this position",
+                            key=f"qtrim_{pos_id}")
+                    with tr2:
+                        new_proceeds = st.number_input(
+                            "Total proceeds from trims ($)",
+                            value=float(pos.get("proceeds_from_trims") or 0.0),
+                            min_value=0.0, step=100.0, format="%.0f",
+                            help="Total dollar amount received from all trim sales",
+                            key=f"proc_{pos_id}")
+                    # House money indicator
+                    if new_qty_trimmed > 0 and new_proceeds > 0:
+                        remaining_cost = new_ep * (new_qty - new_qty_trimmed) * 100
+                        if new_proceeds >= new_ep * new_qty * 100:
+                            st.success(f"HOUSE MONEY — cost fully recovered. "
+                                       f"Remaining {int(new_qty) - new_qty_trimmed} contracts cost $0 net.")
+                        elif new_proceeds > 0:
+                            net_cost = max(0, remaining_cost - (new_proceeds - new_ep * new_qty_trimmed * 100))
+                            st.info(f"Cost recovered: ${new_proceeds:,.0f}  |  "
+                                    f"Remaining net cost: ~${remaining_cost:,.0f}  |  "
+                                    f"Trimmed: {new_qty_trimmed}/{int(new_qty)} contracts")
+
                     new_notes = st.text_area("Notes", value=notes or "", key=f"notes_{pos_id}")
                     sv1, sv2 = st.columns([1, 5])
                     with sv1:
@@ -347,13 +414,15 @@ if page == "Dashboard":
                             opt_type_char = (pos.get("option_type") or "CALL")[0].upper()
                             new_contract = options_data.to_occ(ticker, new_exp, opt_type_char, new_strike)
                             updates = {
-                                "entry_price":     new_ep,
-                                "quantity":        int(new_qty),
-                                "strike":          new_strike,
-                                "expiration_date": new_exp,
-                                "contract":        new_contract,
-                                "mode":            new_mode,
-                                "notes":           new_notes,
+                                "entry_price":        new_ep,
+                                "quantity":           int(new_qty),
+                                "strike":             new_strike,
+                                "expiration_date":    new_exp,
+                                "contract":           new_contract,
+                                "mode":               new_mode,
+                                "notes":              new_notes,
+                                "quantity_trimmed":   int(new_qty_trimmed),
+                                "proceeds_from_trims": float(new_proceeds),
                             }
                             try:
                                 db.update_position(pos_id, updates)

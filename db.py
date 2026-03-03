@@ -17,6 +17,10 @@ DATASET = "leaps_exit_agent"
 def get_client() -> bigquery.Client:
     raw = st.secrets["SERVICE_ACCOUNT_JSON"]
     sa_info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    # Fix private key newlines — required when the secret is stored as a TOML table.
+    # Streamlit Cloud may preserve literal \\n instead of real \n in the RSA key bytes.
+    if "private_key" in sa_info:
+        sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/bigquery"],

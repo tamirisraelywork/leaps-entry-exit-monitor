@@ -218,6 +218,16 @@ if page == "Dashboard":
             # Thesis score + age (for staleness display)
             score, score_age = db.get_leaps_monitor_score_with_age(ticker)
 
+            # ── Auto-score if thesis is missing from BigQuery ────────────────
+            # Happens the first time a ticker is tracked, or if the shared
+            # master_table has no entry yet.  Runs synchronously (~30s) so the
+            # score is immediately available for Pillar 1 evaluation this run.
+            if score is None:
+                with st.spinner(f"First-time thesis scoring for {ticker} (~30s)..."):
+                    _s, _v = score_thesis.compute_and_save_score(ticker)
+                if _s is not None:
+                    score, score_age = _s, 0
+
             # Inject thesis score into mkt so evaluate() sees it
             mkt["thesis_score"] = score
 
@@ -315,7 +325,7 @@ if page == "Dashboard":
                     st.success("✅ All pillars clear — HOLD")
 
                 # Action buttons
-                b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
+                b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1])
                 with b1:
                     if st.button("Mark Closed", key=f"close_{pos_id}"):
                         db.update_position_mode(pos_id, "CLOSED")
@@ -327,6 +337,12 @@ if page == "Dashboard":
                 with b3:
                     if st.button("✏️ Edit", key=f"edit_{pos_id}"):
                         st.session_state["editing_pos_id"] = pos_id
+                        st.session_state.pop("trimming_pos_id", None)
+                with b4:
+                    if st.button("✂️ Record Trim", key=f"trim_{pos_id}",
+                                 help="Record contracts you've sold from this position"):
+                        st.session_state["trimming_pos_id"] = pos_id
+                        st.session_state.pop("editing_pos_id", None)
 
                 if notes:
                     st.caption(f"Notes: {notes}")
@@ -435,6 +451,82 @@ if page == "Dashboard":
                             del st.session_state["editing_pos_id"]
                             st.rerun()
 
+            # ---- Inline Trim Panel ----
+            if st.session_state.get("trimming_pos_id") == pos_id:
+                with st.container(border=True):
+                    st.markdown("#### ✂️ Record Trim")
+                    st.caption(
+                        "Enter how many contracts you sold in this trim event "
+                        "and the price you received per share (from IBKR 'Avg. Price' on the sell). "
+                        "This is additive — each trim adds to the running total."
+                    )
+                    tr1, tr2 = st.columns(2)
+                    with tr1:
+                        max_trim = max(1, qty_remaining)
+                        trim_qty_now = st.number_input(
+                            "Contracts sold in this trim",
+                            min_value=1, max_value=max_trim, step=1,
+                            key=f"tnq_{pos_id}",
+                            help=f"You have {qty_remaining} contracts remaining"
+                        )
+                    with tr2:
+                        trim_price_now = st.number_input(
+                            "Sale price per share $/share",
+                            min_value=0.01, step=0.01, format="%.2f",
+                            key=f"tnp_{pos_id}",
+                            help="From IBKR 'Avg. Price' on the closing trade"
+                        )
+
+                    this_proceeds = trim_qty_now * trim_price_now * 100
+                    new_total_trimmed  = qty_trimmed + trim_qty_now
+                    new_total_proceeds = proceeds + this_proceeds
+                    original_cost      = (ep or 0) * (int(qty or 0)) * 100
+
+                    st.info(
+                        f"**This trim:** {trim_qty_now} contracts × ${trim_price_now:.2f}/share × 100 = "
+                        f"**${this_proceeds:,.0f}** proceeds"
+                    )
+
+                    # Running cumulative after this trim
+                    pnl_on_trim = None
+                    if ep and trim_price_now and ep > 0:
+                        pnl_on_trim = round((trim_price_now - ep) / ep * 100, 1)
+
+                    pnl_str = f"  ·  P&L on trim: {pnl_on_trim:+.1f}%" if pnl_on_trim is not None else ""
+                    contracts_left = int(qty or 0) - new_total_trimmed
+
+                    if original_cost > 0 and new_total_proceeds >= original_cost:
+                        st.success(
+                            f"HOUSE MONEY after this trim!  "
+                            f"${new_total_proceeds:,.0f} recovered ≥ ${original_cost:,.0f} cost basis.  "
+                            f"{contracts_left} contracts left cost $0 net.{pnl_str}"
+                        )
+                    else:
+                        net_remaining_cost = max(0, original_cost - new_total_proceeds)
+                        st.markdown(
+                            f"After this trim: **{new_total_trimmed}/{int(qty or 0)}** contracts sold  ·  "
+                            f"**${new_total_proceeds:,.0f}** recovered  ·  "
+                            f"**${net_remaining_cost:,.0f}** still at risk  ·  "
+                            f"**{contracts_left}** contracts remaining{pnl_str}"
+                        )
+
+                    tc1, tc2 = st.columns([1, 5])
+                    with tc1:
+                        if st.button("Save Trim", type="primary", key=f"rtrim_{pos_id}"):
+                            try:
+                                db.update_position(pos_id, {
+                                    "quantity_trimmed":    new_total_trimmed,
+                                    "proceeds_from_trims": new_total_proceeds,
+                                })
+                                del st.session_state["trimming_pos_id"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Trim save failed: {e}")
+                    with tc2:
+                        if st.button("Cancel", key=f"tcancel_{pos_id}"):
+                            del st.session_state["trimming_pos_id"]
+                            st.rerun()
+
     # -----------------------------------------------------------------------
     # Watchlist
     # -----------------------------------------------------------------------
@@ -450,6 +542,10 @@ if page == "Dashboard":
             pfl         = stock_data.get("pct_from_low")
 
             score = db.get_leaps_monitor_score(ticker)
+            if score is None:
+                with st.spinner(f"First-time thesis scoring for {ticker}..."):
+                    _s, _v = score_thesis.compute_and_save_score(ticker)
+                    score = _s
             score_str = f"{score}/100" if score else "N/A"
 
             with st.container(border=True):

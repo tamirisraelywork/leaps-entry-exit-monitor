@@ -1,32 +1,26 @@
 """
 score_thesis.py — Auto-compute LEAPS thesis scores inside the exit agent.
 
-Fetches fundamental metrics via yfinance, asks Gemini for moat + business
-model classification, then applies the exact same scoring rules used by the
-LEAPS Evaluator (leaps-evaluator.streamlit.app).
+Uses the SAME data sources as the LEAPS Evaluator:
+  • yfinance          — financial survival & growth metrics
+  • Alpha Vantage     — EPS growth (with yfinance fallback)
+  • Gemini + Google Search — GuruFocus moat score, CEO ownership %, business model
+    (Google Search grounding is what makes this accurate — same as gurufocus_moat.py
+     Tier 3 and LLM.py in the LEAPS Evaluator)
 
 Results are upserted into the shared BigQuery master_table so both apps read
 the same data.
 
 Expert-recommended refresh schedule
 ────────────────────────────────────
-LEAPS thesis is driven by business fundamentals that change on quarters,
-not days.  The right balance between freshness and API cost:
-
-  Normal months:          re-score if last score is > 30 days old
-  Earnings months         re-score if last score is >  7 days old
-  (Feb / May / Aug / Nov) ↑ most earnings releases happen in these months
-
-The daily staleness-check job in monitor.py calls needs_refresh() for each
-active ticker and only fires compute_and_save_score() when warranted.
-This gives you a thesis score that is:
-  • Never more than 30 days stale in quiet months
-  • Never more than 7 days stale around earnings
-  • Always available (no more N/A) for any ticker in your portfolio
+  Normal months:   re-score if last score is > 30 days old
+  Earnings months  re-score if last score is >  7 days old
+  (Feb/May/Aug/Nov) — most earnings releases happen in these months
 """
 
 import json
 import re
+import time
 import logging
 from datetime import date
 
@@ -75,7 +69,6 @@ def needs_refresh(ticker: str) -> bool:
             return True   # never scored
         last = date.fromisoformat(str(rows[0]["date"])[:10])
         age = (date.today() - last).days
-        # Tighter window in earnings months
         threshold = 7 if date.today().month in (2, 5, 8, 11) else 30
         return age >= threshold
     except Exception:
@@ -110,7 +103,134 @@ def _upsert_score(client: bigquery.Client, ticker: str, score: int, verdict: str
 
 
 # ---------------------------------------------------------------------------
-# Data fetching — yfinance
+# Gemini helper
+# ---------------------------------------------------------------------------
+
+def _gemini_post(key: str, model: str, payload: dict, timeout: int = 60) -> str | None:
+    """POST to Gemini API. Returns response text or None on failure."""
+    import requests as req
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={key}"
+    )
+    for attempt in range(3):
+        try:
+            resp = req.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=timeout)
+            if resp.status_code == 200:
+                parts = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(
+                    p.get("text", "") for p in parts
+                    if p.get("text") and not p.get("thought", False)
+                )
+                if text.strip():
+                    return text
+                return None
+            elif resp.status_code == 429:
+                time.sleep(2 ** attempt)
+            elif resp.status_code in (404, 400):
+                return None   # model not available
+            else:
+                return None
+        except Exception:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Qualitative analysis — Gemini WITH Google Search
+# (same approach as gurufocus_moat.py Tier 3 + LLM.py in the LEAPS Evaluator)
+# ---------------------------------------------------------------------------
+
+def _gemini_full_analysis(ticker: str) -> dict:
+    """
+    Single Gemini call WITH Google Search to get all qualitative scoring inputs.
+
+    Uses Google Search grounding — this is what makes it accurate vs. just
+    asking Gemini without search (which gives unreliable estimates).
+
+    Returns dict with:
+      moat_score        (str "0"-"5" or "N/A")
+      business_model    (str category name)
+      business_model_pts (int 0/5/6/10/15)
+      ceo_ownership_pct  (float or None)
+    """
+    defaults = {
+        "moat_score": "N/A",
+        "business_model": "N/A",
+        "business_model_pts": 0,
+        "ceo_ownership_pct": None,
+    }
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+        if not key:
+            return defaults
+
+        prompt = (
+            f"Research ticker {ticker} using real-time data from GuruFocus, SEC EDGAR, and financial sources. "
+            f"Answer EXACTLY these 4 questions with ONLY the structured output below — no explanations.\n\n"
+            f"1. Find the GuruFocus Moat Score for {ticker} at gurufocus.com/stock/{ticker}/summary "
+            f"   (integer 0–5; 0=no moat, 5=wide moat)\n"
+            f"2. Find the CEO/top-executive ownership percentage from the most recent SEC DEF 14A proxy filing\n"
+            f"3. Classify {ticker}'s business model into EXACTLY ONE category:\n"
+            f"   - Mission-critical / infrastructure → 15 points\n"
+            f"     (customers cannot operate without it; foundational product; low price sensitivity)\n"
+            f"   - High switching cost SaaS / platform → 10 points\n"
+            f"     (subscription/usage software; data lock-in; high retention; gross margin >60%)\n"
+            f"   - High-growth market / Disruptive technology → 6 points\n"
+            f"     (market growing >20% annually; first-mover/scale advantage; revenue growth >30%)\n"
+            f"   - Competitive commodity → 5 points\n"
+            f"     (undifferentiated product; price-driven purchasing; low pricing power)\n"
+            f"   - Cyclical / low differentiation → 0 points\n"
+            f"     (revenue sensitive to economic cycles; volatile earnings; weak pricing power)\n\n"
+            f"Output format (EXACTLY — one value per line, no extra words):\n"
+            f"MOAT_SCORE: <integer 0-5>\n"
+            f"CEO_OWNERSHIP: <number>%\n"
+            f"BUSINESS_MODEL: <exact category name from the list above>\n"
+            f"BUSINESS_POINTS: <integer 0, 5, 6, 10, or 15>"
+        )
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+        }
+
+        models = ["gemini-2.5-flash-preview-09-2025", "gemini-2.0-flash", "gemini-1.5-flash"]
+        for model in models:
+            text = _gemini_post(key, model, payload, timeout=90)
+            if not text:
+                continue
+
+            result = dict(defaults)
+
+            m = re.search(r"MOAT_SCORE:\s*([0-5])", text)
+            if m:
+                result["moat_score"] = m.group(1)
+
+            m = re.search(r"CEO_OWNERSHIP:\s*([\d.]+)\s*%", text)
+            if m:
+                result["ceo_ownership_pct"] = float(m.group(1))
+
+            m = re.search(r"BUSINESS_MODEL:\s*(.+)", text, re.IGNORECASE)
+            if m:
+                result["business_model"] = m.group(1).strip()
+
+            m = re.search(r"BUSINESS_POINTS:\s*(\d+)", text)
+            if m:
+                result["business_model_pts"] = int(m.group(1))
+
+            # Only return if we got at least moat + business model
+            if result["moat_score"] != "N/A" or result["business_model"] != "N/A":
+                return result
+
+    except Exception as e:
+        logger.warning(f"Gemini full analysis failed for {ticker}: {e}")
+
+    return defaults
+
+
+# ---------------------------------------------------------------------------
+# Data fetching — yfinance + Alpha Vantage (for EPS)
 # ---------------------------------------------------------------------------
 
 def _sf(v) -> float:
@@ -144,8 +264,32 @@ def _get_df(df, keys) -> float | None:
     return None
 
 
+def _fetch_eps_alpha_vantage(ticker: str) -> float | None:
+    """
+    Fetch QuarterlyEarningsGrowthYOY from Alpha Vantage (same as EPS_growth.py).
+    Returns growth % (e.g. 42.5 for 42.5%) or None if unavailable.
+    """
+    import requests as req
+    for key_name in ("ALPHA_VANTAGE_API_KEY_1", "ALPHA_VANTAGE_API_KEY_2",
+                     "ALPHA_VANTAGE_KEY", "ALPHAVANTAGE_API_KEY"):
+        key = st.secrets.get(key_name)
+        if not key:
+            continue
+        try:
+            url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={key}"
+            resp = req.get(url, timeout=10)
+            data = resp.json()
+            if "Note" not in data and data.get("Symbol"):
+                raw = data.get("QuarterlyEarningsGrowthYOY", "")
+                if raw:
+                    return float(raw) * 100
+        except Exception:
+            continue
+    return None
+
+
 def _fetch_metrics(ticker: str) -> dict:
-    """Fetch all scoring metrics using yfinance (no proxy needed for background jobs)."""
+    """Fetch all scoring metrics using yfinance (+ Alpha Vantage for EPS)."""
     import yfinance as yf
     import pandas as pd
 
@@ -176,7 +320,6 @@ def _fetch_metrics(ticker: str) -> dict:
     # Revenue growth
     rev_g = info.get("revenueGrowth")
     rev_g_str = f"{rev_g * 100:.2f}%" if rev_g is not None else "N/A"
-    # Tier 2: from annual financials
     if rev_g is None and inc_a is not None and "Total Revenue" in inc_a.index and inc_a.shape[1] >= 2:
         try:
             row = inc_a.loc["Total Revenue"]
@@ -199,15 +342,17 @@ def _fetch_metrics(ticker: str) -> dict:
     short_f = info.get("shortPercentOfFloat")
     short_str = f"{short_f * 100:.2f}%" if short_f is not None else "N/A"
 
-    # EPS growth
-    eps_g = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
-    eps_str = f"{eps_g * 100:.2f}%" if eps_g is not None else "N/A"
+    # EPS growth — try Alpha Vantage first (same as EPS_growth.py), fallback yfinance
+    eps_g_av = _fetch_eps_alpha_vantage(ticker)
+    if eps_g_av is not None:
+        eps_str = f"{eps_g_av:.2f}%"
+    else:
+        eps_g = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
+        eps_str = f"{eps_g * 100:.2f}%" if eps_g is not None else "N/A"
 
     # Assets / Liabilities
     total_assets = _get_df(bs_q, ["Total Assets"])
-    total_liab = _get_df(bs_q, [
-        "Total Liabilities Net Minor Interest", "Total Liab", "Total Liabilities"
-    ])
+    total_liab   = _get_df(bs_q, ["Total Liabilities Net Minor Interest", "Total Liab", "Total Liabilities"])
     al_ratio = (
         f"{total_assets / total_liab:.2f}"
         if total_assets and total_liab and total_liab > 0
@@ -215,11 +360,8 @@ def _fetch_metrics(ticker: str) -> dict:
     )
 
     # Runway
-    cash = _get_df(bs_q, [
-        "Cash And Cash Equivalents",
-        "Cash Cash Equivalents And Short Term Investments",
-    ])
-    ocf = _get_df(cf_q, ["Operating Cash Flow"])
+    cash = _get_df(bs_q, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"])
+    ocf  = _get_df(cf_q, ["Operating Cash Flow"])
     if cash is not None and ocf is not None:
         if ocf < 0:
             burn = abs(ocf) / 3
@@ -230,7 +372,7 @@ def _fetch_metrics(ticker: str) -> dict:
         runway_str = "N/A"
 
     # Net Debt / EBITDA
-    ebitda_val = _get_df(inc_a, ["EBITDA", "Normalized EBITDA"])
+    ebitda_val   = _get_df(inc_a, ["EBITDA", "Normalized EBITDA"])
     net_debt_val = _get_df(bs_a, ["Net Debt"])
     if net_debt_val is None:
         td = _get_df(bs_a, ["Total Debt"])
@@ -258,7 +400,7 @@ def _fetch_metrics(ticker: str) -> dict:
     else:
         burn_sev = "N/A"
 
-    # Share count growth (YoY from annual balance sheet)
+    # Share count growth
     share_growth = "N/A"
     if bs_a is not None:
         for skey in ["Ordinary Shares Number", "Share Issued"]:
@@ -294,8 +436,8 @@ def _fetch_metrics(ticker: str) -> dict:
         except Exception:
             pass
 
-    # Growth-to-Valuation (Revenue Growth % / P-S Ratio)
-    ps = info.get("priceToSalesTrailingTwelveMonths")
+    # Growth-to-Valuation
+    ps  = info.get("priceToSalesTrailingTwelveMonths")
     gtv = "N/A"
     if ps and ps > 0 and rev_g and rev_g > 0:
         gtv = f"{(rev_g * 100) / ps:.2f}"
@@ -330,53 +472,9 @@ def _fetch_metrics(ticker: str) -> dict:
         "Growth-to-Valuation Score":    gtv,
         "Capital Structure Pressure":   csp,
         "latest expiration date":       latest_exp,
-        # Raw values needed for Net Debt / EBITDA scoring branch
         "_net_debt_raw":    net_debt_val,
         "_ebitda_raw":      ebitda_val,
     }
-
-
-# ---------------------------------------------------------------------------
-# Gemini — moat + business model
-# ---------------------------------------------------------------------------
-
-def _gemini_moat_biz(ticker: str) -> tuple[str, str]:
-    """Ask Gemini for GuruFocus moat score (0-5) and business model category."""
-    try:
-        import requests as req
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if not key:
-            return "N/A", "N/A"
-        prompt = (
-            f"Ticker: {ticker}\n"
-            "Answer ONLY these two questions, no explanation:\n"
-            "1. GuruFocus moat score — integer 0 to 5 (0=no moat, 5=wide moat). "
-            "Be conservative.\n"
-            "2. Business model — pick exactly one:\n"
-            "   Mission-critical/infrastructure\n"
-            "   SaaS/platform/high switching costs\n"
-            "   High-growth/disruptive/emerging\n"
-            "   Commodity/retail\n"
-            "Format EXACTLY as:\nMOAT:X\nBUSINESS:category name"
-        )
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={key}"
-        )
-        resp = req.post(
-            url,
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
-        )
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        moat_m = re.search(r"MOAT:\s*([0-5])", text)
-        biz_m  = re.search(r"BUSINESS:\s*(.+)",  text, re.IGNORECASE)
-        return (
-            moat_m.group(1) if moat_m else "N/A",
-            biz_m.group(1).strip() if biz_m else "N/A",
-        )
-    except Exception:
-        return "N/A", "N/A"
 
 
 # ---------------------------------------------------------------------------
@@ -385,15 +483,14 @@ def _gemini_moat_biz(ticker: str) -> tuple[str, str]:
 
 def _score(m: dict) -> tuple[int, str]:
     """Apply the LEAPS Evaluator's exact scoring rules. Returns (score, verdict)."""
-    total = 0
+    total    = 0
     rejected = False
 
-    nd_raw = m.get("_net_debt_raw")   # float | None
-    eb_raw = m.get("_ebitda_raw")     # float | None
+    nd_raw = m.get("_net_debt_raw")
+    eb_raw = m.get("_ebitda_raw")
 
     # ── Financial Survival & Balance Sheet (21 pts) ──────────────────────────
 
-    # Runway (10 pts, < 6 months = rejected)
     runway = str(m.get("Runway", "N/A")).lower()
     if "positive" in runway or "no burn" in runway or "profitable" in runway:
         total += 10
@@ -406,23 +503,20 @@ def _score(m: dict) -> tuple[int, str]:
         elif rnum >= 6:  total += 3
         else:            rejected = True
 
-    # Net Debt / EBITDA (3 pts, > 3× = rejected)
     nd_num = _sf(m.get("Net Debt / EBITDA", "N/A"))
     if nd_raw is not None and nd_raw < 0:
-        total += 3            # net cash
+        total += 3
     elif eb_raw is not None and eb_raw <= 0:
-        total += 0            # pre-profitable — no rejection
+        total += 0
     elif nd_num == 0:
         total += 3
     elif nd_num <= 1.5:  total += 2
     elif nd_num <= 3.0:  total += 1
     elif nd_num  > 3.0:  rejected = True
 
-    # Assets / Liabilities (1 pt)
     if _sf(m.get("Assets / Liabilities Ratio", "0")) >= 1.0:
         total += 1
 
-    # Cash Burn Severity (2 pts)
     burn = m.get("Cash Burn Severity", "N/A")
     burn_num = _sf(str(burn).replace("%", ""))
     if "positive" in str(burn).lower() or burn_num == 0 or burn_num < 10:
@@ -430,7 +524,6 @@ def _score(m: dict) -> tuple[int, str]:
     elif burn_num <= 20:
         total += 1
 
-    # Share Count Growth (5 pts, > 30% = rejected)
     sg_str = str(m.get("Share Count Growth", "N/A")).lower()
     sg_num = _sf(sg_str.replace("%", ""))
     if sg_str == "n/a":      total += 1
@@ -440,14 +533,12 @@ def _score(m: dict) -> tuple[int, str]:
     elif sg_num <= 30:       total += 0
     else:                    rejected = True
 
-    # Capital Structure (1 pt; heavy converts = rejected)
     csp = str(m.get("Capital Structure Pressure", "")).lower()
     if "heavy" in csp or "atm" in csp:
         rejected = True
     else:
         total += 1
 
-    # Options expiry gate (no points, < 18 months = rejected)
     le = m.get("latest expiration date", "N/A")
     if le and le != "N/A":
         try:
@@ -461,7 +552,6 @@ def _score(m: dict) -> tuple[int, str]:
 
     # ── Growth & Asymmetric Upside (35 pts) ──────────────────────────────────
 
-    # Market Cap (4 pts, ≥ $8B = rejected)
     mc_str = str(m.get("Market cap", "N/A")).lower()
     mc_num = _sf(mc_str)
     if "trillion" in mc_str:  mc_b = mc_num * 1000
@@ -472,39 +562,33 @@ def _score(m: dict) -> tuple[int, str]:
     elif mc_b <  3: total += 3
     elif mc_b <  8: total += 2
 
-    # Revenue Growth YoY (13 pts)
     rg = _sf(str(m.get("Revenue Growth YoY (%)", "N/A")).replace("%", ""))
     if   rg >= 50: total += 13
     elif rg >= 30: total += 10
     elif rg >= 20: total += 7
     elif rg >= 10: total += 4
 
-    # Gross Margin (6 pts)
     gm = _sf(str(m.get("Gross Margin (%)", "N/A")).replace("%", ""))
     if   gm >= 50: total += 6
     elif gm >= 30: total += 4
     elif gm >= 15: total += 2
     elif gm >= 0:  total += 1
 
-    # Forward EPS Growth (3 pts)
     eps = _sf(str(m.get("EPS Growth (Forward %)", "N/A")).replace("%", ""))
     if   eps >= 30: total += 3
     elif eps >= 20: total += 2
     elif eps >= 10: total += 1
 
-    # Degree of Operating Leverage (3 pts)
     dol = _sf(m.get("Degree of Operating Leverage", "N/A"))
     if   dol >= 3:   total += 3
     elif dol >= 2:   total += 2
     elif dol >= 1.5: total += 1
 
-    # Short Float (3 pts)
     sf_num = _sf(str(m.get("Short Float", "N/A")).replace("%", ""))
     if   10 <= sf_num <= 30: total += 3
     elif sf_num >= 5:        total += 2
     elif sf_num >  30:       total += 1
 
-    # Institutional Ownership (3 pts)
     inst = _sf(str(m.get("Institutional Ownership", "N/A")).replace("%", ""))
     if   inst < 20: total += 3
     elif inst < 40: total += 2
@@ -512,7 +596,6 @@ def _score(m: dict) -> tuple[int, str]:
 
     # ── Insider Alignment & Behavior (11 pts) ────────────────────────────────
 
-    # Total Insider Ownership (5 pts)
     ins_str = str(m.get("Total insider ownership %", "N/A")).lower()
     ins_num = _sf(ins_str.replace("%", ""))
     if ins_str == "n/a":     total += 1
@@ -520,25 +603,36 @@ def _score(m: dict) -> tuple[int, str]:
     elif ins_num >= 2:       total += 3
     elif ins_num >= 1:       total += 2
 
-    # CEO Ownership + Net Insider Buying (6 pts combined)
-    # yfinance doesn't easily surface CEO-specific ownership or net-buy ratio.
-    # Award 2 floor pts to avoid penalising tickers where data is unavailable.
-    total += 2
+    # CEO Ownership (6 pts) — uses real data from Gemini Google Search
+    # _ceo_ownership_pct is set by _gemini_full_analysis(), falls back to 2 pts floor
+    ceo_pct = m.get("_ceo_ownership_pct")
+    if ceo_pct is not None:
+        if ceo_pct >= 5:    total += 6
+        elif ceo_pct >= 2:  total += 4
+        elif ceo_pct >= 1:  total += 2
+        else:               total += 1
+    else:
+        total += 2   # floor when data unavailable
 
     # ── Moat & Qualitative Conviction (32 pts) ───────────────────────────────
 
-    # GuruFocus Moat Score (10 pts)
+    # GuruFocus Moat Score (10 pts) — real data via Gemini + Google Search
     moat = _sf(m.get("Moat Score", "N/A"))
     if   moat >= 4: total += 10
     elif moat >= 3: total += 6
     elif moat >= 2: total += 3
 
     # Business Model Classification (15 pts)
-    biz = str(m.get("Business Model", "N/A")).lower()
-    if   "mission-critical" in biz or "infrastructure" in biz: total += 15
-    elif "saas" in biz or "platform" in biz or "switching"  in biz: total += 10
-    elif "high-growth" in biz or "disruptive" in biz or "emerging" in biz: total += 6
-    elif "commodity" in biz or "retail" in biz: total += 5
+    # Prefer structured points from Gemini output; fallback to text matching
+    biz_pts = m.get("_business_model_pts")
+    if biz_pts is not None:
+        total += min(15, max(0, int(biz_pts)))
+    else:
+        biz = str(m.get("Business Model", "N/A")).lower()
+        if   "mission-critical" in biz or "infrastructure" in biz: total += 15
+        elif "saas" in biz or "platform" in biz or "switching"  in biz: total += 10
+        elif "high-growth" in biz or "disruptive" in biz or "emerging" in biz: total += 6
+        elif "commodity" in biz or "retail" in biz: total += 5
 
     # Growth-to-Valuation Score (7 pts)
     gtv = _sf(m.get("Growth-to-Valuation Score", "N/A"))
@@ -548,11 +642,11 @@ def _score(m: dict) -> tuple[int, str]:
     elif gtv >= 2:  total += 1
 
     total = min(total, 100)
-    if rejected:              verdict = "Rejected"
-    elif total >= 80:         verdict = "Elite LEAPS Candidate"
-    elif total >= 70:         verdict = "Qualified"
-    elif total >= 60:         verdict = "Watchlist"
-    else:                     verdict = "Rejected"
+    if rejected:         verdict = "Rejected"
+    elif total >= 80:    verdict = "Elite LEAPS Candidate"
+    elif total >= 70:    verdict = "Qualified"
+    elif total >= 60:    verdict = "Watchlist"
+    else:                verdict = "Rejected"
 
     return total, verdict
 
@@ -563,17 +657,25 @@ def _score(m: dict) -> tuple[int, str]:
 
 def compute_and_save_score(ticker: str) -> tuple[int | None, str | None]:
     """
-    Compute thesis score for a ticker using yfinance + Gemini, then upsert
-    into the shared BigQuery master_table.
+    Compute thesis score using yfinance + Alpha Vantage + Gemini with Google Search,
+    then upsert into the shared BigQuery master_table.
+
+    Data sources used (same as LEAPS Evaluator):
+      • yfinance          — financial/balance sheet metrics
+      • Alpha Vantage     — EPS growth (yfinance fallback)
+      • Gemini + Google Search — GuruFocus moat score, CEO ownership, business model
 
     Returns (score, verdict) on success, (None, None) on failure.
     """
     logger.info(f"Thesis scoring: {ticker}")
     try:
-        metrics = _fetch_metrics(ticker)
-        moat, biz = _gemini_moat_biz(ticker)
-        metrics["Moat Score"]      = moat
-        metrics["Business Model"]  = biz
+        metrics     = _fetch_metrics(ticker)
+        qualitative = _gemini_full_analysis(ticker)
+
+        metrics["Moat Score"]          = qualitative["moat_score"]
+        metrics["Business Model"]      = qualitative["business_model"]
+        metrics["_business_model_pts"] = qualitative["business_model_pts"]
+        metrics["_ceo_ownership_pct"]  = qualitative["ceo_ownership_pct"]
 
         score, verdict = _score(metrics)
 

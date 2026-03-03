@@ -916,6 +916,48 @@ elif page == "Settings":
     )
 
     st.markdown("---")
+    st.subheader("Thesis Score Management")
+    st.caption(
+        "Scores are fetched from the shared BigQuery master_table (same data as the LEAPS Evaluator). "
+        "When a score is missing, the app auto-scores using yfinance + Gemini with Google Search. "
+        "Use the buttons below to force a full rescore for all active positions."
+    )
+
+    rs1, rs2 = st.columns([1, 3])
+    with rs1:
+        rescore_all = st.button("↻ Rescore All Active", type="primary",
+                                help="Re-score every active position using the full pipeline (Gemini + Google Search). ~30s per ticker.")
+    with rs2:
+        st.caption("Runs the same Gemini + Google Search pipeline used by the LEAPS Evaluator to get accurate moat scores, CEO ownership, and business model classification.")
+
+    if rescore_all:
+        try:
+            active_tickers = list({p["ticker"] for p in db.get_positions(mode="ACTIVE") if p.get("ticker")})
+        except Exception as e:
+            st.error(f"Could not fetch positions: {e}")
+            active_tickers = []
+
+        if not active_tickers:
+            st.info("No active positions to rescore.")
+        else:
+            results = []
+            prog = st.progress(0.0, text=f"Rescoring 0/{len(active_tickers)}...")
+            for i, tk in enumerate(active_tickers):
+                prog.progress((i) / len(active_tickers), text=f"Scoring {tk} ({i+1}/{len(active_tickers)})...")
+                s, v = score_thesis.compute_and_save_score(tk)
+                results.append({"Ticker": tk, "Score": s, "Verdict": v, "Status": "✅" if s else "❌"})
+            prog.progress(1.0, text="Done!")
+
+            import pandas as pd
+            st.dataframe(
+                pd.DataFrame(results),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.success(f"Rescored {len([r for r in results if r['Score']])} of {len(active_tickers)} tickers successfully.")
+            st.cache_data.clear()
+
+    st.markdown("---")
     st.subheader("Closed / Rolled Positions")
     try:
         closed = db.get_positions(mode="CLOSED") + db.get_positions(mode="ROLLED")

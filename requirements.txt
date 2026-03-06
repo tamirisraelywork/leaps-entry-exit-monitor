@@ -1,9 +1,11 @@
 streamlit>=1.32.0
 google-cloud-bigquery>=3.11.0
 google-auth>=2.22.0
+db-dtypes>=1.1.1
 yfinance>=0.2.36
 requests>=2.31.0
 curl_cffi>=0.6.2
 pandas>=2.0.0
 apscheduler>=3.10.4
 pytz>=2024.1
+beautifulsoup4>=4.12.0

@@ -1,17 +1,31 @@
 """
-LEAPS Position Manager — Streamlit App
+LEAPS Command Center — Unified App
+===================================
+All LEAPS workflows in one place:
 
-Pages:
-  1. Dashboard      — live position cards with posture badges
-  2. Add Position   — new entry (recommend options) or existing contract
-  3. Alert History  — full log of alerts with filters
-  4. Settings       — email config, threshold overrides, test email
+  1. New Analysis    — run full 7-source thesis evaluation
+  2. Past Analyses   — history + per-ticker detailed breakdown
+  3. Dashboard       — live position cards with exit/entry signals
+  4. Add Position    — recommend options or log an existing contract
+  5. Alert History   — full alert log with filters
+  6. Settings        — email, thresholds, rescore, closed positions
 """
 
 import re
 import time
-import streamlit as st
+import asyncio
+import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import date, datetime, timedelta
+import logging
+
+import pandas as pd
+import streamlit as st
+
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 import db
 import options_data
@@ -27,22 +41,40 @@ from monitor import start_scheduler
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="LEAPS Position Manager",
+    page_title="LEAPS Command Center",
     page_icon="📈",
     layout="wide",
 )
 
-# Ensure BigQuery tables exist and start background scheduler
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 try:
     db.ensure_tables()
 except Exception as e:
     st.error(f"BigQuery setup error: {e}")
 
-start_scheduler()   # no-op on subsequent reruns (cached resource)
+start_scheduler()
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared state for background analysis jobs
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _get_eval_state():
+    return {
+        "background_jobs": {},
+        "batch_job":        {},
+        "jobs_lock":        threading.Lock(),
+        "batch_lock":       threading.Lock(),
+    }
+
+_ES = _get_eval_state()
+
+
+# ---------------------------------------------------------------------------
+# Position-manager helpers (existing)
 # ---------------------------------------------------------------------------
 
 _SEVERITY_COLOR = {
@@ -51,25 +83,12 @@ _SEVERITY_COLOR = {
     "AMBER": "#FFA500",
     "GREEN": "#21C55D",
 }
-
-_POSTURE_LABEL = {
-    "RED":   "EXIT / STOP",
-    "BLUE":  "ROLL",
-    "AMBER": "WATCH",
-    "GREEN": "HOLD",
-}
-
-_POSTURE_EMOJI = {
-    "RED":   "🔴",
-    "BLUE":  "🔵",
-    "AMBER": "⚠️",
-    "GREEN": "🟢",
-}
+_POSTURE_LABEL = {"RED": "EXIT / STOP", "BLUE": "ROLL", "AMBER": "WATCH", "GREEN": "HOLD"}
+_POSTURE_EMOJI = {"RED": "🔴", "BLUE": "🔵", "AMBER": "⚠️", "GREEN": "🟢"}
 
 
 @st.cache_data(ttl=3600)
 def _get_iv_rank_cached(ticker: str) -> float | None:
-    """Fetch IV rank for a ticker and cache for 1 hour (slow API call)."""
     try:
         from iv_rank import get_iv_rank_advanced
         result = get_iv_rank_advanced(ticker)
@@ -82,22 +101,17 @@ def _get_iv_rank_cached(ticker: str) -> float | None:
 
 
 def _live_market(pos: dict) -> dict:
-    """Fetch live market data for a single position (with IV Rank)."""
     ticker   = pos.get("ticker", "")
     contract = pos.get("contract", "")
-    snapshot = {}
-    if contract:
-        snapshot = options_data.get_option_snapshot(ticker, contract) or {}
-
+    snapshot = options_data.get_option_snapshot(ticker, contract) if contract else {}
+    snapshot = snapshot or {}
     return {
-        "mid":     snapshot.get("mid"),
-        "bid":     snapshot.get("bid"),
-        "ask":     snapshot.get("ask"),
-        "delta":   snapshot.get("delta"),
-        "dte":     snapshot.get("dte"),
-        "iv_rank": _get_iv_rank_cached(ticker),
-        # thesis_score injected separately in the dashboard loop
-        # so we can also show the score age
+        "mid":          snapshot.get("mid"),
+        "bid":          snapshot.get("bid"),
+        "ask":          snapshot.get("ask"),
+        "delta":        snapshot.get("delta"),
+        "dte":          snapshot.get("dte"),
+        "iv_rank":      _get_iv_rank_cached(ticker),
         "thesis_score": None,
     }
 
@@ -113,25 +127,928 @@ def _alert_priority(a) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Evaluator — BigQuery helpers
+# ---------------------------------------------------------------------------
+
+def safe_float(val):
+    if val is None or str(val).lower() in ("n/a", "none", "rejected", "", "nan"):
+        return 0.0
+    try:
+        return float(re.sub(r"[^\d.-]", "", str(val)) or "0")
+    except Exception:
+        return 0.0
+
+
+def _verdict_from_score(score, is_rejected):
+    if is_rejected:
+        return "❌ Rejected"
+    if score >= 80:
+        return "🔥 Elite LEAPS Candidate"
+    if score >= 70:
+        return "✅ Qualified"
+    if score >= 60:
+        return "⚠️ Watchlist"
+    return "❌ Rejected"
+
+
+def _verdict_color(verdict):
+    v = str(verdict).lower()
+    if "elite"     in v: return "#28a745"
+    if "qualified" in v: return "#007bff"
+    if "watchlist" in v: return "#e6a817"
+    return "#dc3545"
+
+
+@st.cache_resource(show_spinner=False)
+def _get_eval_bq_client():
+    try:
+        raw = st.secrets["SERVICE_ACCOUNT_JSON"]
+        sa  = json_loads_or_dict(raw)
+        sa["private_key"] = sa.get("private_key", "").replace("\\n", "\n")
+        creds = service_account.Credentials.from_service_account_info(sa)
+        return bigquery.Client(credentials=creds, project=sa["project_id"])
+    except Exception as e:
+        logger.error(f"Eval BQ client init failed: {e}")
+        return None
+
+
+def json_loads_or_dict(raw):
+    import json
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
+def _eval_table_path(client, table_name: str) -> str:
+    raw = (
+        st.secrets.get("DATASET_ID")
+        or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+    )
+    ticker_clean = table_name.strip().upper().replace("-", "_").replace(".", "_")
+    if "." in str(raw):
+        return f"{raw}.{ticker_clean}"
+    return f"{client.project}.{raw}.{ticker_clean}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_eval_master_data() -> pd.DataFrame:
+    client = _get_eval_bq_client()
+    if not client:
+        return pd.DataFrame()
+    try:
+        path = _eval_table_path(client, "master_table")
+        return client.query(
+            f"SELECT Ticker, date, Score, Verdict FROM `{path}`"
+        ).to_dataframe()
+    except Exception as e:
+        logger.error(f"master_table read error: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
+    client = _get_eval_bq_client()
+    if not client:
+        return pd.DataFrame()
+    try:
+        path = _eval_table_path(client, ticker)
+        return client.query(f"SELECT * FROM `{path}`").to_dataframe()
+    except Exception as e:
+        err = str(e)
+        if "404" in err or "not found" in err.lower():
+            return pd.DataFrame()
+        logger.error(f"Ticker detail read error for {ticker}: {e}")
+        return pd.DataFrame()
+
+
+def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: dict,
+                        final_score: float, verdict: str) -> tuple[bool, str | None]:
+    """Save full analysis to evaluator BigQuery tables (per-ticker + master_table)."""
+    client = _get_eval_bq_client()
+    if not client:
+        return False, "BigQuery client unavailable"
+    try:
+        ticker_path  = _eval_table_path(client, ticker)
+        master_path  = _eval_table_path(client, "master_table")
+
+        rows = [
+            {
+                "Matric name":    r["Metric Name"],
+                "Source":         r.get("Source", ""),
+                "Value":          str(r.get("Value", "")),
+                "Obtained Score": str(r["Obtained points"]),
+                "Total score":    str(r["Total points"]),
+                "LLM":            None,
+            }
+            for r in table_rows
+            if r["Metric Name"] != "TOTAL"
+        ]
+        rows += [
+            {"Matric name": "Risks",               "LLM": "\n".join(sws_data.get("risks",    []))},
+            {"Matric name": "Rewards",             "LLM": "\n".join(sws_data.get("rewards",  []))},
+            {"Matric name": "Company Description", "LLM": llm_data.get("description",       "N/A")},
+            {"Matric name": "Value Proposition",   "LLM": llm_data.get("value_proposition", "N/A")},
+            {"Matric name": "Moat Analysis",       "LLM": llm_data.get("moat",              "N/A")},
+            {"Matric name": "DATE",                "LLM": date.today().strftime("%Y-%m-%d")},
+        ]
+
+        client.load_table_from_dataframe(
+            pd.DataFrame(rows), ticker_path,
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+        ).result()
+
+        today  = date.today().strftime("%Y-%m-%d")
+        params = [
+            bigquery.ScalarQueryParameter("ticker",  "STRING", ticker),
+            bigquery.ScalarQueryParameter("score",   "INT64",  int(float(final_score))),
+            bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
+            bigquery.ScalarQueryParameter("date",    "STRING", today),
+        ]
+        exists = client.query(
+            f"SELECT Ticker FROM `{master_path}` WHERE Ticker = @ticker",
+            job_config=bigquery.QueryJobConfig(query_parameters=[params[0]]),
+        ).to_dataframe()
+
+        sql = (
+            f"UPDATE `{master_path}` SET Score=@score, Verdict=@verdict, date=@date WHERE Ticker=@ticker"
+            if not exists.empty else
+            f"INSERT INTO `{master_path}` (Ticker, Score, Verdict, date) VALUES (@ticker,@score,@verdict,@date)"
+        )
+        client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        return True, None
+
+    except Exception as e:
+        logger.error(f"save_eval_analysis error for {ticker}: {e}")
+        return False, str(e)
+
+
+def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
+    """Re-apply current scoring rules to stored VALUES. No API calls. Returns (old, new, old_v, new_v)."""
+    try:
+        client      = _get_eval_bq_client()
+        if not client:
+            return 0, 0, "Error", "No BQ client"
+        ticker_path = _eval_table_path(client, ticker)
+        master_path = _eval_table_path(client, "master_table")
+
+        old_df = client.query(
+            f"SELECT Score, Verdict FROM `{master_path}` WHERE Ticker = @ticker",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+            ]),
+        ).to_dataframe()
+        old_score   = int(safe_float(old_df["Score"].iloc[0]))   if not old_df.empty else 0
+        old_verdict = str(old_df["Verdict"].iloc[0])              if not old_df.empty else "N/A"
+
+        detail_df = client.query(f"SELECT * FROM `{ticker_path}`").to_dataframe()
+        if detail_df.empty:
+            return old_score, old_score, old_verdict, old_verdict
+
+        m_col = "Matric name"    if "Matric name"    in detail_df.columns else "Metric Name"
+        s_col = "Obtained Score" if "Obtained Score" in detail_df.columns else "Obtained points"
+        t_col = "Total score"    if "Total score"    in detail_df.columns else "Total points"
+
+        QUAL = {"Risks","Rewards","Company Description","Value Proposition","Moat Analysis","DATE"}
+
+        # Seed thread_local scratch for Net Debt / EBITDA metric
+        tl = score_thesis._thread_local
+        for _, row in detail_df.iterrows():
+            mn = str(row.get(m_col, "")).lower()
+            if mn == "net debt":
+                tl.net_debt_val = row.get("Value", None)
+            elif mn == "ebitda":
+                tl.ebitda_val = row.get("Value", None)
+
+        new_rows    = []
+        total_score = 0.0
+        is_rejected = False
+
+        for _, row in detail_df.iterrows():
+            r           = row.to_dict()
+            metric_name = str(r.get(m_col, ""))
+            if metric_name in QUAL or not metric_name:
+                new_rows.append(r)
+                continue
+            value              = str(r.get("Value", "N/A"))
+            pts, total_pts, rej = score_thesis.calculate_scoring(metric_name, value)
+            if rej:
+                is_rejected = True
+                r[s_col]    = "rejected"
+                r[t_col]    = str(total_pts) if total_pts > 0 else ""
+            else:
+                r[s_col] = str(pts)       if total_pts > 0 else ""
+                r[t_col] = str(total_pts) if total_pts > 0 else ""
+                if total_pts > 0:
+                    total_score += pts
+            new_rows.append(r)
+
+        client.load_table_from_dataframe(
+            pd.DataFrame(new_rows), ticker_path,
+            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+        ).result()
+
+        new_score   = int(round(total_score))
+        new_verdict = _verdict_from_score(new_score, is_rejected)
+
+        client.query(
+            f"UPDATE `{master_path}` SET Score=@score, Verdict=@verdict WHERE Ticker=@ticker",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("score",   "INT64",  new_score),
+                bigquery.ScalarQueryParameter("verdict", "STRING", new_verdict),
+                bigquery.ScalarQueryParameter("ticker",  "STRING", ticker),
+            ]),
+        ).result()
+
+        return old_score, new_score, old_verdict, new_verdict
+
+    except Exception as e:
+        logger.error(f"rescore_ticker_in_bq failed for {ticker}: {e}")
+        return 0, 0, "Error", str(e)
+
+
+def delete_eval_ticker(ticker: str) -> bool:
+    client = _get_eval_bq_client()
+    if not client:
+        return False
+    try:
+        client.delete_table(_eval_table_path(client, ticker), not_found_ok=True)
+        master_path = _eval_table_path(client, "master_table")
+        client.query(
+            f"DELETE FROM `{master_path}` WHERE Ticker = @ticker",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("ticker", "STRING", ticker)
+            ]),
+        ).result()
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        logger.error(f"delete_eval_ticker error for {ticker}: {e}")
+        return False
+
+
+def delete_all_eval_tickers(tickers: list) -> bool:
+    client = _get_eval_bq_client()
+    if not client:
+        return False
+    try:
+        master_path = _eval_table_path(client, "master_table")
+        for t in tickers:
+            client.delete_table(_eval_table_path(client, t), not_found_ok=True)
+        client.query(f"DELETE FROM `{master_path}` WHERE TRUE").result()
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        logger.error(f"delete_all_eval_tickers error: {e}")
+        return False
+
+
+def send_alert_email(to_addr: str, subject: str, body: str) -> tuple[bool, str | None]:
+    """Send an HTML email via SMTP. Uses ALERT_EMAIL_* secrets."""
+    try:
+        from_addr = st.secrets.get("ALERT_EMAIL_FROM", "")
+        password  = st.secrets.get("ALERT_EMAIL_PASS",  "")
+        smtp_host = st.secrets.get("ALERT_SMTP_HOST",   "smtp.gmail.com")
+        smtp_port = int(st.secrets.get("ALERT_SMTP_PORT", 587))
+        if not from_addr or not password or not to_addr:
+            return False, "Missing email credentials or recipient"
+        msg            = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = from_addr
+        msg["To"]      = to_addr
+        msg.attach(MIMEText(body, "html"))
+        with smtplib.SMTP(smtp_host, smtp_port) as srv:
+            srv.ehlo(); srv.starttls(); srv.login(from_addr, password)
+            srv.sendmail(from_addr, to_addr, msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Evaluator — background workers
+# ---------------------------------------------------------------------------
+
+def _single_worker(ticker: str):
+    with _ES["jobs_lock"]:
+        _ES["background_jobs"][ticker] = {"status": "running"}
+    try:
+        raw              = score_thesis._run_analysis(ticker)
+        score, verdict, table_rows, llm, sws = score_thesis._build_report(ticker, raw)
+
+        # TOTAL row for display
+        total_pts = sum(safe_float(r["Total points"])   for r in table_rows if r.get("Total points"))
+        table_rows_display = table_rows + [{
+            "Metric Name": "TOTAL", "Source": "", "Value": "",
+            "Obtained points": str(int(score)), "Total points": str(int(total_pts)),
+        }]
+
+        save_eval_analysis(ticker, table_rows, sws, llm, score, verdict)
+
+        with _ES["jobs_lock"]:
+            _ES["background_jobs"][ticker] = {
+                "status":    "complete",
+                "table_rows": table_rows_display,
+                "llm_parsed": llm,
+                "sws_data":   sws,
+                "score":      score,
+                "verdict":    verdict,
+            }
+    except Exception as e:
+        with _ES["jobs_lock"]:
+            _ES["background_jobs"][ticker] = {"status": "error", "error": str(e)}
+
+
+def _batch_worker(tickers: list, delay_seconds: int):
+    bj = _ES["batch_job"]
+    bl = _ES["batch_lock"]
+    try:
+        for i, ticker in enumerate(tickers):
+            with bl:
+                bj["current"] = ticker
+            try:
+                raw           = score_thesis._run_analysis(ticker)
+                score, verdict, table_rows, llm, sws = score_thesis._build_report(ticker, raw)
+                saved, err    = save_eval_analysis(ticker, table_rows, sws, llm, score, verdict)
+                if not saved:
+                    time.sleep(3)
+                    saved, err = save_eval_analysis(ticker, table_rows, sws, llm, score, verdict)
+                row = {
+                    "Ticker": ticker,
+                    "Score":  f"{score:.0f}",
+                    "Verdict": verdict,
+                    "DB":     "✓ Saved" if saved else f"✗ {str(err)[:120]}",
+                }
+            except Exception as e:
+                row = {"Ticker": ticker, "Score": "N/A", "Verdict": "N/A",
+                       "DB": f"Error: {str(e)[:120]}"}
+            with bl:
+                bj["results"].append(row)
+                bj["done"] = i + 1
+            if i < len(tickers) - 1:
+                time.sleep(delay_seconds)
+    except Exception as e:
+        with bl:
+            bj["error"] = str(e)
+    finally:
+        with bl:
+            bj["status"]  = "complete"
+            bj["current"] = ""
+
+
+# ---------------------------------------------------------------------------
+# Session state init
+# ---------------------------------------------------------------------------
+
+for _k, _v in [
+    ("eval_report_data",   None),
+    ("eval_risk_reward",   None),
+    ("eval_llm",           None),
+    ("eval_ticker",        ""),
+    ("past_view",          "history"),
+    ("past_selected",      None),
+    ("confirm_delete_all", False),
+    ("rescore_results",    []),
+    ("alert_email",        ""),
+    ("alert_trigger",      "Verdict changes"),
+    ("alert_enabled",      False),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+# ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
 
-st.sidebar.title("📈 LEAPS Manager")
+st.sidebar.title("📈 LEAPS Command Center")
+
 page = st.sidebar.radio(
     "Navigate",
-    ["Dashboard", "Add Position", "Alert History", "Settings"],
+    [
+        "🔍 New Analysis",
+        "📋 Past Analyses",
+        "📊 Dashboard",
+        "➕ Add Position",
+        "🔔 Alert History",
+        "⚙️ Settings",
+    ],
     label_visibility="collapsed",
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Monitoring active during US market hours. Daily summary at 9:35 AM ET.")
+st.sidebar.caption(
+    "Monitoring active during US market hours.\n"
+    "Daily summary at 9:35 AM ET."
+)
 
 
 # ===========================================================================
-# PAGE 1: DASHBOARD
+# PAGE: NEW ANALYSIS
 # ===========================================================================
 
-if page == "Dashboard":
+if page == "🔍 New Analysis":
+
+    st.title("New Analysis")
+    st.caption(
+        "Institutional-grade LEAPS evaluation. Enter a ticker to run a full "
+        "7-source thesis analysis and save results to your database."
+    )
+
+    cur = st.session_state.eval_ticker
+
+    # ── Single-ticker polling ─────────────────────────────────────────────────
+    if cur and st.session_state.eval_report_data is None:
+        job     = _ES["background_jobs"].get(cur, {})
+        jstatus = job.get("status")
+        if jstatus == "running":
+            st.info(f"⏳ Analyzing **{cur}**… (~60 seconds)  You can leave and return later.")
+            time.sleep(5)
+            st.rerun()
+        elif jstatus == "complete":
+            st.session_state.eval_report_data = job["table_rows"]
+            st.session_state.eval_llm         = job["llm_parsed"]
+            st.session_state.eval_risk_reward = job["sws_data"]
+            with _ES["jobs_lock"]:
+                _ES["background_jobs"].pop(cur, None)
+            st.rerun()
+        elif jstatus == "error":
+            st.error(f"Analysis failed for **{cur}**: {job.get('error', '')}")
+            with _ES["jobs_lock"]:
+                _ES["background_jobs"].pop(cur, None)
+            st.session_state.eval_ticker = ""
+
+    # ── Batch polling ─────────────────────────────────────────────────────────
+    with _ES["batch_lock"]:
+        _bj = dict(_ES["batch_job"])
+
+    if _bj.get("status") in ("running", "complete"):
+        done    = _bj.get("done",    0)
+        total   = _bj.get("total",   1)
+        current = _bj.get("current", "")
+        results = _bj.get("results", [])
+
+        if _bj["status"] == "running":
+            st.info(f"⏳ Batch — **{done}/{total}** complete.  Currently: **{current}**")
+            st.progress(done / max(total, 1))
+        else:
+            st.success(f"✅ Batch complete — **{total}** tickers processed.")
+            if st.button("Start New Analysis"):
+                with _ES["batch_lock"]:
+                    _ES["batch_job"].clear()
+                st.cache_data.clear()
+                st.rerun()
+
+        if results:
+            st.subheader(f"Results ({len(results)}/{total})")
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+        if _bj["status"] == "running":
+            time.sleep(5)
+            st.rerun()
+
+        st.stop()
+
+    # ── Input form ────────────────────────────────────────────────────────────
+    if st.session_state.eval_report_data is None:
+        _, center, _ = st.columns([1, 2, 1])
+        with center:
+            ticker_input = st.text_input(
+                "Ticker",
+                placeholder="Single: TSLA   |   Batch: TSLA, NVDA, AAPL",
+                label_visibility="collapsed",
+            )
+            is_batch = "," in ticker_input
+            if is_batch:
+                delay_seconds = st.slider(
+                    "Delay between tickers (seconds)", 5, 30, 10, 5,
+                    help="Prevents rate-limiting.",
+                )
+                btn_label = "Run Batch Analysis"
+            else:
+                delay_seconds = 20
+                btn_label     = "Generate Report"
+
+            if st.button(btn_label, type="primary", disabled=not ticker_input.strip()):
+                if is_batch:
+                    tickers = list(dict.fromkeys(
+                        t.strip().upper() for t in ticker_input.split(",") if t.strip()
+                    ))
+                    with _ES["batch_lock"]:
+                        already = _ES["batch_job"].get("status") == "running"
+                    if not already:
+                        with _ES["batch_lock"]:
+                            _ES["batch_job"].update({
+                                "status":  "running", "total": len(tickers),
+                                "done":    0,         "current": tickers[0] if tickers else "",
+                                "results": [],
+                            })
+                        threading.Thread(
+                            target=_batch_worker, args=(tickers, delay_seconds), daemon=False
+                        ).start()
+                    st.rerun()
+                else:
+                    ticker = ticker_input.strip().upper()
+                    with _ES["jobs_lock"]:
+                        already = _ES["background_jobs"].get(ticker, {}).get("status") == "running"
+                    if not already:
+                        with _ES["jobs_lock"]:
+                            _ES["background_jobs"][ticker] = {"status": "running"}
+                        threading.Thread(
+                            target=_single_worker, args=(ticker,), daemon=False
+                        ).start()
+                    st.session_state.eval_ticker      = ticker
+                    st.session_state.eval_report_data = None
+                    st.rerun()
+
+    # ── Results display ───────────────────────────────────────────────────────
+    else:
+        report = st.session_state.eval_report_data
+        ticker = st.session_state.eval_ticker
+
+        if st.button("← New Analysis"):
+            st.session_state.eval_report_data = None
+            st.session_state.eval_ticker      = ""
+            st.session_state.eval_llm         = None
+            st.session_state.eval_risk_reward = None
+            st.rerun()
+
+        st.markdown(f"## Results: {ticker}")
+
+        if report:
+            st.subheader("Financial Metrics")
+            df = pd.DataFrame(report)
+            for c in ("Obtained points", "Total points"):
+                if c in df.columns:
+                    df[c] = df[c].astype(str)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.subheader("Score Summary")
+
+            def _pts(k1, k2=None):
+                for r in report:
+                    n = r["Metric Name"].lower()
+                    if k2 and k1 in n and k2 in n: return r["Obtained points"]
+                    elif not k2 and k1 in n:        return r["Obtained points"]
+                return "0"
+
+            def _f(v):
+                try:    return float(v)
+                except: return 0.0
+
+            s1 = (_f(_pts("runway")) + _f(_pts("net debt","ebitda")) +
+                  _f(_pts("assets","liabilities")) + _f(_pts("burn")) +
+                  _f(_pts("share count")) + _f(_pts("capital structure")))
+            s2 = (_f(_pts("market cap")) + _f(_pts("revenue growth")) +
+                  _f(_pts("gross margin")) + _f(_pts("eps growth")) +
+                  _f(_pts("operating leverage")) + _f(_pts("iv rank")) +
+                  _f(_pts("short float")) + _f(_pts("institutional ownership")))
+            s3 = (_f(_pts("total insider ownership")) + _f(_pts("ceo ownership")) +
+                  _f(_pts("buying vs selling")))
+            s4 = (_f(_pts("moat score")) + _f(_pts("business model")) +
+                  _f(_pts("growth-to-valuation")))
+            final_score = s1 + s2 + s3 + s4
+            is_rej      = any(r["Obtained points"] == "rejected" for r in report)
+            verdict     = _verdict_from_score(final_score, is_rej)
+
+            vc = _verdict_color(verdict)
+            st.dataframe(pd.DataFrame([{
+                "Ticker":                             ticker,
+                "Financial Survival & Balance Sheet": s1,
+                "Growth & Asymmetric Upside":         s2,
+                "Insider Alignment":                  s3,
+                "Moat & Conviction":                  s4,
+                "Final Score":                        str(int(final_score)),
+                "Verdict":                            verdict,
+            }]), use_container_width=True, hide_index=True)
+
+            # Add to watchlist button (no rerun to keep results visible)
+            existing_pos = db.get_positions()
+            existing_tickers = {p.get("ticker","").upper() for p in existing_pos}
+            if ticker in existing_tickers:
+                st.info(f"**{ticker}** is already in your position watchlist.")
+            else:
+                if st.button("📌 Add to Position Watchlist", key="new_add_watchlist"):
+                    db.save_position({
+                        "ticker":          ticker,
+                        "contract":        "",
+                        "option_type":     "CALL",
+                        "strike":          None,
+                        "expiration_date": None,
+                        "entry_date":      None,
+                        "entry_price":     None,
+                        "quantity":        None,
+                        "entry_delta":     None,
+                        "entry_iv_rank":   None,
+                        "entry_thesis_score": int(final_score),
+                        "position_type":   "WATCHLIST",
+                        "target_return":   "5-10x",
+                        "mode":            "WATCHLIST",
+                        "notes":           f"Added from thesis analysis. Score: {int(final_score)}, Verdict: {verdict}",
+                    })
+                    st.toast(f"Added {ticker} to watchlist! Go to Dashboard to manage it.")
+
+            sws = st.session_state.eval_risk_reward or {}
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.subheader("Risks & Rewards")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### ✅ Rewards")
+                for item in sws.get("rewards", []):
+                    st.markdown(
+                        f'<p style="color:#28a745;font-weight:600">• {item}</p>',
+                        unsafe_allow_html=True,
+                    )
+            with col2:
+                st.markdown("#### ⚠️ Risks")
+                for item in sws.get("risks", []):
+                    st.markdown(
+                        f'<p style="color:#dc3545;font-weight:600">• {item}</p>',
+                        unsafe_allow_html=True,
+                    )
+
+            llm = st.session_state.eval_llm
+            if llm:
+                st.markdown("---")
+                st.subheader("Business Profile")
+                st.markdown("#### 🏢 Company Description")
+                st.markdown(
+                    f'<div style="background:#f8f9fa;padding:14px;border-radius:8px;'
+                    f'white-space:pre-wrap;line-height:1.6">{llm["description"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown("#### 💎 Value Proposition")
+                st.markdown(
+                    f'<div style="background:#f8f9fa;padding:14px;border-radius:8px;'
+                    f'white-space:pre-wrap;line-height:1.6">{llm["value_proposition"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown("#### 🛡️ Moat Analysis")
+                st.markdown(
+                    f'<div style="background:#f8f9fa;padding:14px;border-radius:8px;'
+                    f'white-space:pre-wrap;line-height:1.6">{llm["moat"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+# ===========================================================================
+# PAGE: PAST ANALYSES
+# ===========================================================================
+
+elif page == "📋 Past Analyses":
+
+    if st.session_state.past_view == "history":
+        st.title("Past Analyses")
+
+        master_df = get_eval_master_data()
+
+        if master_df.empty:
+            st.info("No analyses yet. Run a **New Analysis** to get started.")
+            st.stop()
+
+        # Confirm delete-all flow
+        if st.session_state.confirm_delete_all:
+            st.warning("⚠️ This will permanently delete ALL analyses. Are you sure?")
+            yes_col, no_col, _ = st.columns([1, 1, 5])
+            if yes_col.button("✅ Yes, delete all", type="primary"):
+                if delete_all_eval_tickers(master_df["Ticker"].tolist()):
+                    st.session_state.confirm_delete_all = False
+                    st.toast("All analyses deleted.")
+                    st.rerun()
+            if no_col.button("❌ Cancel"):
+                st.session_state.confirm_delete_all = False
+                st.rerun()
+
+        # Filters
+        fc1, fc2, fc3 = st.columns([1.4, 2.2, 2])
+        with fc1:
+            search = st.text_input("search", placeholder="Search ticker…",
+                                   label_visibility="collapsed").upper()
+        with fc2:
+            verdict_opts   = sorted(master_df["Verdict"].dropna().unique().tolist())
+            verdict_filter = st.multiselect(
+                "verdict", verdict_opts,
+                placeholder="Filter by verdict…", label_visibility="collapsed",
+            )
+        with fc3:
+            sort_by = st.selectbox(
+                "sort",
+                ["Score ↓ (best first)", "Score ↑ (worst first)",
+                 "Date ↓ (newest)", "Date ↑ (oldest)", "Ticker A→Z"],
+                label_visibility="collapsed",
+            )
+
+        scores_num = master_df["Score"].apply(safe_float)
+        s_min, s_max = int(scores_num.min()), int(scores_num.max())
+        score_range = (
+            st.slider("Score range", s_min, s_max, (s_min, s_max), format="%d pts")
+            if s_min < s_max else (s_min, s_max)
+        )
+
+        df = master_df.copy()
+        if search:
+            df = df[df["Ticker"].str.upper().str.contains(search, na=False)]
+        if verdict_filter:
+            df = df[df["Verdict"].isin(verdict_filter)]
+        df = df[df["Score"].apply(safe_float).between(score_range[0], score_range[1])]
+
+        _sort_map = {
+            "Score ↓ (best first)":  ("Score",  False),
+            "Score ↑ (worst first)": ("Score",  True),
+            "Date ↓ (newest)":       ("date",   False),
+            "Date ↑ (oldest)":       ("date",   True),
+            "Ticker A→Z":            ("Ticker", True),
+        }
+        _scol, _sasc = _sort_map[sort_by]
+        df["_k"] = df[_scol].apply(safe_float) if _scol == "Score" else df[_scol].astype(str)
+        df = df.sort_values("_k", ascending=_sasc, na_position="last").drop(columns=["_k"])
+        df = df.reset_index(drop=True)
+
+        _, del_col = st.columns([8, 1])
+        with del_col:
+            if st.button("🗑️ Delete All"):
+                st.session_state.confirm_delete_all = True
+                st.rerun()
+
+        st.caption(f"Showing **{len(df)}** of {len(master_df)} analyses")
+        st.divider()
+
+        if df.empty:
+            st.info("No analyses match the current filters.")
+        else:
+            hdr = st.columns([1, 2.5, 2.2, 1.5, 2, 1, 1])
+            for txt, c in zip(
+                ["**#**","**Ticker**","**Date**","**Score**","**Verdict**","",""],
+                hdr,
+            ):
+                c.write(txt)
+            st.divider()
+
+            for row_num, row in df.iterrows():
+                ticker = row["Ticker"]
+                vc     = _verdict_color(row["Verdict"])
+                rc     = st.columns([1, 2.5, 2.2, 1.5, 2, 1, 1])
+                rc[0].write(row_num + 1)
+                rc[1].write(f"**{ticker}**")
+                rc[2].write(str(row.get("date", "N/A")))
+                rc[3].write(str(row["Score"]))
+                rc[4].markdown(
+                    f'<span style="color:{vc};font-weight:700">{row["Verdict"]}</span>',
+                    unsafe_allow_html=True,
+                )
+                if rc[5].button("👁️", key=f"view_{row_num}_{ticker}"):
+                    st.session_state.past_selected = ticker
+                    st.session_state.past_view     = "detail"
+                    st.rerun()
+                if rc[6].button("🗑️", key=f"del_{row_num}_{ticker}"):
+                    if delete_eval_ticker(ticker):
+                        st.toast(f"Deleted {ticker}")
+                        st.rerun()
+
+    # ── Detail view ──────────────────────────────────────────────────────────
+    elif st.session_state.past_view == "detail":
+        ticker = st.session_state.past_selected
+
+        btn_c1, btn_c2, btn_c3, _ = st.columns([1.2, 1.8, 1.8, 4])
+        if btn_c1.button("← Back"):
+            st.session_state.past_view    = "history"
+            st.session_state.past_selected = None
+            st.rerun()
+
+        # Add to watchlist button
+        existing_pos     = db.get_positions()
+        existing_tickers = {p.get("ticker","").upper() for p in existing_pos}
+        if ticker in existing_tickers:
+            if btn_c2.button("✅ In Watchlist — Remove", key="detail_rm"):
+                pos_to_rm = next((p for p in existing_pos if p.get("ticker","").upper() == ticker), None)
+                if pos_to_rm:
+                    db.delete_position(str(pos_to_rm["id"]))
+                    st.toast(f"Removed {ticker} from watchlist.")
+                    st.rerun()
+        else:
+            if btn_c2.button("📌 Add to Watchlist", key="detail_add"):
+                score_from_master = db.get_leaps_monitor_score(ticker)
+                db.save_position({
+                    "ticker":          ticker,
+                    "contract":        "",
+                    "option_type":     "CALL",
+                    "strike":          None,
+                    "expiration_date": None,
+                    "entry_date":      None,
+                    "entry_price":     None,
+                    "quantity":        None,
+                    "entry_delta":     None,
+                    "entry_iv_rank":   None,
+                    "entry_thesis_score": score_from_master,
+                    "position_type":   "WATCHLIST",
+                    "target_return":   "5-10x",
+                    "mode":            "WATCHLIST",
+                    "notes":           f"Added from Past Analyses.",
+                })
+                st.toast(f"Added {ticker} to watchlist.")
+                st.rerun()
+
+        # Re-analyze button
+        _analyzing = st.session_state.get("detail_analyzing")
+        if btn_c3.button("🔍 Re-analyze", key=f"reanalyze_{ticker}"):
+            threading.Thread(target=_single_worker, args=(ticker,), daemon=False).start()
+            st.session_state["detail_analyzing"] = ticker
+            st.rerun()
+
+        if _analyzing == ticker:
+            _job     = _ES["background_jobs"].get(ticker, {})
+            _jstatus = _job.get("status")
+            if _jstatus == "running":
+                st.info(f"⏳ Analyzing **{ticker}**…")
+                time.sleep(5)
+                st.rerun()
+            elif _jstatus in ("complete", "error"):
+                del st.session_state["detail_analyzing"]
+                with _ES["jobs_lock"]:
+                    _ES["background_jobs"].pop(ticker, None)
+                st.cache_data.clear()
+                if _jstatus == "error":
+                    st.error(f"Analysis failed: {_job.get('error','')}")
+                st.rerun()
+
+        df = get_eval_ticker_detail(ticker)
+
+        if df.empty:
+            st.info(f"No detailed data for **{ticker}** yet. Click **Re-analyze** to run a full analysis.")
+        else:
+            st.markdown(f"<h2 style='text-align:center'>Analysis: {ticker}</h2>",
+                        unsafe_allow_html=True)
+
+            m_col = "Matric name"    if "Matric name"    in df.columns else "Metric Name"
+            s_col = "Obtained Score" if "Obtained Score" in df.columns else "Obtained points"
+            t_col = "Total score"    if "Total score"    in df.columns else "Total points"
+
+            date_row = df[df[m_col].str.upper() == "DATE"] if m_col in df.columns else pd.DataFrame()
+            date_val = date_row["LLM"].iloc[0] if not date_row.empty else "N/A"
+            st.caption(f"Analysis Date: {date_val}")
+
+            QUAL = {"Risks","Rewards","Company Description","Value Proposition","Moat Analysis","DATE"}
+            metrics_df   = df[~df[m_col].isin(QUAL)].copy()
+            display_cols = [c for c in [m_col, "Source", "Value", s_col, t_col] if c in df.columns]
+            score_sum    = metrics_df[s_col].apply(safe_float).sum() if s_col in metrics_df.columns else 0
+            total_row    = pd.DataFrame([{
+                m_col: "Total Score", "Source": "", "Value": "",
+                s_col: int(round(score_sum)), t_col: "—",
+            }])
+            st.subheader("Financial Metrics")
+            st.table(pd.concat([metrics_df[display_cols], total_row], ignore_index=True))
+
+            def _section_score(metric_list):
+                if s_col not in df.columns: return 0
+                return int(round(df[df[m_col].isin(metric_list)][s_col].apply(safe_float).sum()))
+
+            s1 = _section_score(["Runway","Net Debt / EBITDA","Assets / Liabilities Ratio",
+                                  "Cash Burn Severity","Share Count Growth","Capital Structure Pressure"])
+            s2 = _section_score(["Market cap","Revenue Growth YoY (%)","Gross Margin (%)",
+                                  "Forward EPS Growth (%)","Degree of Operating Leverage",
+                                  "IV Rank","Short Float (%)","Institutional Ownership (%)"])
+            s3 = _section_score(["Total insider ownership %","CEO Ownership %",
+                                  "Net Insider Buying vs Selling (%)"])
+            s4 = _section_score(["GuruFocus Moat Score","Business Model & Value Proposition",
+                                  "Growth-to-Valuation Score"])
+            final   = s1 + s2 + s3 + s4
+            is_rej  = "rejected" in df[s_col].astype(str).str.lower().values if s_col in df.columns else False
+            verdict = _verdict_from_score(final, is_rej)
+
+            st.subheader("Score Summary")
+            st.table(pd.DataFrame([{
+                "Ticker": ticker,
+                "Financial Survival": s1, "Growth & Upside": s2,
+                "Insider Alignment":  s3, "Moat & Conviction": s4,
+                "Final Score": final,     "Verdict": verdict,
+            }]))
+
+            def _llm(metric):
+                if m_col not in df.columns or "LLM" not in df.columns: return "N/A"
+                res = df[df[m_col] == metric]["LLM"]
+                return res.iloc[0] if not res.empty and pd.notnull(res.iloc[0]) else "N/A"
+
+            st.markdown("#### 💰 Rewards")
+            st.markdown(
+                f'<p style="color:#28a745;font-weight:600">{_llm("Rewards")}</p>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("#### 🚨 Risks")
+            st.markdown(
+                f'<p style="color:#dc3545;font-weight:600">{_llm("Risks")}</p>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("#### 🏭 Company Description")
+            st.write(_llm("Company Description"))
+            st.markdown("#### 🤝 Value Proposition")
+            st.write(_llm("Value Proposition"))
+            st.markdown("#### 🛡️ Moat Analysis")
+            st.write(_llm("Moat Analysis"))
+
+
+# ===========================================================================
+# PAGE: DASHBOARD
+# ===========================================================================
+
+elif page == "📊 Dashboard":
     st.title("Portfolio Dashboard")
 
     col_refresh, col_spacer = st.columns([1, 5])
@@ -155,19 +1072,17 @@ if page == "Dashboard":
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Active Positions",   len(active))
     s2.metric("Watchlist",          len(watchlist))
-    # Portfolio cost basis
     total_cost = sum(
         (p.get("entry_price") or 0) * (p.get("quantity") or 0) * 100
         for p in active
     )
     s3.metric("Portfolio Cost Basis", f"${total_cost:,.0f}" if total_cost else "N/A")
-    s4.metric("Avg Contracts/Position", f"{sum(p.get('quantity') or 0 for p in active) / len(active):.1f}" if active else "N/A")
+    s4.metric("Avg Contracts/Position",
+              f"{sum(p.get('quantity') or 0 for p in active) / len(active):.1f}" if active else "N/A")
 
     st.markdown("---")
 
-    # -----------------------------------------------------------------------
-    # Active position cards
-    # -----------------------------------------------------------------------
+    # ── Active position cards ─────────────────────────────────────────────────
     if active:
         st.subheader("Active Positions")
         for pos in active:
@@ -183,15 +1098,13 @@ if page == "Dashboard":
             with st.spinner(f"Loading {ticker}..."):
                 if force_check:
                     mkt = _live_market(pos)
-                    time.sleep(12)     # respect Polygon rate limit
+                    time.sleep(12)
                     polygon_error = None
                 else:
-                    # Quick fetch without IV rank (faster for dashboard)
                     contract = pos.get("contract", "")
                     snap = options_data.get_option_snapshot(ticker, contract) if contract else {}
                     snap = snap or {}
                     polygon_error = snap.get("_error")
-                    # DTE fallback: compute from stored expiration_date when live data fails
                     dte_fallback = None
                     try:
                         raw_exp = pos.get("expiration_date")
@@ -207,7 +1120,7 @@ if page == "Dashboard":
                         "delta":        snap.get("delta"),
                         "dte":          snap.get("dte") or dte_fallback,
                         "iv_rank":      _get_iv_rank_cached(ticker),
-                        "thesis_score": None,  # injected below from get_leaps_monitor_score_with_age
+                        "thesis_score": None,
                     }
 
             mid      = mkt.get("mid")
@@ -215,24 +1128,17 @@ if page == "Dashboard":
             dte_days = mkt.get("dte")
             pnl      = _pnl_pct(ep, mid)
 
-            # Thesis score + age (for staleness display)
             score, score_age = db.get_leaps_monitor_score_with_age(ticker)
 
-            # ── Auto-score if thesis is missing from BigQuery ────────────────
-            # Happens the first time a ticker is tracked, or if the shared
-            # master_table has no entry yet.  Runs synchronously (~30s) so the
-            # score is immediately available for Pillar 1 evaluation this run.
             if score is None:
                 with st.spinner(f"First-time thesis scoring for {ticker} (~30s)..."):
                     _s, _v = score_thesis.compute_and_save_score(ticker)
                 if _s is not None:
                     score, score_age = _s, 0
 
-            # Inject thesis score into mkt so evaluate() sees it
             mkt["thesis_score"] = score
-
-            # Run evaluation once — drives both badge AND inline recommendation
             position_alerts = evaluate(pos, mkt)
+
             if position_alerts:
                 worst_alert   = max(position_alerts, key=_alert_priority)
                 severity      = worst_alert.severity
@@ -245,14 +1151,14 @@ if page == "Dashboard":
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
             emoji = _POSTURE_EMOJI.get(severity, "🟢")
 
-            qty_trimmed = int(pos.get("quantity_trimmed") or 0)
-            proceeds    = float(pos.get("proceeds_from_trims") or 0.0)
+            qty_trimmed   = int(pos.get("quantity_trimmed") or 0)
+            proceeds      = float(pos.get("proceeds_from_trims") or 0.0)
             qty_remaining = int(qty or 0) - qty_trimmed
 
             with st.container(border=True):
                 h1, h2 = st.columns([5, 1])
                 with h1:
-                    cb_str = f"  ·  Cost Basis ${cost_basis:,.0f}" if cost_basis else ""
+                    cb_str   = f"  ·  Cost Basis ${cost_basis:,.0f}" if cost_basis else ""
                     trim_str = ""
                     if qty_trimmed > 0:
                         trim_str = (
@@ -274,17 +1180,16 @@ if page == "Dashboard":
                     )
 
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Avg. Price",   f"${ep:.2f}"   if ep       else "N/A")
-                m2.metric("Current Mid",  f"${mid:.2f}"  if mid      else "N/A")
+                m1.metric("Avg. Price",  f"${ep:.2f}"   if ep       else "N/A")
+                m2.metric("Current Mid", f"${mid:.2f}"  if mid      else "N/A")
                 m3.metric("P&L",
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
                           delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"))
-                m4.metric("Delta",        f"{delta:.2f}" if delta     else "N/A")
-                m5.metric("DTE",          f"{dte_days}d" if dte_days  else "N/A")
-                # Thesis score with age indicator
+                m4.metric("Delta",   f"{delta:.2f}" if delta    else "N/A")
+                m5.metric("DTE",     f"{dte_days}d" if dte_days else "N/A")
                 if score is not None:
                     age_label = f" ({score_age}d ago)" if score_age is not None else ""
-                    stale = score_age is not None and score_age > 30
+                    stale     = score_age is not None and score_age > 30
                     m6.metric("Thesis Score", f"{score}/100{age_label}",
                               delta="⚠️ stale" if stale else None,
                               delta_color="inverse" if stale else "normal")
@@ -292,8 +1197,8 @@ if page == "Dashboard":
                     m6.metric("Thesis Score", "N/A")
                 with m6:
                     if st.button("↻ Re-score", key=f"rescore_{pos_id}",
-                                 help="Re-compute thesis score now using yfinance + Gemini"):
-                        with st.spinner(f"Scoring {ticker} thesis (~30s)..."):
+                                 help="Re-compute thesis score using yfinance + Gemini"):
+                        with st.spinner(f"Scoring {ticker} (~30s)..."):
                             new_score, new_verdict = score_thesis.compute_and_save_score(ticker)
                         if new_score is not None:
                             st.success(f"Score updated: {new_score}/100 ({new_verdict})")
@@ -304,7 +1209,6 @@ if page == "Dashboard":
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")
 
-                # ── Active signal — always visible on the card ──────────────
                 if worst_alert:
                     sig_color = _SEVERITY_COLOR.get(worst_alert.severity, "#FFA500")
                     st.markdown(
@@ -315,7 +1219,6 @@ if page == "Dashboard":
                     )
                     with st.expander("📋 View recommendation & trade instruction"):
                         st.code(worst_alert.body, language=None)
-                        # If multiple alerts fired, show the others too
                         others = [a for a in position_alerts if a is not worst_alert]
                         if others:
                             st.caption(f"Additional signals ({len(others)}):")
@@ -324,7 +1227,6 @@ if page == "Dashboard":
                 else:
                     st.success("✅ All pillars clear — HOLD")
 
-                # Action buttons
                 b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1])
                 with b1:
                     if st.button("Mark Closed", key=f"close_{pos_id}"):
@@ -340,7 +1242,7 @@ if page == "Dashboard":
                         st.session_state.pop("trimming_pos_id", None)
                 with b4:
                     if st.button("✂️ Record Trim", key=f"trim_{pos_id}",
-                                 help="Record contracts you've sold from this position"):
+                                 help="Record contracts you've sold"):
                         st.session_state["trimming_pos_id"] = pos_id
                         st.session_state.pop("editing_pos_id", None)
 
@@ -351,97 +1253,73 @@ if page == "Dashboard":
             if st.session_state.get("editing_pos_id") == pos_id:
                 with st.container(border=True):
                     st.markdown("#### Edit Position")
-                    st.caption("Tip: Avg. Price = option premium per share from IBKR (NOT the stock price, NOT the strike)")
+                    st.caption("Avg. Price = option premium per share from IBKR (NOT the stock price)")
                     ec1, ec2, ec3 = st.columns(3)
                     with ec1:
-                        new_ep  = st.number_input(
-                            "Avg. Price $/share",
+                        new_ep  = st.number_input("Avg. Price $/share",
                             value=float(ep or 0), min_value=0.01, step=0.01, format="%.2f",
-                            help="Option premium per share you paid (IBKR 'Avg. Price'). ×100 = cost per contract.",
                             key=f"ep_{pos_id}")
-                        new_qty = st.number_input(
-                            "Pos (contracts)",
+                        new_qty = st.number_input("Pos (contracts)",
                             value=int(qty or 1), min_value=1, step=1,
-                            help="Number of contracts (IBKR 'Pos')",
                             key=f"qty_{pos_id}")
                     with ec2:
-                        # Parse stored strike for default
                         _strike_default = float(pos.get("strike") or 0)
-                        new_strike = st.number_input(
-                            "Strike Price",
+                        new_strike = st.number_input("Strike Price",
                             value=_strike_default, min_value=0.01, step=0.5, format="%.2f",
-                            help="The strike price of the option contract (e.g. $15, $150)",
                             key=f"strike_{pos_id}")
-                        # Parse stored expiry for default
                         _exp_raw = pos.get("expiration_date")
                         try:
                             _exp_default = _exp_raw if isinstance(_exp_raw, date) else date.fromisoformat(str(_exp_raw))
                         except Exception:
                             _exp_default = date.today() + timedelta(days=540)
-                        new_exp = st.date_input(
-                            "Expiration Date",
-                            value=_exp_default,
-                            min_value=date.today(),
-                            key=f"exp_{pos_id}")
+                        new_exp = st.date_input("Expiration Date", value=_exp_default,
+                            min_value=date.today(), key=f"exp_{pos_id}")
                     with ec3:
-                        new_mode = st.selectbox(
-                            "Mode", ["ACTIVE", "WATCHLIST"],
+                        new_mode = st.selectbox("Mode", ["ACTIVE", "WATCHLIST"],
                             index=0 if pos.get("mode") == "ACTIVE" else 1,
                             key=f"mode_{pos_id}")
-                        # Live cost basis preview
                         cb_preview = new_ep * new_qty * 100
-                        st.metric("Cost Basis (preview)", f"${cb_preview:,.0f}",
-                                  help="Avg. Price × Pos × 100 — verify against IBKR")
+                        st.metric("Cost Basis (preview)", f"${cb_preview:,.0f}")
 
-                    # Trim tracking row
-                    st.markdown("**Trim tracking** — record contracts you've already sold")
+                    st.markdown("**Trim tracking**")
                     tr1, tr2 = st.columns(2)
                     with tr1:
-                        new_qty_trimmed = st.number_input(
-                            "Contracts sold so far (trimmed)",
+                        new_qty_trimmed = st.number_input("Contracts sold so far",
                             value=int(pos.get("quantity_trimmed") or 0),
                             min_value=0, max_value=int(new_qty), step=1,
-                            help="How many contracts you've already sold from this position",
                             key=f"qtrim_{pos_id}")
                     with tr2:
-                        new_proceeds = st.number_input(
-                            "Total proceeds from trims ($)",
+                        new_proceeds = st.number_input("Total proceeds from trims ($)",
                             value=float(pos.get("proceeds_from_trims") or 0.0),
                             min_value=0.0, step=100.0, format="%.0f",
-                            help="Total dollar amount received from all trim sales",
                             key=f"proc_{pos_id}")
-                    # House money indicator
                     if new_qty_trimmed > 0 and new_proceeds > 0:
                         remaining_cost = new_ep * (new_qty - new_qty_trimmed) * 100
                         if new_proceeds >= new_ep * new_qty * 100:
                             st.success(f"HOUSE MONEY — cost fully recovered. "
                                        f"Remaining {int(new_qty) - new_qty_trimmed} contracts cost $0 net.")
-                        elif new_proceeds > 0:
-                            net_cost = max(0, remaining_cost - (new_proceeds - new_ep * new_qty_trimmed * 100))
+                        else:
                             st.info(f"Cost recovered: ${new_proceeds:,.0f}  |  "
-                                    f"Remaining net cost: ~${remaining_cost:,.0f}  |  "
-                                    f"Trimmed: {new_qty_trimmed}/{int(new_qty)} contracts")
+                                    f"Remaining net cost: ~${remaining_cost:,.0f}")
 
                     new_notes = st.text_area("Notes", value=notes or "", key=f"notes_{pos_id}")
-                    sv1, sv2 = st.columns([1, 5])
+                    sv1, sv2  = st.columns([1, 5])
                     with sv1:
                         if st.button("Save Changes", type="primary", key=f"save_{pos_id}"):
-                            # Rebuild OCC contract symbol whenever strike or expiry changes
                             opt_type_char = (pos.get("option_type") or "CALL")[0].upper()
-                            new_contract = options_data.to_occ(ticker, new_exp, opt_type_char, new_strike)
-                            updates = {
-                                "entry_price":        new_ep,
-                                "quantity":           int(new_qty),
-                                "strike":             new_strike,
-                                "expiration_date":    new_exp,
-                                "contract":           new_contract,
-                                "mode":               new_mode,
-                                "notes":              new_notes,
-                                "quantity_trimmed":   int(new_qty_trimmed),
-                                "proceeds_from_trims": float(new_proceeds),
-                            }
+                            new_contract  = options_data.to_occ(ticker, new_exp, opt_type_char, new_strike)
                             try:
-                                db.update_position(pos_id, updates)
+                                db.update_position(pos_id, {
+                                    "entry_price":         new_ep,
+                                    "quantity":            int(new_qty),
+                                    "strike":              new_strike,
+                                    "expiration_date":     new_exp,
+                                    "contract":            new_contract,
+                                    "mode":                new_mode,
+                                    "notes":               new_notes,
+                                    "quantity_trimmed":    int(new_qty_trimmed),
+                                    "proceeds_from_trims": float(new_proceeds),
+                                })
                                 del st.session_state["editing_pos_id"]
                                 st.rerun()
                             except Exception as e:
@@ -455,59 +1333,46 @@ if page == "Dashboard":
             if st.session_state.get("trimming_pos_id") == pos_id:
                 with st.container(border=True):
                     st.markdown("#### ✂️ Record Trim")
-                    st.caption(
-                        "Enter how many contracts you sold in this trim event "
-                        "and the price you received per share (from IBKR 'Avg. Price' on the sell). "
-                        "This is additive — each trim adds to the running total."
-                    )
+                    st.caption("Enter contracts sold + price received (IBKR 'Avg. Price' on the sell). Additive.")
                     tr1, tr2 = st.columns(2)
                     with tr1:
-                        max_trim = max(1, qty_remaining)
-                        trim_qty_now = st.number_input(
-                            "Contracts sold in this trim",
+                        max_trim      = max(1, qty_remaining)
+                        trim_qty_now  = st.number_input("Contracts sold in this trim",
                             min_value=1, max_value=max_trim, step=1,
                             key=f"tnq_{pos_id}",
-                            help=f"You have {qty_remaining} contracts remaining"
-                        )
+                            help=f"{qty_remaining} contracts remaining")
                     with tr2:
-                        trim_price_now = st.number_input(
-                            "Sale price per share $/share",
+                        trim_price_now = st.number_input("Sale price per share $/share",
                             min_value=0.01, step=0.01, format="%.2f",
-                            key=f"tnp_{pos_id}",
-                            help="From IBKR 'Avg. Price' on the closing trade"
-                        )
+                            key=f"tnp_{pos_id}")
 
-                    this_proceeds = trim_qty_now * trim_price_now * 100
+                    this_proceeds      = trim_qty_now * trim_price_now * 100
                     new_total_trimmed  = qty_trimmed + trim_qty_now
                     new_total_proceeds = proceeds + this_proceeds
                     original_cost      = (ep or 0) * (int(qty or 0)) * 100
 
-                    st.info(
-                        f"**This trim:** {trim_qty_now} contracts × ${trim_price_now:.2f}/share × 100 = "
-                        f"**${this_proceeds:,.0f}** proceeds"
-                    )
+                    st.info(f"This trim: {trim_qty_now} × ${trim_price_now:.2f} × 100 = **${this_proceeds:,.0f}**")
 
-                    # Running cumulative after this trim
                     pnl_on_trim = None
                     if ep and trim_price_now and ep > 0:
                         pnl_on_trim = round((trim_price_now - ep) / ep * 100, 1)
 
-                    pnl_str = f"  ·  P&L on trim: {pnl_on_trim:+.1f}%" if pnl_on_trim is not None else ""
                     contracts_left = int(qty or 0) - new_total_trimmed
+                    pnl_str = f"  ·  P&L on trim: {pnl_on_trim:+.1f}%" if pnl_on_trim is not None else ""
 
                     if original_cost > 0 and new_total_proceeds >= original_cost:
                         st.success(
                             f"HOUSE MONEY after this trim!  "
-                            f"${new_total_proceeds:,.0f} recovered ≥ ${original_cost:,.0f} cost basis.  "
+                            f"${new_total_proceeds:,.0f} recovered ≥ ${original_cost:,.0f} cost.  "
                             f"{contracts_left} contracts left cost $0 net.{pnl_str}"
                         )
                     else:
-                        net_remaining_cost = max(0, original_cost - new_total_proceeds)
+                        net_remaining = max(0, original_cost - new_total_proceeds)
                         st.markdown(
-                            f"After this trim: **{new_total_trimmed}/{int(qty or 0)}** contracts sold  ·  "
+                            f"After trim: **{new_total_trimmed}/{int(qty or 0)}** sold  ·  "
                             f"**${new_total_proceeds:,.0f}** recovered  ·  "
-                            f"**${net_remaining_cost:,.0f}** still at risk  ·  "
-                            f"**{contracts_left}** contracts remaining{pnl_str}"
+                            f"**${net_remaining:,.0f}** still at risk  ·  "
+                            f"**{contracts_left}** remaining{pnl_str}"
                         )
 
                     tc1, tc2 = st.columns([1, 5])
@@ -527,9 +1392,7 @@ if page == "Dashboard":
                             del st.session_state["trimming_pos_id"]
                             st.rerun()
 
-    # -----------------------------------------------------------------------
-    # Watchlist
-    # -----------------------------------------------------------------------
+    # ── Watchlist ─────────────────────────────────────────────────────────────
     if watchlist:
         st.markdown("---")
         st.subheader("Watchlist — Waiting for Entry Signal")
@@ -538,22 +1401,22 @@ if page == "Dashboard":
             pos_id = str(pos.get("id", ""))
 
             stock_data = get_price_and_range(ticker)
-            price       = stock_data.get("price")
-            pfl         = stock_data.get("pct_from_low")
+            price      = stock_data.get("price")
+            pfl        = stock_data.get("pct_from_low")
 
             score = db.get_leaps_monitor_score(ticker)
             if score is None:
-                with st.spinner(f"First-time thesis scoring for {ticker}..."):
+                with st.spinner(f"First-time scoring for {ticker}..."):
                     _s, _v = score_thesis.compute_and_save_score(ticker)
-                    score = _s
+                    score  = _s
             score_str = f"{score}/100" if score else "N/A"
 
             with st.container(border=True):
                 c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-                c1.metric("Ticker",       ticker)
+                c1.metric("Ticker",        ticker)
                 c2.metric("Current Price", f"${price:.2f}" if price else "N/A")
-                c3.metric("52w Position", f"{pfl*100:.0f}% from low" if pfl is not None else "N/A")
-                c4.metric("Thesis Score", score_str)
+                c3.metric("52w Position",  f"{pfl*100:.0f}% from low" if pfl is not None else "N/A")
+                c4.metric("Thesis Score",  score_str)
                 with c5:
                     if st.button("Move to Active", key=f"activate_{pos_id}"):
                         db.update_position_mode(pos_id, "ACTIVE")
@@ -561,15 +1424,14 @@ if page == "Dashboard":
                     if st.button("Remove", key=f"rm_watch_{pos_id}"):
                         db.delete_position(pos_id)
                         st.rerun()
-
             st.caption(pos.get("notes", ""))
 
 
 # ===========================================================================
-# PAGE 2: ADD POSITION
+# PAGE: ADD POSITION
 # ===========================================================================
 
-elif page == "Add Position":
+elif page == "➕ Add Position":
     st.title("Add Position")
 
     tab_new, tab_existing = st.tabs([
@@ -577,14 +1439,10 @@ elif page == "Add Position":
         "📋 Existing Position — Already Bought",
     ])
 
-    # -----------------------------------------------------------------------
-    # Tab 1: Recommend options for a ticker
-    # -----------------------------------------------------------------------
     with tab_new:
         st.markdown(
-            "Enter a stock ticker you've identified and approved in the LEAPS Monitor. "
-            "The app will fetch available LEAPS and recommend the best contracts for your "
-            "10x (Moonshot) and 3-5x (Core) strategy."
+            "Enter a stock ticker you've evaluated. The app will fetch available LEAPS "
+            "and recommend the best contracts for your 10x (Moonshot) and 3-5x (Core) strategy."
         )
 
         ticker_new = st.text_input("Stock Ticker", placeholder="e.g. NVDA", max_chars=10).upper().strip()
@@ -603,13 +1461,13 @@ elif page == "Add Position":
                 cores     = recs["CORE"]
 
                 if not moonshots and not cores:
-                    st.warning("No qualifying LEAPS found. The ticker may have limited options liquidity.")
+                    st.warning("No qualifying LEAPS found.")
                 else:
                     col_m, col_c = st.columns(2)
 
                     with col_m:
                         st.markdown("### Moonshot Picks (10x target)")
-                        st.caption("Far OTM · Low delta · Big stock move needed · High risk / High reward")
+                        st.caption("Far OTM · Low delta · High risk / High reward")
                         for i, c in enumerate(moonshots):
                             with st.expander(
                                 f"Option {i+1}:  ${c.get('strike')}C  {c.get('expiration_date')}  "
@@ -618,13 +1476,12 @@ elif page == "Add Position":
                             ):
                                 st.code(format_recommendation(c, stock_price))
                                 if st.button("Add to Watchlist as Moonshot", key=f"add_moon_{i}"):
-                                    exp_date = c.get("expiration_date")
-                                    pos_id = db.save_position({
+                                    db.save_position({
                                         "ticker":          ticker_new,
                                         "contract":        c.get("contract", ""),
                                         "option_type":     "CALL",
                                         "strike":          c.get("strike"),
-                                        "expiration_date": exp_date,
+                                        "expiration_date": c.get("expiration_date"),
                                         "entry_date":      None,
                                         "entry_price":     None,
                                         "quantity":        None,
@@ -634,13 +1491,13 @@ elif page == "Add Position":
                                         "position_type":   "MOONSHOT",
                                         "target_return":   "10x",
                                         "mode":            "WATCHLIST",
-                                        "notes":           f"Recommended by engine. Δ={c.get('delta')}, move needed for 10x: {c.get('10x_required_move_pct','?')}%",
+                                        "notes": f"Recommended. Δ={c.get('delta')}, 10x move: {c.get('10x_required_move_pct','?')}%",
                                     })
                                     st.success(f"Added {ticker_new} moonshot to watchlist!")
 
                     with col_c:
                         st.markdown("### Core Picks (3-5x target)")
-                        st.caption("Moderate OTM · Medium delta · Realistic stock move · Balanced risk / reward")
+                        st.caption("Moderate OTM · Medium delta · Balanced risk / reward")
                         for i, c in enumerate(cores):
                             with st.expander(
                                 f"Option {i+1}:  ${c.get('strike')}C  {c.get('expiration_date')}  "
@@ -649,13 +1506,12 @@ elif page == "Add Position":
                             ):
                                 st.code(format_recommendation(c, stock_price))
                                 if st.button("Add to Watchlist as Core", key=f"add_core_{i}"):
-                                    exp_date = c.get("expiration_date")
-                                    pos_id = db.save_position({
+                                    db.save_position({
                                         "ticker":          ticker_new,
                                         "contract":        c.get("contract", ""),
                                         "option_type":     "CALL",
                                         "strike":          c.get("strike"),
-                                        "expiration_date": exp_date,
+                                        "expiration_date": c.get("expiration_date"),
                                         "entry_date":      None,
                                         "entry_price":     None,
                                         "quantity":        None,
@@ -665,19 +1521,15 @@ elif page == "Add Position":
                                         "position_type":   "CORE",
                                         "target_return":   "3-5x",
                                         "mode":            "WATCHLIST",
-                                        "notes":           f"Recommended by engine. Δ={c.get('delta')}, move needed for 3x: {c.get('3x_required_move_pct','?')}%",
+                                        "notes": f"Recommended. Δ={c.get('delta')}, 3x move: {c.get('3x_required_move_pct','?')}%",
                                     })
                                     st.success(f"Added {ticker_new} core to watchlist!")
 
-    # -----------------------------------------------------------------------
-    # Tab 2: Add existing position (already purchased)
-    # -----------------------------------------------------------------------
     with tab_existing:
         st.markdown(
             "You've already bought this option. Enter the details and the app "
-            "will immediately preview your current position health."
+            "will preview your current position health."
         )
-
         st.info(
             "**Field guide (from IBKR):**  "
             "Strike = the option's strike price (e.g. $15)  ·  "
@@ -689,38 +1541,23 @@ elif page == "Add Position":
             c1, c2 = st.columns(2)
             with c1:
                 ticker_ex  = st.text_input("Stock Ticker *", placeholder="NVDA").upper().strip()
-                strike_ex  = st.number_input(
-                    "Strike Price * — the option's strike (e.g. $15, $150)",
-                    min_value=0.0, step=0.5, format="%.2f",
-                    help="This is NOT your avg price. It's the price level the option contract is written on.")
+                strike_ex  = st.number_input("Strike Price *", min_value=0.0, step=0.5, format="%.2f",
+                    help="The option's strike price. NOT your avg price.")
                 exp_date   = st.date_input("Expiration Date *", min_value=date.today() + timedelta(days=30))
                 opt_type   = st.selectbox("Option Type", ["CALL", "PUT"])
             with c2:
-                entry_price_ex = st.number_input(
-                    "Avg. Price $/share * — option premium you paid per share",
-                    min_value=0.01, step=0.01, format="%.2f",
-                    help="From IBKR 'Avg. Price' column. NOT the stock price, NOT the strike. × 100 = cost per contract."
-                )
-                qty_ex     = st.number_input(
-                    "Pos (number of contracts) *",
-                    min_value=1, step=1, value=1,
-                    help="From IBKR 'Pos' column"
-                )
-                # Cost Basis computed display (read-only)
+                entry_price_ex = st.number_input("Avg. Price $/share *", min_value=0.01, step=0.01, format="%.2f",
+                    help="From IBKR 'Avg. Price'. × 100 = cost per contract.")
+                qty_ex     = st.number_input("Pos (contracts) *", min_value=1, step=1, value=1)
                 cb_display = entry_price_ex * qty_ex * 100 if entry_price_ex and qty_ex else 0
-                st.metric("Cost Basis (computed)", f"${cb_display:,.2f}",
-                          help="Avg. Price × Pos × 100 — verify this matches IBKR 'Cost Basis'")
-
-            mode_ex    = st.radio("Mode", ["ACTIVE", "WATCHLIST"], horizontal=True,
-                                  help="ACTIVE = monitoring with exit alerts | WATCHLIST = watching for entry signals")
-            notes_ex   = st.text_area("Notes (optional)", placeholder="e.g. Bought on earnings dip")
-
+                st.metric("Cost Basis (computed)", f"${cb_display:,.2f}")
+            mode_ex  = st.radio("Mode", ["ACTIVE", "WATCHLIST"], horizontal=True,
+                                help="ACTIVE = exit alerts | WATCHLIST = entry signals")
+            notes_ex = st.text_area("Notes (optional)")
             submitted = st.form_submit_button("Save Position", type="primary")
 
         if submitted and ticker_ex and strike_ex and exp_date and entry_price_ex:
-            # Build OCC symbol
             contract_sym = options_data.to_occ(ticker_ex, exp_date, opt_type[0], strike_ex)
-
             with st.spinner("Fetching live data and saving..."):
                 snap  = options_data.get_option_snapshot(ticker_ex, contract_sym) or {}
                 score = db.get_leaps_monitor_score(ticker_ex)
@@ -731,7 +1568,6 @@ elif page == "Add Position":
             dte_d = snap.get("dte") or (exp_date - date.today()).days
             pnl   = _pnl_pct(entry_price_ex, mid)
 
-            # Save immediately (no second click needed)
             db.save_position({
                 "ticker":             ticker_ex,
                 "contract":           contract_sym,
@@ -749,29 +1585,27 @@ elif page == "Add Position":
                 "notes":              notes_ex,
             })
 
-            st.success(f"✅ Position saved! {ticker_ex} {exp_date} ${strike_ex}C — go to **Dashboard** to monitor it.")
+            st.success(
+                f"✅ Position saved! {ticker_ex} {exp_date} ${strike_ex}C — "
+                f"go to **Dashboard** to monitor it."
+            )
 
             if snap_error:
-                st.warning(f"⚠️ Live data unavailable: {snap_error}  (DTE computed from expiration date)")
+                st.warning(f"⚠️ Live data unavailable: {snap_error}")
 
-            # Show snapshot after saving
             st.markdown("---")
             st.subheader("Position Snapshot")
             pr1, pr2, pr3, pr4, pr5 = st.columns(5)
-            pr1.metric("Current Mid",  f"${mid:.2f}"  if mid    else "N/A")
+            pr1.metric("Current Mid",  f"${mid:.2f}"  if mid   else "N/A")
             pr2.metric("P&L",          f"{pnl:+.1f}%" if pnl is not None else "N/A")
-            pr3.metric("Delta",        f"{delta:.2f}" if delta   else "N/A")
-            pr4.metric("DTE",          f"{dte_d}d"    if dte_d   else "N/A")
-            pr5.metric("Thesis Score", f"{score}/100" if score   else "N/A")
+            pr3.metric("Delta",        f"{delta:.2f}" if delta else "N/A")
+            pr4.metric("DTE",          f"{dte_d}d"    if dte_d else "N/A")
+            pr5.metric("Thesis Score", f"{score}/100" if score else "N/A")
 
-            # Run a quick pillar check
-            dummy_pos = {
-                "ticker":          ticker_ex,
-                "entry_price":     entry_price_ex,
-                "expiration_date": exp_date,
-                "mode":            mode_ex,
-            }
-            dummy_mkt = {"mid": mid, "delta": delta, "dte": dte_d, "iv_rank": None, "thesis_score": score}
+            dummy_pos = {"ticker": ticker_ex, "entry_price": entry_price_ex,
+                         "expiration_date": exp_date, "mode": mode_ex}
+            dummy_mkt = {"mid": mid, "delta": delta, "dte": dte_d,
+                         "iv_rank": None, "thesis_score": score}
             preview_alerts = evaluate(dummy_pos, dummy_mkt) if mode_ex == "ACTIVE" else []
 
             if preview_alerts:
@@ -782,40 +1616,27 @@ elif page == "Add Position":
 
 
 # ===========================================================================
-# PAGE 3: ALERT HISTORY
+# PAGE: ALERT HISTORY
 # ===========================================================================
 
-elif page == "Alert History":
+elif page == "🔔 Alert History":
     st.title("Alert History")
 
-    # Filters
     fc1, fc2, fc3 = st.columns([1.5, 2, 2])
     with fc1:
         filter_ticker = st.text_input("Filter ticker", placeholder="NVDA").upper().strip()
     with fc2:
-        filter_severity = st.multiselect(
-            "Severity",
-            ["RED", "BLUE", "AMBER", "GREEN"],
-            placeholder="All severities",
-        )
+        filter_severity = st.multiselect("Severity",
+            ["RED", "BLUE", "AMBER", "GREEN"], placeholder="All severities")
     with fc3:
-        filter_type = st.multiselect(
-            "Alert type",
-            [
-                # Threshold-based (Pillars 1-5)
-                "EXIT_THESIS", "EXIT_STOP", "EXIT_TIME_URGENT", "EXIT_TIME_WARNING",
-                "ROLL_DELTA", "ROLL_TIME",
-                "PROFIT_100", "PROFIT_300", "PROFIT_600", "PROFIT_900",
-                "ENTRY_SIGNAL", "ENTRY_WATCH", "DELTA_WARN",
-                # IV Timing (Pillar 6) — fires when IV window is optimal
-                "IV_EXIT_NOW", "IV_TRIM_NOW",
-                "IV_ROLL_SELL_NOW", "IV_ROLL_BUY_NOW",
-                "IV_ENTRY_OPTIMAL",
-                # System
-                "DAILY_SUMMARY",
-            ],
-            placeholder="All types",
-        )
+        filter_type = st.multiselect("Alert type", [
+            "EXIT_THESIS", "EXIT_STOP", "EXIT_TIME_URGENT", "EXIT_TIME_WARNING",
+            "ROLL_DELTA", "ROLL_TIME",
+            "PROFIT_100", "PROFIT_300", "PROFIT_600", "PROFIT_900",
+            "ENTRY_SIGNAL", "ENTRY_WATCH", "DELTA_WARN",
+            "IV_EXIT_NOW", "IV_TRIM_NOW", "IV_ROLL_SELL_NOW", "IV_ROLL_BUY_NOW",
+            "IV_ENTRY_OPTIMAL", "DAILY_SUMMARY",
+        ], placeholder="All types")
 
     try:
         alerts = db.get_alerts(ticker=filter_ticker or None, limit=300)
@@ -842,95 +1663,118 @@ elif page == "Alert History":
                 ts = ts.strftime("%b %d, %Y  %H:%M")
 
             with st.expander(
-                f"{emoji}  {ts}  |  {a.get('ticker', '')}  |  {a.get('alert_type', '')}",
+                f"{emoji}  {ts}  |  {a.get('ticker','')}  |  {a.get('alert_type','')}",
                 expanded=False,
             ):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("P&L at Alert",  f"{a.get('current_pnl_pct'):+.1f}%" if a.get("current_pnl_pct") is not None else "N/A")
-                c2.metric("Delta",         f"{a.get('current_delta'):.2f}" if a.get("current_delta") else "N/A")
-                c3.metric("DTE",           f"{a.get('current_dte')}d" if a.get("current_dte") else "N/A")
-                c4.metric("Thesis Score",  f"{a.get('current_thesis_score')}/100" if a.get("current_thesis_score") else "N/A")
+                c1.metric("P&L at Alert",
+                          f"{a.get('current_pnl_pct'):+.1f}%" if a.get("current_pnl_pct") is not None else "N/A")
+                c2.metric("Delta",  f"{a.get('current_delta'):.2f}" if a.get("current_delta") else "N/A")
+                c3.metric("DTE",    f"{a.get('current_dte')}d"      if a.get("current_dte")   else "N/A")
+                c4.metric("Thesis", f"{a.get('current_thesis_score')}/100" if a.get("current_thesis_score") else "N/A")
                 st.code(a.get("body", ""), language=None)
-                sent_str = "✅ Email sent" if a.get("email_sent") else "❌ Email failed"
-                st.caption(sent_str)
+                st.caption("✅ Email sent" if a.get("email_sent") else "❌ Email failed")
 
 
 # ===========================================================================
-# PAGE 4: SETTINGS
+# PAGE: SETTINGS
 # ===========================================================================
 
-elif page == "Settings":
+elif page == "⚙️ Settings":
     st.title("Settings")
 
-    st.subheader("Email Configuration")
-    try:
-        sender    = st.secrets.get("GMAIL_SENDER", "not configured")
-        recipient = st.secrets.get("ALERT_RECIPIENT_EMAIL", sender)
-        st.info(f"Alerts sent from **{sender}** to **{recipient}**\nChange via secrets.toml in Streamlit Cloud.")
-    except Exception:
-        st.warning("Gmail secrets not configured. Add GMAIL_SENDER, GMAIL_APP_PASSWORD, ALERT_RECIPIENT_EMAIL to secrets.")
-
-    if st.button("Send Test Email"):
-        with st.spinner("Sending test email..."):
-            ok = email_alerts.send_test_email()
-        if ok:
-            st.success("Test email sent successfully. Check your inbox.")
-        else:
-            st.error("Test email failed. Check your Gmail secrets configuration.")
-
-    st.markdown("---")
-    st.subheader("Alert Thresholds")
-    st.info(
-        "Default thresholds are set based on professional LEAPS management rules. "
-        "Custom overrides coming in a future update."
-    )
-
-    st.markdown(
-        """
-        All positions use a single unified threshold set targeting **5-10x returns**.
-
-        | Signal | Threshold | Action |
-        |---|---|---|
-        | **Stop loss** | -60% | Exit — recovery from here is statistically rare |
-        | **First trim** | +100% (2x) | Sell 20-25% — recover initial cost basis |
-        | **Trim & Roll** | +300% (4x) | Sell 50% to lock gains; roll remainder if DTE > 90 |
-        | **Trim hard** | +600% (7x) | Sell 75%; trail 25% toward 10x |
-        | **Full exit** | +900% (10x) | Exit everything — target hit |
-        | **Roll delta** | Δ > 0.90 | Leverage exhausted — roll to higher strike |
-        | **Delta warn** | Δ < 0.10 | Option near worthless — reassess |
-        | **DTE roll window** | < 270 days | Roll if profitable |
-        | **DTE urgent** | < 90 days | Exit losers; take profits if positive |
-        | **DTE hard exit** | < 60 days | Exit regardless of P&L |
-        """
-    )
-
-    st.markdown("---")
-    st.subheader("Monitoring Schedule")
-    st.markdown(
-        """
-        - Active position checks: **every 30 minutes** (Mon–Fri, 9:30–16:00 ET)
-        - Watchlist entry checks: **every hour** (Mon–Fri, 9:30–16:00 ET)
-        - Daily portfolio summary email: **9:35 AM ET** (Mon–Fri)
-        - Deduplication: each alert type fires **at most once per day** per position
-        """
-    )
-
-    st.markdown("---")
-    st.subheader("Thesis Score Management")
+    # ── Thesis Rescore ────────────────────────────────────────────────────────
+    st.subheader("🔄 Rescore All Analyses")
     st.caption(
-        "Scores are fetched from the shared BigQuery master_table (same data as the LEAPS Evaluator). "
-        "When a score is missing, the app auto-scores using yfinance + Gemini with Google Search. "
-        "Use the buttons below to force a full rescore for all active positions."
+        "Re-applies the **current scoring rules** to stored BigQuery values. "
+        "No new API calls — fast, and fixes score discrepancies from rule changes."
     )
 
+    if st.button("🔄 Rescore All", type="primary"):
+        master_df = get_eval_master_data()
+        if master_df.empty:
+            st.warning("No analyses found.")
+        else:
+            tickers = master_df["Ticker"].tolist()
+            results = []
+            prog    = st.progress(0.0)
+            status  = st.empty()
+            for i, ticker in enumerate(tickers):
+                status.info(f"Rescoring **{ticker}** ({i+1}/{len(tickers)})…")
+                old_s, new_s, old_v, new_v = rescore_ticker_in_bq(ticker)
+                results.append({
+                    "Ticker":      ticker,
+                    "Old Score":   old_s,
+                    "New Score":   new_s,
+                    "Score Δ":     new_s - old_s,
+                    "Old Verdict": old_v,
+                    "New Verdict": new_v,
+                    "Changed":     "✅" if (old_s != new_s or old_v != new_v) else "—",
+                })
+                prog.progress((i + 1) / len(tickers))
+
+            st.session_state.rescore_results = results
+            st.cache_data.clear()
+            status.success(f"✅ Rescored **{len(tickers)}** tickers.")
+            prog.empty()
+
+            # Email alerts for active positions that changed
+            if st.session_state.alert_enabled and st.session_state.alert_email:
+                active_tickers = {p["ticker"].upper() for p in db.get_positions(mode="ACTIVE") if p.get("ticker")}
+                trigger        = st.session_state.alert_trigger
+                changed        = []
+                for r in results:
+                    if r["Ticker"].upper() not in active_tickers:
+                        continue
+                    vdict = r["Old Verdict"] != r["New Verdict"]
+                    sdiff = abs(r["Score Δ"])
+                    if (
+                        (trigger == "Verdict changes"          and vdict) or
+                        (trigger == "Score changes by ≥ 5 pts" and sdiff >= 5) or
+                        (trigger == "Both"                     and (vdict or sdiff >= 5))
+                    ):
+                        changed.append(r)
+
+                if changed:
+                    rows_html = "".join(
+                        f"<tr><td>{a['Ticker']}</td><td>{a['Old Score']}</td>"
+                        f"<td>{a['New Score']}</td><td>{a['Score Δ']:+d}</td>"
+                        f"<td>{a['Old Verdict']}</td><td>{a['New Verdict']}</td></tr>"
+                        for a in changed
+                    )
+                    body = (
+                        f'<html><body style="font-family:Arial,sans-serif;">'
+                        f'<h2 style="color:#1a1a2e">LEAPS — Score Alert</h2>'
+                        f'<table border="1" cellpadding="8" style="border-collapse:collapse">'
+                        f'<tr style="background:#f1f3f5"><th>Ticker</th><th>Old</th>'
+                        f'<th>New</th><th>Δ</th><th>Old Verdict</th><th>New Verdict</th></tr>'
+                        f'{rows_html}</table></body></html>'
+                    )
+                    ok, err = send_alert_email(
+                        st.session_state.alert_email,
+                        f"LEAPS: {len(changed)} position(s) changed",
+                        body,
+                    )
+                    st.success(f"Alert sent for {len(changed)} position(s).") if ok \
+                        else st.warning(f"Email failed: {err}")
+
+    if st.session_state.rescore_results:
+        st.markdown("#### Last Rescore Results")
+        st.dataframe(pd.DataFrame(st.session_state.rescore_results),
+                     use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Full Re-score (with API calls) ────────────────────────────────────────
+    st.subheader("↻ Re-score Active Positions (Full Pipeline)")
     rs1, rs2 = st.columns([1, 3])
     with rs1:
-        rescore_all = st.button("↻ Rescore All Active", type="primary",
-                                help="Re-score every active position using the full pipeline (Gemini + Google Search). ~30s per ticker.")
+        rescore_full = st.button("↻ Rescore All Active",
+                                 help="Re-score every active position via Gemini + Google Search (~30s/ticker).")
     with rs2:
-        st.caption("Runs the same Gemini + Google Search pipeline used by the LEAPS Evaluator to get accurate moat scores, CEO ownership, and business model classification.")
+        st.caption("Runs the full 7-source pipeline (yfinance, Finviz, GuruFocus, Gemini, SWS, IV Rank, EPS).")
 
-    if rescore_all:
+    if rescore_full:
         try:
             active_tickers = list({p["ticker"] for p in db.get_positions(mode="ACTIVE") if p.get("ticker")})
         except Exception as e:
@@ -941,23 +1785,111 @@ elif page == "Settings":
             st.info("No active positions to rescore.")
         else:
             results = []
-            prog = st.progress(0.0, text=f"Rescoring 0/{len(active_tickers)}...")
+            prog    = st.progress(0.0, text=f"Rescoring 0/{len(active_tickers)}...")
             for i, tk in enumerate(active_tickers):
-                prog.progress((i) / len(active_tickers), text=f"Scoring {tk} ({i+1}/{len(active_tickers)})...")
+                prog.progress(i / len(active_tickers), text=f"Scoring {tk} ({i+1}/{len(active_tickers)})...")
                 s, v = score_thesis.compute_and_save_score(tk)
-                results.append({"Ticker": tk, "Score": s, "Verdict": v, "Status": "✅" if s else "❌"})
+                results.append({"Ticker": tk, "Score": s, "Verdict": v,
+                                 "Status": "✅" if s else "❌"})
             prog.progress(1.0, text="Done!")
-
-            import pandas as pd
-            st.dataframe(
-                pd.DataFrame(results),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.success(f"Rescored {len([r for r in results if r['Score']])} of {len(active_tickers)} tickers successfully.")
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            st.success(f"Rescored {len([r for r in results if r['Score']])} of {len(active_tickers)} tickers.")
             st.cache_data.clear()
 
-    st.markdown("---")
+    st.divider()
+
+    # ── Position Manager email ─────────────────────────────────────────────────
+    st.subheader("📧 Position Manager Alerts (Exit / Entry)")
+    try:
+        sender    = st.secrets.get("GMAIL_SENDER", "not configured")
+        recipient = st.secrets.get("ALERT_RECIPIENT_EMAIL", sender)
+        st.info(f"Alerts sent from **{sender}** to **{recipient}**\n"
+                f"Change via secrets.toml in Streamlit Cloud.")
+    except Exception:
+        st.warning("Gmail secrets not configured. Add GMAIL_SENDER, GMAIL_APP_PASSWORD, "
+                   "ALERT_RECIPIENT_EMAIL to secrets.")
+
+    if st.button("Send Test Exit-Alert Email"):
+        with st.spinner("Sending..."):
+            ok = email_alerts.send_test_email()
+        st.success("Test email sent.") if ok else st.error("Test email failed.")
+
+    st.divider()
+
+    # ── Evaluator email alerts ────────────────────────────────────────────────
+    st.subheader("📧 Evaluator Score-Change Alerts")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.alert_enabled = st.toggle(
+            "Enable evaluator email alerts", value=st.session_state.alert_enabled
+        )
+        st.session_state.alert_email = st.text_input(
+            "Alert recipient email",
+            value=st.session_state.alert_email,
+            placeholder="you@example.com",
+            disabled=not st.session_state.alert_enabled,
+        )
+    with col2:
+        trigger_opts = ["Verdict changes", "Score changes by ≥ 5 pts", "Both"]
+        st.session_state.alert_trigger = st.selectbox(
+            "Alert trigger", trigger_opts,
+            index=trigger_opts.index(st.session_state.alert_trigger),
+            disabled=not st.session_state.alert_enabled,
+        )
+        if st.button("✉️ Send Test Email", disabled=not st.session_state.alert_enabled):
+            ok, err = send_alert_email(
+                st.session_state.alert_email,
+                "LEAPS Command Center — Test Alert",
+                "<html><body><h2>Test alert ✅</h2><p>Email alerts are configured.</p></body></html>",
+            )
+            st.success("Test email sent.") if ok else st.error(f"Failed: {err}")
+
+    with st.expander("Required secrets for evaluator email"):
+        st.code("""
+# Add to .streamlit/secrets.toml
+ALERT_EMAIL_FROM = "your-gmail@gmail.com"
+ALERT_EMAIL_PASS = "your-app-password"
+ALERT_SMTP_HOST  = "smtp.gmail.com"   # optional default
+ALERT_SMTP_PORT  = "587"              # optional default
+        """, language="toml")
+
+    st.divider()
+
+    # ── Alert thresholds ──────────────────────────────────────────────────────
+    st.subheader("Exit / Entry Thresholds")
+    st.markdown(
+        """
+        | Signal | Threshold | Action |
+        |---|---|---|
+        | **Stop loss** | −60% | Exit — statistical recovery rare |
+        | **First trim** | +100% (2x) | Sell 20-25% — recover initial cost |
+        | **Trim & Roll** | +300% (4x) | Sell 50%; roll remainder if DTE > 90 |
+        | **Trim hard** | +600% (7x) | Sell 75%; trail 25% toward 10x |
+        | **Full exit** | +900% (10x) | Exit everything — target hit |
+        | **Roll delta** | Δ > 0.90 | Leverage exhausted — roll higher |
+        | **Delta warn** | Δ < 0.10 | Option near worthless — reassess |
+        | **DTE roll** | < 270 days | Roll if profitable |
+        | **DTE urgent** | < 90 days | Exit losers; take profits |
+        | **DTE hard exit** | < 60 days | Exit regardless of P&L |
+        """
+    )
+
+    st.divider()
+
+    # ── Monitoring schedule ───────────────────────────────────────────────────
+    st.subheader("Monitoring Schedule")
+    st.markdown(
+        """
+        - Active position checks: **every 30 minutes** (Mon–Fri, 9:30–16:00 ET)
+        - Watchlist entry checks: **every hour** (Mon–Fri, 9:30–16:00 ET)
+        - Daily portfolio summary email: **9:35 AM ET** (Mon–Fri)
+        - Thesis auto-refresh: **6:00 AM ET** (Mon–Fri) — 30-day cycle, 7-day in earnings months
+        """
+    )
+
+    st.divider()
+
+    # ── Closed / Rolled positions ─────────────────────────────────────────────
     st.subheader("Closed / Rolled Positions")
     try:
         closed = db.get_positions(mode="CLOSED") + db.get_positions(mode="ROLLED")
@@ -970,7 +1902,8 @@ elif page == "Settings":
         st.caption(f"{len(closed)} closed/rolled positions")
         for pos in closed:
             c1, c2, c3 = st.columns([3, 2, 1])
-            c1.write(f"{pos.get('ticker')}  {pos.get('expiration_date')} ${pos.get('strike')}C  — {pos.get('mode')}")
+            c1.write(f"{pos.get('ticker')}  {pos.get('expiration_date')} "
+                     f"${pos.get('strike')}C  — {pos.get('mode')}")
             c2.write(f"Entry: ${pos.get('entry_price')}  ×{pos.get('quantity')}")
             with c3:
                 if st.button("Delete", key=f"del_{pos.get('id')}"):

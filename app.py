@@ -159,24 +159,6 @@ def _verdict_color(verdict):
     return "#dc3545"
 
 
-@st.cache_resource(show_spinner=False)
-def _get_eval_bq_client():
-    try:
-        raw = st.secrets["SERVICE_ACCOUNT_JSON"]
-        sa  = json_loads_or_dict(raw)
-        sa["private_key"] = sa.get("private_key", "").replace("\\n", "\n")
-        creds = service_account.Credentials.from_service_account_info(sa)
-        return bigquery.Client(credentials=creds, project=sa["project_id"])
-    except Exception as e:
-        logger.error(f"Eval BQ client init failed: {e}")
-        return None
-
-
-def json_loads_or_dict(raw):
-    import json
-    return json.loads(raw) if isinstance(raw, str) else dict(raw)
-
-
 def _eval_table_path(client, table_name: str) -> str:
     """Build a fully-qualified BigQuery table path.
     Pass table_name as-is for system tables (master_table),
@@ -198,10 +180,8 @@ def _ticker_table_name(ticker: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_eval_master_data() -> pd.DataFrame:
-    client = _get_eval_bq_client()
-    if not client:
-        return pd.DataFrame()
     try:
+        client = db.get_client()
         path = _eval_table_path(client, "master_table")
         return client.query(
             f"SELECT Ticker, date, Score, Verdict FROM `{path}`"
@@ -213,10 +193,8 @@ def get_eval_master_data() -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
-    client = _get_eval_bq_client()
-    if not client:
-        return pd.DataFrame()
     try:
+        client = db.get_client()
         path = _eval_table_path(client, _ticker_table_name(ticker))
         return client.query(f"SELECT * FROM `{path}`").to_dataframe()
     except Exception as e:
@@ -230,10 +208,9 @@ def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
 def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: dict,
                         final_score: float, verdict: str) -> tuple[bool, str | None]:
     """Save full analysis to evaluator BigQuery tables (per-ticker + master_table)."""
-    client = _get_eval_bq_client()
-    if not client:
-        return False, "BigQuery client unavailable"
     try:
+        client = db.get_client()
+
         ticker_path  = _eval_table_path(client, _ticker_table_name(ticker))
         master_path  = _eval_table_path(client, "master_table")
 
@@ -291,9 +268,7 @@ def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: 
 def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
     """Re-apply current scoring rules to stored VALUES. No API calls. Returns (old, new, old_v, new_v)."""
     try:
-        client      = _get_eval_bq_client()
-        if not client:
-            return 0, 0, "Error", "No BQ client"
+        client      = db.get_client()
         ticker_path = _eval_table_path(client, _ticker_table_name(ticker))
         master_path = _eval_table_path(client, "master_table")
 
@@ -373,10 +348,8 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
 
 
 def delete_eval_ticker(ticker: str) -> bool:
-    client = _get_eval_bq_client()
-    if not client:
-        return False
     try:
+        client = db.get_client()
         client.delete_table(_eval_table_path(client, _ticker_table_name(ticker)), not_found_ok=True)
         master_path = _eval_table_path(client, "master_table")
         client.query(
@@ -393,10 +366,8 @@ def delete_eval_ticker(ticker: str) -> bool:
 
 
 def delete_all_eval_tickers(tickers: list) -> bool:
-    client = _get_eval_bq_client()
-    if not client:
-        return False
     try:
+        client = db.get_client()
         master_path = _eval_table_path(client, "master_table")
         for t in tickers:
             client.delete_table(_eval_table_path(client, _ticker_table_name(t)), not_found_ok=True)

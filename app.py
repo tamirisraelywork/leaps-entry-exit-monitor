@@ -178,14 +178,22 @@ def json_loads_or_dict(raw):
 
 
 def _eval_table_path(client, table_name: str) -> str:
+    """Build a fully-qualified BigQuery table path.
+    Pass table_name as-is for system tables (master_table),
+    or pre-clean ticker symbols before calling.
+    """
     raw = (
         st.secrets.get("DATASET_ID")
         or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
     )
-    ticker_clean = table_name.strip().upper().replace("-", "_").replace(".", "_")
     if "." in str(raw):
-        return f"{raw}.{ticker_clean}"
-    return f"{client.project}.{raw}.{ticker_clean}"
+        return f"{raw}.{table_name}"
+    return f"{client.project}.{raw}.{table_name}"
+
+
+def _ticker_table_name(ticker: str) -> str:
+    """Clean a ticker symbol into a valid BigQuery table name."""
+    return ticker.strip().upper().replace("-", "_").replace(".", "_")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -209,7 +217,7 @@ def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
     if not client:
         return pd.DataFrame()
     try:
-        path = _eval_table_path(client, ticker)
+        path = _eval_table_path(client, _ticker_table_name(ticker))
         return client.query(f"SELECT * FROM `{path}`").to_dataframe()
     except Exception as e:
         err = str(e)
@@ -226,7 +234,7 @@ def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: 
     if not client:
         return False, "BigQuery client unavailable"
     try:
-        ticker_path  = _eval_table_path(client, ticker)
+        ticker_path  = _eval_table_path(client, _ticker_table_name(ticker))
         master_path  = _eval_table_path(client, "master_table")
 
         rows = [
@@ -286,7 +294,7 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
         client      = _get_eval_bq_client()
         if not client:
             return 0, 0, "Error", "No BQ client"
-        ticker_path = _eval_table_path(client, ticker)
+        ticker_path = _eval_table_path(client, _ticker_table_name(ticker))
         master_path = _eval_table_path(client, "master_table")
 
         old_df = client.query(
@@ -369,7 +377,7 @@ def delete_eval_ticker(ticker: str) -> bool:
     if not client:
         return False
     try:
-        client.delete_table(_eval_table_path(client, ticker), not_found_ok=True)
+        client.delete_table(_eval_table_path(client, _ticker_table_name(ticker)), not_found_ok=True)
         master_path = _eval_table_path(client, "master_table")
         client.query(
             f"DELETE FROM `{master_path}` WHERE Ticker = @ticker",
@@ -391,7 +399,7 @@ def delete_all_eval_tickers(tickers: list) -> bool:
     try:
         master_path = _eval_table_path(client, "master_table")
         for t in tickers:
-            client.delete_table(_eval_table_path(client, t), not_found_ok=True)
+            client.delete_table(_eval_table_path(client, _ticker_table_name(t)), not_found_ok=True)
         client.query(f"DELETE FROM `{master_path}` WHERE TRUE").result()
         st.cache_data.clear()
         return True

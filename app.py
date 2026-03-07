@@ -87,9 +87,9 @@ _POSTURE_LABEL = {"RED": "EXIT / STOP", "BLUE": "ROLL", "AMBER": "WATCH", "GREEN
 _POSTURE_EMOJI = {"RED": "🔴", "BLUE": "🔵", "AMBER": "⚠️", "GREEN": "🟢"}
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> float | None:
-    """Fetch IV Rank, cached 1 hour. Pass current_iv_pct to skip the option-chain round-trip."""
+    """Fetch IV Rank, cached 5 min. Pass current_iv_pct to skip the option-chain round-trip."""
     try:
         from iv_rank import get_iv_rank_advanced
         result = get_iv_rank_advanced(ticker, current_iv_pct=current_iv_pct)
@@ -101,12 +101,33 @@ def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> flo
     return None
 
 
+def _resolve_contract(pos: dict) -> str:
+    """
+    Return the stored OCC contract symbol, or build one from strike/expiry when
+    the contract field is empty but the position data is complete.
+    """
+    contract = (pos.get("contract") or "").strip()
+    if contract:
+        return contract
+    ticker  = pos.get("ticker", "")
+    strike  = pos.get("strike")
+    exp     = pos.get("expiration_date")
+    opttype = (pos.get("option_type") or "CALL")[0].upper()
+    if ticker and strike and exp:
+        try:
+            exp_date = exp if isinstance(exp, date) else date.fromisoformat(str(exp))
+            return options_data.to_occ(ticker, exp_date, opttype, float(strike))
+        except Exception:
+            pass
+    return ""
+
+
 def _live_market(pos: dict) -> dict:
     ticker   = pos.get("ticker", "")
-    contract = pos.get("contract", "")
+    contract = _resolve_contract(pos)
     snapshot = options_data.get_option_snapshot(ticker, contract) if contract else {}
     snapshot = snapshot or {}
-    # Reuse IV already fetched by get_option_snapshot to avoid a second yfinance call
+    # Reuse IV from snapshot to skip the option-chain round-trip in iv_rank
     iv_pct = (snapshot.get("implied_volatility") or 0) * 100 or None
     return {
         "mid":          snapshot.get("mid"),
@@ -1083,7 +1104,13 @@ elif page == "📊 Dashboard":
                     time.sleep(12)
                     polygon_error = None
                 else:
-                    contract = pos.get("contract", "")
+                    contract = _resolve_contract(pos)
+                    # Persist auto-built contract so future loads don't need to recompute it
+                    if contract and not (pos.get("contract") or "").strip():
+                        try:
+                            db.update_position(pos_id, {"contract": contract})
+                        except Exception:
+                            pass
                     snap = options_data.get_option_snapshot(ticker, contract) if contract else {}
                     snap = snap or {}
                     polygon_error = snap.get("_error")

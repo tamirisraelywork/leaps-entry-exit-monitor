@@ -88,10 +88,11 @@ _POSTURE_EMOJI = {"RED": "🔴", "BLUE": "🔵", "AMBER": "⚠️", "GREEN": "�
 
 
 @st.cache_data(ttl=3600)
-def _get_iv_rank_cached(ticker: str) -> float | None:
+def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> float | None:
+    """Fetch IV Rank, cached 1 hour. Pass current_iv_pct to skip the option-chain round-trip."""
     try:
         from iv_rank import get_iv_rank_advanced
-        result = get_iv_rank_advanced(ticker)
+        result = get_iv_rank_advanced(ticker, current_iv_pct=current_iv_pct)
         if result and "Success" in result:
             m = re.search(r"([\d.]+)", result.split("is:")[-1])
             return float(m.group(1)) if m else None
@@ -105,13 +106,15 @@ def _live_market(pos: dict) -> dict:
     contract = pos.get("contract", "")
     snapshot = options_data.get_option_snapshot(ticker, contract) if contract else {}
     snapshot = snapshot or {}
+    # Reuse IV already fetched by get_option_snapshot to avoid a second yfinance call
+    iv_pct = (snapshot.get("implied_volatility") or 0) * 100 or None
     return {
         "mid":          snapshot.get("mid"),
         "bid":          snapshot.get("bid"),
         "ask":          snapshot.get("ask"),
         "delta":        snapshot.get("delta"),
         "dte":          snapshot.get("dte"),
-        "iv_rank":      _get_iv_rank_cached(ticker),
+        "iv_rank":      _get_iv_rank_cached(ticker, iv_pct),
         "thesis_score": None,
     }
 
@@ -1092,13 +1095,14 @@ elif page == "📊 Dashboard":
                             dte_fallback = (exp_d - date.today()).days
                     except Exception:
                         pass
+                    iv_pct_dash = (snap.get("implied_volatility") or 0) * 100 or None
                     mkt = {
                         "mid":          snap.get("mid"),
                         "bid":          snap.get("bid"),
                         "ask":          snap.get("ask"),
                         "delta":        snap.get("delta"),
                         "dte":          snap.get("dte") or dte_fallback,
-                        "iv_rank":      _get_iv_rank_cached(ticker),
+                        "iv_rank":      _get_iv_rank_cached(ticker, iv_pct_dash),
                         "thesis_score": None,
                     }
 

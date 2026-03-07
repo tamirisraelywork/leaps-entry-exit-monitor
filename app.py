@@ -89,15 +89,76 @@ _POSTURE_EMOJI = {"RED": "🔴", "BLUE": "🔵", "AMBER": "⚠️", "GREEN": "�
 
 @st.cache_data(ttl=300)
 def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> float | None:
-    """Fetch IV Rank, cached 5 min. Pass current_iv_pct to skip the option-chain round-trip."""
+    """
+    IV Rank cached 5 min.
+
+    Fast path (current_iv_pct known): rank the given IV directly against the
+    1-year rolling realized-vol range — one price-history call, no option chain.
+
+    Slow path (no IV): delegate to iv_rank module which tries the option chain
+    first then falls back to realized-vol percentile.
+
+    Last-resort fallback: inline realized-vol percentile from price history only.
+    """
+    import yfinance as yf
+    import math as _math
+
+    def _hist_rank(iv_pct: float) -> float | None:
+        """Rank iv_pct vs 1-year rolling realized-vol range. Returns 0-100 or None."""
+        try:
+            hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+            if hist is None or hist.empty or len(hist) < 31:
+                return round(iv_pct, 1)   # no history — return raw IV as rank
+            rolling = (
+                hist["Close"].pct_change().dropna()
+                .rolling(30).std().dropna()
+                * _math.sqrt(252) * 100
+            )
+            if rolling.empty:
+                return round(iv_pct, 1)
+            vmin, vmax = float(rolling.min()), float(rolling.max())
+            if vmax > vmin:
+                return round(max(0.0, min(100.0, (iv_pct - vmin) / (vmax - vmin) * 100)), 1)
+            return 50.0   # flat vol — neutral
+        except Exception:
+            return round(iv_pct, 1)   # absolute fallback: return IV itself as rank
+
+    # ── Fast path: we already have IV from the option snapshot ───────────────
+    if current_iv_pct and current_iv_pct > 0:
+        result = _hist_rank(current_iv_pct)
+        if result is not None:
+            return result
+
+    # ── Slow path: no IV — try iv_rank module (option chain + history) ───────
     try:
         from iv_rank import get_iv_rank_advanced
         result = get_iv_rank_advanced(ticker, current_iv_pct=current_iv_pct)
         if result and "Success" in result:
             m = re.search(r"([\d.]+)", result.split("is:")[-1])
-            return float(m.group(1)) if m else None
+            val = float(m.group(1)) if m else None
+            if val is not None:
+                return val
     except Exception:
         pass
+
+    # ── Last resort: realized-vol percentile — no options needed ─────────────
+    try:
+        hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+        if hist is not None and not hist.empty and len(hist) >= 31:
+            rolling = (
+                hist["Close"].pct_change().dropna()
+                .rolling(30).std().dropna()
+                * _math.sqrt(252) * 100
+            )
+            if len(rolling) >= 2:
+                cur  = float(rolling.iloc[-1])
+                vmin = float(rolling.min())
+                vmax = float(rolling.max())
+                if vmax > vmin:
+                    return round(max(0.0, min(100.0, (cur - vmin) / (vmax - vmin) * 100)), 1)
+    except Exception:
+        pass
+
     return None
 
 

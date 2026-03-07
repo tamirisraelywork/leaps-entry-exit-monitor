@@ -1133,16 +1133,34 @@ elif page == "📊 Dashboard":
         st.stop()
 
     # Portfolio summary strip
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Active Positions",   len(active))
-    s2.metric("Watchlist",          len(watchlist))
-    total_cost = sum(
+    _strip_cost = sum(
         (p.get("entry_price") or 0) * (p.get("quantity") or 0) * 100
         for p in active
     )
-    s3.metric("Portfolio Cost Basis", f"${total_cost:,.0f}" if total_cost else "N/A")
-    s4.metric("Avg Contracts/Position",
-              f"{sum(p.get('quantity') or 0 for p in active) / len(active):.1f}" if active else "N/A")
+    _strip_realized = sum(
+        float(p.get("proceeds_from_trims") or 0)
+        - (p.get("entry_price") or 0) * int(p.get("quantity_trimmed") or 0) * 100
+        for p in active
+    )
+    _strip_net_cost = _strip_cost - sum(float(p.get("proceeds_from_trims") or 0) for p in active)
+    _strip_house_ct = sum(
+        1 for p in active
+        if float(p.get("proceeds_from_trims") or 0) >= (p.get("entry_price") or 0) * (p.get("quantity") or 0) * 100
+        and (p.get("entry_price") or 0) > 0
+    )
+
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("Active Positions", len(active))
+    s2.metric("Watchlist",        len(watchlist))
+    s3.metric("Portfolio Cost",   f"${_strip_cost:,.0f}" if _strip_cost else "N/A")
+    s4.metric("Net At-Risk",      f"${max(0, _strip_net_cost):,.0f}" if _strip_cost else "N/A",
+              help="Cost basis minus proceeds already recovered via trims")
+    s5.metric("Total Realized P&L",
+              f"${_strip_realized:+,.0f}" if _strip_realized != 0 else "$0",
+              delta=f"{'▲' if _strip_realized >= 0 else '▼'} {abs(_strip_realized):,.0f}" if _strip_realized != 0 else None,
+              delta_color="normal" if _strip_realized >= 0 else "inverse")
+    s6.metric("House Money", f"{_strip_house_ct} / {len(active)}",
+              help="Positions where trims have fully recovered original cost")
 
     st.markdown("---")
 
@@ -1226,6 +1244,15 @@ elif page == "📊 Dashboard":
             proceeds      = float(pos.get("proceeds_from_trims") or 0.0)
             qty_remaining = int(qty or 0) - qty_trimmed
 
+            # P&L breakdown
+            _orig_cost        = (ep or 0) * int(qty or 0) * 100
+            _cost_of_trimmed  = (ep or 0) * qty_trimmed * 100
+            _realized_pnl     = proceeds - _cost_of_trimmed
+            _unrealized_pnl   = ((mid - (ep or 0)) * qty_remaining * 100) if (mid and ep) else None
+            _total_pnl        = (_realized_pnl + _unrealized_pnl) if _unrealized_pnl is not None else _realized_pnl
+            _cost_recovery    = (proceeds / _orig_cost * 100) if _orig_cost > 0 else 0.0
+            _house_money      = _cost_recovery >= 100.0
+
             with st.container(border=True):
                 h1, h2 = st.columns([5, 1])
                 with h1:
@@ -1237,10 +1264,16 @@ elif page == "📊 Dashboard":
                             + (f", ${proceeds:,.0f} recovered" if proceeds else "")
                             + ")"
                         )
+                    house_badge = (
+                        " &nbsp;<span style='background:#21C55D;color:white;padding:2px 8px;"
+                        "border-radius:4px;font-size:0.75em;font-weight:bold'>HOUSE MONEY</span>"
+                        if _house_money else ""
+                    )
                     st.markdown(
                         f"### {ticker} — {exp} ${strike} Call  ·  "
                         f"{qty} contract{'s' if int(qty or 1) > 1 else ''}"
-                        f"{cb_str}{trim_str}"
+                        f"{cb_str}{trim_str}{house_badge}",
+                        unsafe_allow_html=True,
                     )
                 with h2:
                     st.markdown(
@@ -1251,13 +1284,14 @@ elif page == "📊 Dashboard":
                     )
 
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Avg. Price",  f"${ep:.2f}"   if ep       else "N/A")
-                m2.metric("Current Mid", f"${mid:.2f}"  if mid      else "N/A")
-                m3.metric("P&L",
+                m1.metric("Avg. Price",   f"${ep:.2f}"   if ep       else "N/A")
+                m2.metric("Current Mid",  f"${mid:.2f}"  if mid      else "N/A")
+                m3.metric("Unrlzd P&L",
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
-                          delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"))
-                m4.metric("Delta",   f"{delta:.2f}" if delta    else "N/A")
-                m5.metric("DTE",     f"{dte_days}d" if dte_days else "N/A")
+                          delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"),
+                          help="Unrealized P&L % on remaining contracts vs avg entry price")
+                m4.metric("Delta",    f"{delta:.2f}" if delta    else "N/A")
+                m5.metric("DTE",      f"{dte_days}d" if dte_days else "N/A")
                 if score is not None:
                     age_label = f" ({score_age}d ago)" if score_age is not None else ""
                     stale     = score_age is not None and score_age > 30
@@ -1276,6 +1310,40 @@ elif page == "📊 Dashboard":
                             st.rerun()
                         else:
                             st.error("Scoring failed — check logs")
+
+                # ── P&L breakdown row ─────────────────────────────────────────
+                if qty_trimmed > 0 or _unrealized_pnl is not None:
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric(
+                        "Realized P&L",
+                        f"${_realized_pnl:+,.0f}" if _realized_pnl != 0 else "$0",
+                        help="Proceeds from trims minus cost of trimmed contracts",
+                        delta_color="normal" if _realized_pnl >= 0 else "inverse",
+                    )
+                    p2.metric(
+                        "Unrealized P&L",
+                        f"${_unrealized_pnl:+,.0f}" if _unrealized_pnl is not None else "N/A",
+                        help="(Current mid − entry price) × remaining contracts × 100",
+                        delta_color="normal" if (_unrealized_pnl or 0) >= 0 else "inverse",
+                    )
+                    p3.metric(
+                        "Total P&L",
+                        f"${_total_pnl:+,.0f}" if _total_pnl is not None else "N/A",
+                        help="Realized + Unrealized",
+                        delta_color="normal" if (_total_pnl or 0) >= 0 else "inverse",
+                    )
+                    _total_return_pct = (
+                        (_total_pnl / _orig_cost * 100) if (_orig_cost > 0 and _total_pnl is not None) else None
+                    )
+                    p4.metric(
+                        "Cost Recovery",
+                        f"{_cost_recovery:.0f}%",
+                        delta="HOUSE MONEY" if _house_money else (
+                            f"{_total_return_pct:+.0f}% total return" if _total_return_pct is not None else None
+                        ),
+                        delta_color="normal",
+                        help="Proceeds from trims ÷ original cost. ≥100% = house money (risk-free remaining contracts)",
+                    )
 
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")

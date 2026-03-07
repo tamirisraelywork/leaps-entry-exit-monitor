@@ -273,6 +273,40 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # Dollar proceeds already recovered from trims
     proceeds_recovered = float(position.get("proceeds_from_trims") or 0.0)
 
+    # ── Cost recovery & house money analysis ─────────────────────────────────
+    original_cost     = float(entry_price or 0) * qty_total * 100
+    cost_recovery_pct = (proceeds_recovered / original_cost * 100) if original_cost > 0 else 0.0
+    house_money       = cost_recovery_pct >= 100.0   # trims already returned full investment
+
+    # Thesis score gap: current vs score at entry (gap analysis)
+    # Positive = thesis improved since entry; negative = thesis deteriorated
+    entry_thesis = int(position.get("entry_thesis_score") or 0) or None
+    thesis_gap   = (market.get("thesis_score") - entry_thesis
+                    if (market.get("thesis_score") is not None and entry_thesis)
+                    else None)
+
+    # Dynamic exit threshold — relaxed as more profit is locked in.
+    # Key insight: these positions were bought with a different scoring system.
+    # Performance and cost recovery are the primary signals; thesis is secondary.
+    # If thesis has IMPROVED since entry, add 5 pts patience.
+    # If thesis has DECLINED a lot, tighten by 5 pts.
+    if house_money:
+        _thesis_exit = 40     # only exit on near-total collapse when fully covered
+    elif cost_recovery_pct >= 70:
+        _thesis_exit = 50
+    elif cost_recovery_pct >= 30:
+        _thesis_exit = 55
+    else:
+        _thesis_exit = 60     # standard
+
+    if thesis_gap is not None:
+        if thesis_gap >= 10:       # thesis improved → more patient
+            _thesis_exit = max(30, _thesis_exit - 5)
+        elif thesis_gap <= -20:    # thesis deteriorated a lot → tighter
+            _thesis_exit = min(70, _thesis_exit + 10)
+        elif thesis_gap <= -10:    # thesis somewhat worse
+            _thesis_exit = min(70, _thesis_exit + 5)
+
     mid          = market.get("mid")
     bid          = market.get("bid")
     delta        = market.get("delta")
@@ -323,33 +357,82 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # PILLAR 1 — Fundamental: Is the thesis still intact?
     # -----------------------------------------------------------------------
     if thesis_score is not None:
-        if thesis_score < 60:
+        if thesis_score < _thesis_exit:
             # IV context: if IV is high, extra urgency to exit before IV crushes AND price
             iv_extra = ""
             if iv_rank and iv_rank >= 60:
                 iv_extra = (
                     f"\n  ★ IV Rank = {iv_rank:.0f}% — DOUBLY URGENT:\n"
-                    f"  Options are expensive AND the thesis is broken. Exit NOW to\n"
+                    f"  Options are expensive AND the thesis is weakening. Exit NOW to\n"
                     f"  capture the inflated IV premium before both price AND IV drop.\n"
                 )
+
+            # Cost recovery context — explains why threshold may differ from standard 60
+            recovery_ctx = ""
+            if house_money:
+                recovery_ctx = (
+                    f"\n  POSITION STATUS: HOUSE MONEY ({cost_recovery_pct:.0f}% cost recovered via trims)\n"
+                    f"  Your original capital is already safe. The remaining {qty} contracts\n"
+                    f"  represent pure profit. Threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
+                    f"  Exiting only because thesis has reached near-total collapse.\n"
+                )
+            elif cost_recovery_pct >= 30:
+                recovery_ctx = (
+                    f"\n  COST RECOVERY: {cost_recovery_pct:.0f}% recovered via trims.\n"
+                    f"  Thesis exit threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
+                )
+
+            # Thesis gap context
+            gap_ctx = ""
+            if thesis_gap is not None:
+                direction = "improved" if thesis_gap >= 0 else "deteriorated"
+                gap_ctx = (
+                    f"\n  THESIS TREND: Score {direction} by {abs(thesis_gap)} pts since entry\n"
+                    f"  (entry: {entry_thesis}/100  →  current: {thesis_score}/100)\n"
+                )
+            elif entry_thesis is None:
+                gap_ctx = (
+                    f"\n  NOTE: Position predates current scoring system. Cost recovery\n"
+                    f"  ({cost_recovery_pct:.0f}%) is the primary risk signal for this position.\n"
+                )
+
+            severity = "AMBER" if house_money else "RED"
+            subject_prefix = "⚠️ REVIEW" if house_money else "🔴 EXIT"
+
             alerts.append(Alert(
-                type="EXIT_THESIS", severity="RED",
-                subject=f"🔴 EXIT — Thesis Broken: {ticker}  (Score: {thesis_score}/100)",
+                type="EXIT_THESIS", severity=severity,
+                subject=f"{subject_prefix} — Thesis Weakening: {ticker}  (Score: {thesis_score}/100  threshold: {_thesis_exit})",
                 body=(
                     hdr()
-                    + "SIGNAL: EXIT — THESIS BROKEN\n"
+                    + f"SIGNAL: {'REVIEW' if house_money else 'EXIT'} — THESIS BELOW THRESHOLD\n"
                     + f"{'─'*50}\n"
-                    + f"  Thesis score has fallen to {thesis_score}/100 (threshold: 60).\n\n"
-                    + "  The fundamental reason for holding this LEAPS is gone.\n"
-                    + "  A broken thesis means the asymmetric upside that justified\n"
-                    + "  this position no longer exists. P&L at entry time is irrelevant —\n"
-                    + "  exit before the market prices in the deterioration fully.\n"
+                    + f"  Thesis score: {thesis_score}/100  |  Exit threshold: {_thesis_exit}/100\n"
+                    + recovery_ctx
+                    + gap_ctx
+                    + "\n"
+                    + (
+                        "  HOUSE MONEY GUIDANCE:\n"
+                        "  You've already locked in full cost recovery. The remaining contracts\n"
+                        "  are playing with profits. Consider trimming rather than full exit.\n"
+                        "  Only exit fully if you have NO confidence in the thesis recovering.\n"
+                        if house_money else
+                        "  The fundamental reason for holding this LEAPS is weakening.\n"
+                        "  A deteriorating thesis means the asymmetric upside is shrinking.\n"
+                        "  Exit before the market prices in the deterioration fully.\n"
+                    )
                     + iv_extra
                     + _divider("IV TIMING")
                     + _iv_sell_context(iv_rank)
                     + _divider("TRADE INSTRUCTION")
-                    + _exit_order(qty)
-                    + "  Execute at market open tomorrow.\n"
+                    + (
+                        f"  OPTION A — Full exit ({qty} contracts):\n"
+                        + _exit_order(qty)
+                        + f"\n  OPTION B — Trim only (if you still have some thesis conviction):\n"
+                        + _exit_order(max(1, qty // 2))
+                        if house_money else
+                        _exit_order(qty)
+                        + "  Execute at market open tomorrow.\n"
+                    )
                 ),
                 context=market,
             ))
@@ -467,6 +550,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
 
         elif dte_days < _T["dte_urgent"]:
             if pnl is not None and pnl < 0:
+                # Losing + < 90 days: still urgent regardless of house money
                 alerts.append(Alert(
                     type="EXIT_TIME_URGENT", severity="RED",
                     subject=f"🔴 EXIT — Losing & Time Running Out: {ticker}  DTE: {dte_days}  P&L: {pnl:+.1f}%",
@@ -478,6 +562,12 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                         + "  Inside 90 days, theta acceleration compounds losses rapidly.\n"
                         + "  There is not enough time left for a meaningful recovery.\n\n"
                         + "  Do NOT roll a losing position inside 90 days — it amplifies losses.\n"
+                        + (
+                            f"\n  HOUSE MONEY NOTE: {cost_recovery_pct:.0f}% cost was already recovered\n"
+                            f"  via prior trims, so your net position loss is limited.\n"
+                            f"  Still: exit the remaining contracts — theta will destroy them.\n"
+                            if house_money else ""
+                        )
                         + _divider("IV TIMING")
                         + _iv_sell_context(iv_rank)
                         + _divider("TRADE INSTRUCTION")
@@ -487,34 +577,61 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     context=market,
                 ))
             elif pnl is not None:
-                # Profitable with < 90 days — take the gain
-                alerts.append(Alert(
-                    type="EXIT_TIME_URGENT", severity="RED",
-                    subject=f"🔴 TAKE PROFIT — DTE < 90 Days: {ticker}  P&L: {pnl:+.1f}%",
-                    body=(
-                        hdr()
-                        + "SIGNAL: TAKE PROFIT — DTE < 90 DAYS\n"
-                        + f"{'─'*50}\n"
-                        + f"  {dte_days} days left with a {pnl:+.1f}% gain.\n"
-                        + "  Inside 90 days, rolling is rarely cost-effective: the new\n"
-                        + "  contract starts decaying at the same accelerated rate.\n\n"
-                        + "  ACTION: Take the full profit. Close now.\n"
-                        + "  If thesis is still strong, re-enter fresh LEAPS (>= 18 months).\n"
-                        + _divider("IV TIMING")
-                        + _iv_sell_context(iv_rank)
-                        + (
-                            f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — wait for IV to drop\n"
-                            f"  below 35% before buying the new LEAPS position.\n"
-                            if iv_rank and iv_rank >= 50 else
-                            f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — good conditions\n"
-                            f"  to buy back in after closing this position.\n"
-                            if iv_rank else ""
-                        )
-                        + _divider("TRADE INSTRUCTION")
-                        + _exit_order(qty)
-                    ),
-                    context=market,
-                ))
+                # Profitable with < 90 days
+                if house_money:
+                    # House money: downgrade urgency — remaining contracts are pure profit
+                    alerts.append(Alert(
+                        type="EXIT_TIME_URGENT", severity="AMBER",
+                        subject=f"⚠️ PROTECT GAINS — DTE < 90 Days: {ticker}  DTE: {dte_days}  P&L: {pnl:+.1f}%",
+                        body=(
+                            hdr()
+                            + "SIGNAL: PROTECT GAINS — TIME RUNNING DOWN\n"
+                            + f"{'─'*50}\n"
+                            + f"  {dte_days} days left. Position is at {pnl:+.1f}% on remaining contracts.\n\n"
+                            + f"  HOUSE MONEY STATUS: {cost_recovery_pct:.0f}% of original cost already\n"
+                            + f"  recovered via trims. The remaining {qty} contracts are pure profit.\n\n"
+                            + "  Urgency is AMBER (not RED) because your original capital is already safe.\n"
+                            + "  However, theta will accelerate — protect your remaining gains:\n\n"
+                            + "  RECOMMENDED ACTION:\n"
+                            + f"  → Sell at least {max(1, qty // 2)} contracts now to lock in gains\n"
+                            + f"  → Decide: exit the rest or let the final {qty - max(1, qty // 2)} ride to expiry\n"
+                            + "  → If thesis is still strong, re-enter fresh LEAPS after closing\n"
+                            + _divider("IV TIMING")
+                            + _iv_sell_context(iv_rank)
+                            + _divider("TRADE INSTRUCTION")
+                            + _exit_order(max(1, qty // 2))
+                        ),
+                        context=market,
+                    ))
+                else:
+                    # Not house money — standard RED take profit signal
+                    alerts.append(Alert(
+                        type="EXIT_TIME_URGENT", severity="RED",
+                        subject=f"🔴 TAKE PROFIT — DTE < 90 Days: {ticker}  P&L: {pnl:+.1f}%",
+                        body=(
+                            hdr()
+                            + "SIGNAL: TAKE PROFIT — DTE < 90 DAYS\n"
+                            + f"{'─'*50}\n"
+                            + f"  {dte_days} days left with a {pnl:+.1f}% gain.\n"
+                            + "  Inside 90 days, rolling is rarely cost-effective: the new\n"
+                            + "  contract starts decaying at the same accelerated rate.\n\n"
+                            + "  ACTION: Take the full profit. Close now.\n"
+                            + "  If thesis is still strong, re-enter fresh LEAPS (>= 18 months).\n"
+                            + _divider("IV TIMING")
+                            + _iv_sell_context(iv_rank)
+                            + (
+                                f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — wait for IV to drop\n"
+                                f"  below 35% before buying the new LEAPS position.\n"
+                                if iv_rank and iv_rank >= 50 else
+                                f"\n  Re-entry note: IV Rank is {iv_rank:.0f}% — good conditions\n"
+                                f"  to buy back in after closing this position.\n"
+                                if iv_rank else ""
+                            )
+                            + _divider("TRADE INSTRUCTION")
+                            + _exit_order(qty)
+                        ),
+                        context=market,
+                    ))
 
         elif dte_days < _T["dte_review"]:
             # 90-270 days — the roll window

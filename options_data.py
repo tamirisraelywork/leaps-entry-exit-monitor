@@ -28,26 +28,51 @@ def _norm_cdf(x: float) -> float:
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
 
-def _bs_delta(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "C") -> float | None:
-    """
-    Black-Scholes delta for a European option.
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-    S     = current stock price
-    K     = strike price
-    T     = time to expiry in years
-    r     = risk-free rate (e.g. 0.045 for 4.5%)
-    sigma = implied volatility (e.g. 0.35 for 35%)
+
+def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
+               option_type: str = "C") -> dict:
+    """
+    Full Black-Scholes Greeks for a European option.
+    Returns dict with delta, gamma, theta (per day), vega (per 1% IV move).
+    Returns empty dict on bad inputs.
     """
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return None
+        return {}
     try:
-        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-        if option_type.upper() == "C":
-            return round(_norm_cdf(d1), 4)
-        else:
-            return round(_norm_cdf(d1) - 1.0, 4)
+        d1    = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2    = d1 - sigma * math.sqrt(T)
+        pdf1  = _norm_pdf(d1)
+        is_call = option_type.upper() == "C"
+
+        delta = _norm_cdf(d1) if is_call else (_norm_cdf(d1) - 1.0)
+        gamma = pdf1 / (S * sigma * math.sqrt(T))
+        vega  = S * pdf1 * math.sqrt(T) * 0.01          # per 1% change in IV
+        theta_raw = (
+            -(S * pdf1 * sigma) / (2 * math.sqrt(T))
+            - r * K * math.exp(-r * T) * (_norm_cdf(d2) if is_call else _norm_cdf(-d2))
+        )
+        theta = theta_raw / 365.0                         # per calendar day
+
+        # Sanity-check delta
+        if not (0.001 <= abs(delta) <= 0.999):
+            delta = None
+
+        return {
+            "delta": round(delta, 4) if delta is not None else None,
+            "gamma": round(gamma, 6),
+            "theta": round(theta, 4),
+            "vega":  round(vega,  4),
+        }
     except Exception:
-        return None
+        return {}
+
+
+def _bs_delta(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "C") -> float | None:
+    """Black-Scholes delta only (kept for backward compatibility)."""
+    return _bs_greeks(S, K, T, r, sigma, option_type).get("delta")
 
 
 def _parse_occ(contract: str, ticker: str) -> dict | None:
@@ -87,98 +112,93 @@ def to_occ(ticker: str, expiry: date, option_type: str, strike: float) -> str:
 
 def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type: str = "C") -> dict:
     """
-    Fetch option bid/ask via yfinance and compute delta via Black-Scholes.
-
-    Returns same keys as Polygon snapshot (mid, delta, dte, implied_volatility…)
-    or {"_error": "..."} on failure.
+    Fetch option bid/ask/IV via yfinance and compute all Greeks via Black-Scholes.
+    Retries up to 3 times on rate-limit errors with exponential back-off.
     """
     try:
         import yfinance as yf
-
         t = yf.Ticker(ticker)
 
-        # Find the closest available expiry
-        try:
-            available = t.options   # tuple of expiry date strings e.g. "2027-01-15"
-        except Exception as e:
-            return {"_error": f"yfinance could not fetch option chain: {e}"}
-
+        # Fetch available expiries — retry on rate-limit (429)
+        available = None
+        last_err  = ""
+        for _wait in (0, 3, 8):
+            if _wait:
+                time.sleep(_wait)
+            try:
+                available = t.options
+                break
+            except Exception as e:
+                last_err = str(e)
+                if not any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
+                    return {"_error": f"yfinance could not fetch option chain: {e}"}
+        if available is None:
+            return {"_error": f"yfinance rate-limited after retries: {last_err}"}
         if not available:
             return {"_error": "yfinance returned no expiry dates for this ticker"}
 
         target_str = expiry.strftime("%Y-%m-%d")
         if target_str not in available:
-            # Use closest available expiry
-            closest = min(
-                available,
-                key=lambda d: abs((date.fromisoformat(d) - expiry).days)
-            )
-            target_str = closest
-
+            target_str = min(available, key=lambda d: abs((date.fromisoformat(d) - expiry).days))
         actual_expiry = date.fromisoformat(target_str)
 
-        # Fetch option chain
-        try:
-            chain = t.option_chain(target_str)
-        except Exception as e:
-            return {"_error": f"yfinance option_chain failed: {e}"}
+        # Fetch option chain — also retry on rate-limit
+        chain = None
+        for _wait in (0, 3, 8):
+            if _wait:
+                time.sleep(_wait)
+            try:
+                chain = t.option_chain(target_str)
+                break
+            except Exception as e:
+                last_err = str(e)
+                if not any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
+                    return {"_error": f"yfinance option_chain failed: {e}"}
+        if chain is None:
+            return {"_error": f"yfinance rate-limited after retries: {last_err}"}
 
         df = chain.calls if option_type.upper() == "C" else chain.puts
-
-        # Match exact strike; fall back to nearest
         exact = df[df["strike"] == float(strike)]
         if exact.empty:
             exact = df.iloc[(df["strike"] - float(strike)).abs().argsort()[:1]]
         if exact.empty:
             return {"_error": f"yfinance: no option near strike {strike} for {ticker} {target_str}"}
 
-        row = exact.iloc[0]
-        bid = float(row.get("bid") or 0)
-        ask = float(row.get("ask") or 0)
+        row  = exact.iloc[0]
+        bid  = float(row.get("bid")       or 0)
+        ask  = float(row.get("ask")       or 0)
         last = float(row.get("lastPrice") or 0)
+        mid  = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else (last or None)
 
-        if bid > 0 and ask > 0:
-            mid = round((bid + ask) / 2, 2)
-        elif last > 0:
-            mid = last
-        else:
-            mid = None
-
+        # IV — cap at 200% to avoid BS degeneration on illiquid options
         raw_iv = float(row.get("impliedVolatility") or 0)
-        # yfinance sometimes returns absurdly high IV for illiquid options
-        # which causes Black-Scholes delta to collapse to 0 or 1. Cap at 2.0 (200%).
         iv = min(raw_iv, 2.0) if raw_iv > 0 else None
 
-        # Black-Scholes delta — requires stock price + reasonable IV
-        delta = None
+        # Full Black-Scholes Greeks (delta, gamma, theta, vega)
+        greeks = {}
         try:
             fi = t.fast_info
-            S = fi.last_price or fi.previous_close
+            S  = fi.last_price or fi.previous_close
             if S and iv and iv > 0.01:
-                T = max((actual_expiry - date.today()).days, 1) / 365.0
-                raw_delta = _bs_delta(float(S), float(strike), T, 0.045, iv, option_type)
-                # Sanity-check: if BS gives a degenerate value, discard it
-                if raw_delta is not None and 0.01 <= abs(raw_delta) <= 0.99:
-                    delta = raw_delta
+                T      = max((actual_expiry - date.today()).days, 1) / 365.0
+                greeks = _bs_greeks(float(S), float(strike), T, 0.045, iv, option_type)
         except Exception:
             pass
 
-        dte = (actual_expiry - date.today()).days
-
         return {
-            "delta":              delta,
-            "gamma":              None,
-            "theta":              None,
-            "vega":               None,
+            "delta":              greeks.get("delta"),
+            "gamma":              greeks.get("gamma"),
+            "theta":              greeks.get("theta"),
+            "vega":               greeks.get("vega"),
             "implied_volatility": iv,
             "bid":                bid,
             "ask":                ask,
             "mid":                mid,
             "expiration_date":    actual_expiry,
-            "dte":                dte,
+            "dte":                (actual_expiry - date.today()).days,
             "strike":             float(row.get("strike", strike)),
             "open_interest":      int(row.get("openInterest") or 0) or None,
-            "_source":            "yfinance",
+            "_source":            "yfinance+BS",
         }
 
     except Exception as e:
@@ -246,15 +266,19 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
 # Public interface
 # ---------------------------------------------------------------------------
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_option_snapshot(ticker: str, contract: str) -> dict:
     """
-    Fetch live option data: bid/ask/mid, delta, DTE, IV.
+    Fetch live option data: bid/ask/mid, Greeks (delta/gamma/theta/vega), DTE, IV.
 
-    Tries Polygon first (if API key present). Falls back to yfinance
-    automatically — so this works even without a paid Polygon plan.
+    Tries Polygon first (if API key present). Falls back to yfinance + Black-Scholes
+    automatically — full Greeks available with no paid subscription.
+
+    Results cached for 10 minutes to avoid rate-limiting when the dashboard
+    loads multiple positions in quick succession.
 
     Returns a dict. Check '_error' key for failures; '_source' key
-    indicates where data came from ('polygon' or 'yfinance').
+    indicates where data came from ('polygon' or 'yfinance+BS').
     """
     key = _api_key()
 

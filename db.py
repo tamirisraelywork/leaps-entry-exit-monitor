@@ -187,22 +187,26 @@ def update_position(position_id: str, fields: dict):
     client = get_client()
     allowed = {"entry_price", "quantity", "entry_date", "expiration_date",
                "strike", "mode", "notes", "contract",
-               "quantity_trimmed", "proceeds_from_trims"}
+               "quantity_trimmed", "proceeds_from_trims", "entry_thesis_score"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
+
+    _INT64_COLS   = {"quantity", "quantity_trimmed", "entry_thesis_score"}
+    _FLOAT64_COLS = {"entry_price", "strike", "proceeds_from_trims"}
+    _DATE_COLS    = {"entry_date", "expiration_date"}
 
     set_clauses = []
     params = [bigquery.ScalarQueryParameter("id", "STRING", position_id)]
     for i, (col, val) in enumerate(updates.items()):
         param_name = f"p{i}"
-        if col in ("entry_date", "expiration_date"):
+        if col in _DATE_COLS:
             if isinstance(val, date):
                 val = val.isoformat()
             bq_type = "DATE"
-        elif col in ("entry_price", "strike", "proceeds_from_trims"):
+        elif col in _FLOAT64_COLS:
             bq_type = "FLOAT64"
-        elif col in ("quantity", "quantity_trimmed"):
+        elif col in _INT64_COLS:
             bq_type = "INT64"
         else:
             bq_type = "STRING"

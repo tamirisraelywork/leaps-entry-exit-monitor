@@ -197,24 +197,53 @@ def _header(pos: dict, market: dict) -> str:
     iv_rank  = market.get("iv_rank")
     score    = market.get("thesis_score")
 
-    pnl_str  = f"{pnl:+.1f}%" if pnl is not None else "N/A"
-    mid_str  = f"${mid:.2f}" if mid else "N/A"
-    cost_basis = ""
-    proceeds_line = ""
+    pnl_str = f"{pnl:+.1f}%" if pnl is not None else "N/A"
+    mid_str = f"${mid:.2f}" if mid else "N/A"
+    iv_str  = f"{iv_rank:.0f}%" if iv_rank is not None else "N/A"
+    score_emoji = "✅" if score and score >= 70 else ("⚠️" if score and score >= 60 else "❌")
+
+    # Cost-basis / trim summary
+    cost_line = ""
     try:
-        cb = float(entry_p) * float(qty_total_h) * 100
-        cost_basis = f"  Cost Basis:   ${cb:,.0f}\n"
+        cb   = float(entry_p) * float(qty_total_h) * 100
         prec = float(pos.get("proceeds_from_trims") or 0)
         if qty_trimmed_h > 0:
-            cost_basis = (
+            recovery_pct = (prec / cb * 100) if cb > 0 else 0
+            house_tag = " ★ HOUSE MONEY" if recovery_pct >= 100 else ""
+            cost_line = (
                 f"  Cost Basis:   ${cb:,.0f} original  "
-                f"({qty_trimmed_h} trimmed, ${prec:,.0f} recovered)\n"
+                f"({qty_trimmed_h} trimmed, ${prec:,.0f} recovered = {recovery_pct:.0f}%{house_tag})\n"
             )
+        else:
+            cost_line = f"  Cost Basis:   ${cb:,.0f}\n"
     except Exception:
         pass
 
-    iv_str     = f"{iv_rank:.0f}%" if iv_rank is not None else "N/A"
-    score_emoji = "✅" if score and score >= 70 else ("⚠️" if score and score >= 60 else "❌")
+    # Thesis trend: entry score vs current
+    entry_thesis_score = pos.get("entry_thesis_score")
+    thesis_trend_line = ""
+    if entry_thesis_score and score is not None:
+        gap = score - int(entry_thesis_score)
+        arrow = "↑" if gap > 0 else ("↓" if gap < 0 else "→")
+        thesis_trend_line = (
+            f"  Thesis Trend: {arrow} {gap:+d} pts  "
+            f"(entry baseline: {entry_thesis_score}/100  →  now: {score}/100)\n"
+        )
+    elif not entry_thesis_score and score is not None:
+        thesis_trend_line = (
+            f"  Thesis Trend: legacy position — no entry baseline\n"
+            f"  (current score: {score}/100; cost recovery is the primary risk signal)\n"
+        )
+
+    # Days held
+    days_held_line = ""
+    try:
+        ed_raw = pos.get("entry_date")
+        if ed_raw:
+            ed = ed_raw if isinstance(ed_raw, date) else date.fromisoformat(str(ed_raw))
+            days_held_line = f"  Held:         {(date.today() - ed).days} days  (entered {ed.strftime('%b %d, %Y')})\n"
+    except Exception:
+        pass
 
     return (
         f"{'─'*50}\n"
@@ -223,12 +252,14 @@ def _header(pos: dict, market: dict) -> str:
         f"  Stock:        {ticker}\n"
         f"  Contract:     {exp} ${strike} Call  |  {qty_remaining_h}/{qty_total_h} contracts remaining\n"
         f"  Avg. Price:   ${entry_p}/share\n"
-        + cost_basis +
+        + cost_line
+        + days_held_line +
         f"  Current mid:  {mid_str}\n"
-        f"  P&L:          {pnl_str}\n"
+        f"  P&L:          {pnl_str}  (on remaining {qty_remaining_h} contracts vs avg. entry)\n"
         f"{'─'*50}\n"
-        f"MARKET SNAPSHOT\n"
+        f"THESIS & MARKET\n"
         f"{'─'*50}\n"
+        + thesis_trend_line +
         f"  Delta:        {delta if delta is not None else 'N/A'}\n"
         f"  DTE:          {dte_days if dte_days is not None else 'N/A'} days\n"
         f"  IV Rank:      {iv_str}\n"
@@ -776,7 +807,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
             ))
 
         elif pnl >= _T["profit_300"]:
-            n_trim = max(1, round(qty * 0.50))
+            # For house money: prefer smaller trim — remaining contracts are zero-net-cost
+            n_trim = max(1, round(qty * (0.35 if house_money else 0.50)))
             n_hold = qty - n_trim
 
             # IV-adjusted roll guidance for the held portion
@@ -810,6 +842,23 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     f"    thesis is still intact and you want more upside.\n"
                 )
 
+            trim_pct_str = "35%" if house_money else "50%"
+            house_money_context = ""
+            if house_money:
+                remaining_val = round(mid * qty * 100) if mid else None
+                val_str = f"${remaining_val:,.0f}" if remaining_val else "N/A"
+                house_money_context = (
+                    f"\n  ★ HOUSE MONEY: Original cost fully recovered via prior trims.\n"
+                    f"  Remaining {qty} contracts = {val_str} of PURE BONUS PROFIT.\n"
+                    f"  Trim suggestion reduced to {trim_pct_str} (vs 50% standard) because\n"
+                    f"  your risk is zero — let more of the position ride.\n\n"
+                )
+            elif cost_recovery_pct >= 20:
+                house_money_context = (
+                    f"\n  RECOVERY NOTE: {cost_recovery_pct:.0f}% of original cost already recovered.\n"
+                    f"  Net capital at risk is significantly reduced.\n\n"
+                )
+
             alerts.append(Alert(
                 type="PROFIT_300", severity="AMBER",
                 subject=f"⚠️ TRIM & ROLL — {ticker} Up 4x: {pnl:+.1f}%",
@@ -817,20 +866,25 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     hdr()
                     + "SIGNAL: TRIM & CONSIDER ROLLING — UP 4x\n"
                     + f"{'─'*50}\n"
-                    + f"  Position is up {pnl:+.1f}% — a 4x return. You've hit your\n"
-                    + "  first major profit milestone (3-5x target zone).\n\n"
-                    + "  Strategy: Take serious profits while keeping upside exposure.\n\n"
+                    + f"  Position is up {pnl:+.1f}% — a 4x return on remaining contracts.\n"
+                    + house_money_context
+                    + (
+                        "  Strategy: Take serious profits while keeping upside exposure.\n\n"
+                        if not house_money else
+                        "  Strategy: Protect bonus profit while keeping exposure to 7-10x.\n\n"
+                    )
                     + "  RECOMMENDED ACTION:\n"
-                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (50%) now — lock in the 4x on half\n"
+                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} ({trim_pct_str}) now — lock in the 4x\n"
                     + roll_action
                     + "\n"
                     + "  This approach:\n"
                     + "  ✓ Secures substantial gains that cannot be taken away\n"
                     + "  ✓ Keeps exposure to the 7-10x move if thesis plays out\n"
-                    + "  ✓ Reduces capital at risk significantly\n"
+                    + ("  ✓ Zero net capital at risk on remaining contracts\n" if house_money else
+                       "  ✓ Reduces capital at risk significantly\n")
                     + _divider("IV TIMING")
                     + _iv_sell_context(iv_rank)
-                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 50% trim)")
+                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — {trim_pct_str} trim)")
                     + _exit_order(n_trim)
                     + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — targeting 7-10x\n" if n_hold > 0 else "")
                 ),
@@ -838,47 +892,78 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
             ))
 
         elif pnl >= _T["profit_100"]:
-            n_trim = max(1, round(qty * 0.20))
-            n_hold = qty - n_trim
-
-            # IV adjusts urgency: high IV = sell now, low IV = can wait a bit
+            # IV adjusts urgency
             iv_note = ""
             if iv_rank and iv_rank >= 65:
                 iv_note = (
                     f"\n  ★ IV Rank = {iv_rank:.0f}% — this is a great time to take the trim.\n"
-                    f"  You're selling expensive paper. Execute the 20% now.\n"
+                    f"  You're selling expensive paper. Execute now.\n"
                 )
             elif iv_rank and iv_rank < 25:
                 iv_note = (
                     f"\n  IV Rank = {iv_rank:.0f}% — options are cheap right now.\n"
-                    f"  You're at the 2x milestone but IV is compressed. If DTE > 270,\n"
-                    f"  consider waiting for an IV spike before trimming to maximize proceeds.\n"
+                    f"  If DTE > 270, consider waiting for an IV spike before trimming.\n"
                     f"  If DTE < 270, take the trim regardless.\n"
                 )
 
-            alerts.append(Alert(
-                type="PROFIT_100", severity="AMBER",
-                subject=f"⚠️ FIRST TRIM — {ticker} Up 2x: {pnl:+.1f}%",
-                body=(
-                    hdr()
-                    + "SIGNAL: FIRST PROFIT MILESTONE — UP 2x\n"
-                    + f"{'─'*50}\n"
-                    + f"  Position is up {pnl:+.1f}% — you've doubled your money.\n\n"
-                    + "  RECOMMENDED ACTION:\n"
-                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (~20%) to recover initial cost basis\n"
-                    + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} running — your target is 5-10x, not 2x\n\n" if n_hold > 0 else "\n")
-                    + "  Do NOT sell the full position here. Selling at 2x is the\n"
-                    + "  most common mistake in LEAPS trading — it sacrifices the\n"
-                    + "  asymmetric return that justifies buying options in the first place.\n"
-                    + iv_note
-                    + _divider("IV TIMING")
-                    + _iv_sell_context(iv_rank)
-                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — ~20% trim)")
-                    + _exit_order(n_trim)
-                    + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — keep riding\n" if n_hold > 0 else "")
-                ),
-                context=market,
-            ))
+            if house_money:
+                # User already recovered full original cost via prior trims.
+                # Remaining contracts cost $0 net — any proceeds are bonus profit.
+                # Don't pressure a 20% trim on top of already-executed trimming.
+                remaining_val = round(mid * qty * 100) if mid else None
+                val_str = f"  Current value of {qty} remaining contracts: ${remaining_val:,.0f}\n" if remaining_val else ""
+                alerts.append(Alert(
+                    type="PROFIT_100", severity="BLUE",
+                    subject=f"🔵 BONUS PROFIT — {ticker} Up 2x on Remaining Contracts: {pnl:+.1f}%",
+                    body=(
+                        hdr()
+                        + "SIGNAL: BONUS PROFIT — REMAINING CONTRACTS AT 2x\n"
+                        + f"{'─'*50}\n"
+                        + f"  Position is up {pnl:+.1f}% on your remaining {qty} contracts.\n\n"
+                        + "  ★ HOUSE MONEY CONTEXT:\n"
+                        + f"  Your original investment is FULLY RECOVERED via prior trims.\n"
+                        + val_str
+                        + "  Every dollar you realize from here is pure additional profit.\n\n"
+                        + "  No action required — you've already done the hard part.\n"
+                        + "  Options:\n"
+                        + f"  → Let all {qty} contracts ride toward the 5-10x target\n"
+                        + f"  → OR trim a few more to lock in this bonus profit\n"
+                        + iv_note
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
+                    ),
+                    context=market,
+                ))
+            else:
+                n_trim = max(1, round(qty * 0.20))
+                n_hold = qty - n_trim
+                alerts.append(Alert(
+                    type="PROFIT_100", severity="AMBER",
+                    subject=f"⚠️ FIRST TRIM — {ticker} Up 2x: {pnl:+.1f}%",
+                    body=(
+                        hdr()
+                        + "SIGNAL: FIRST PROFIT MILESTONE — UP 2x\n"
+                        + f"{'─'*50}\n"
+                        + f"  Position is up {pnl:+.1f}% — you've doubled your money.\n\n"
+                        + (
+                            f"  PARTIAL RECOVERY NOTE: {cost_recovery_pct:.0f}% of original cost already\n"
+                            f"  recovered via prior trims. Net cost at risk is reduced.\n\n"
+                            if cost_recovery_pct >= 20 else ""
+                        )
+                        + "  RECOMMENDED ACTION:\n"
+                        + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (~20%) to recover initial cost basis\n"
+                        + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} running — your target is 5-10x, not 2x\n\n" if n_hold > 0 else "\n")
+                        + "  Do NOT sell the full position here. Selling at 2x sacrifices\n"
+                        + "  the asymmetric return that justifies buying LEAPS in the first place.\n"
+                        + iv_note
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
+                        + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — ~20% trim)")
+                        + _exit_order(n_trim)
+                        + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — keep riding\n" if n_hold > 0 else "")
+                    ),
+                    context=market,
+                ))
 
     # -----------------------------------------------------------------------
     # PILLAR 6 — IV Timing: Strike while the iron is hot

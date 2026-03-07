@@ -1311,6 +1311,40 @@ elif page == "📊 Dashboard":
                         else:
                             st.error("Scoring failed — check logs")
 
+                # ── Thesis trend row ──────────────────────────────────────────
+                _entry_score = pos.get("entry_thesis_score")
+                _entry_date  = pos.get("entry_date")
+                _days_held   = None
+                try:
+                    if _entry_date:
+                        _ed = _entry_date if isinstance(_entry_date, date) else date.fromisoformat(str(_entry_date))
+                        _days_held = (date.today() - _ed).days
+                except Exception:
+                    pass
+
+                if _entry_score or _days_held:
+                    th1, th2, th3, th4 = st.columns(4)
+                    if _entry_score and score is not None:
+                        _gap = score - int(_entry_score)
+                        th1.metric("Entry Thesis", f"{_entry_score}/100",
+                                   help="Thesis score recorded when position was entered")
+                        th2.metric("Current Thesis", f"{score}/100")
+                        th3.metric("Thesis Δ", f"{_gap:+d} pts",
+                                   delta=f"{'improved' if _gap > 0 else 'declined' if _gap < 0 else 'unchanged'}",
+                                   delta_color="normal" if _gap >= 0 else "inverse",
+                                   help="Change in thesis score since entry")
+                    elif score is not None:
+                        th1.metric("Thesis", f"{score}/100")
+                        th2.metric("Entry Baseline", "Legacy",
+                                   help="Position predates scoring system — no entry baseline. "
+                                        "Cost recovery is the primary signal.")
+                        th3.metric("Primary Signal", f"{_cost_recovery:.0f}% recovered",
+                                   delta="HOUSE MONEY" if _house_money else None,
+                                   delta_color="normal")
+                    if _days_held is not None:
+                        th4.metric("Days Held", f"{_days_held}d",
+                                   help=f"Position entered on {str(_entry_date)[:10]}")
+
                 # ── P&L breakdown row ─────────────────────────────────────────
                 if qty_trimmed > 0 or _unrealized_pnl is not None:
                     p1, p2, p3, p4 = st.columns(4)
@@ -1986,9 +2020,44 @@ elif page == "⚙️ Settings":
                 else:
                     _sync_log.append({"Ticker": tkr, "Status": "OK", "Changes": "no changes"})
 
-        st.success(f"Sync complete — {_sync_updated} position(s) updated.")
+        # ── Populate entry_thesis_score for positions that don't have it ──
+        _baseline_set = 0
+        try:
+            _master_df = get_eval_master_data()
+            _master_scores = {
+                row["Ticker"].upper(): int(row["Score"])
+                for _, row in _master_df.iterrows()
+                if row.get("Score") is not None
+            }
+            # Re-fetch positions with fresh data after the updates above
+            _refreshed = db.get_positions()
+            for _rp in _refreshed:
+                if _rp.get("entry_thesis_score"):
+                    continue          # already has a baseline
+                _rt = (_rp.get("ticker") or "").upper()
+                if _rt in _master_scores:
+                    db.update_position(str(_rp["id"]), {"entry_thesis_score": _master_scores[_rt]})
+                    _baseline_set += 1
+                    _sync_log.append({
+                        "Ticker": _rt,
+                        "Status": "BASELINE SET",
+                        "Changes": f"entry_thesis_score → {_master_scores[_rt]}/100 (today's score as baseline)",
+                    })
+        except Exception as _be:
+            st.warning(f"Could not set entry thesis baselines: {_be}")
+
+        st.success(
+            f"Sync complete — {_sync_updated} position(s) updated, "
+            f"{_baseline_set} thesis baseline(s) set."
+        )
         st.cache_data.clear()
         st.dataframe(pd.DataFrame(_sync_log), use_container_width=True, hide_index=True)
+        if _baseline_set > 0:
+            st.info(
+                "Entry thesis baselines have been set using today's scores. "
+                "Future re-analyses will show the Δ gap vs this baseline, "
+                "letting you track how the thesis evolves from this point forward."
+            )
 
     st.divider()
 

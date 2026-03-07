@@ -1904,6 +1904,94 @@ elif page == "⚙️ Settings":
 
     st.divider()
 
+    # ── IBKR Data Sync ────────────────────────────────────────────────────────
+    st.subheader("📥 Sync IBKR Position Data")
+    st.caption(
+        "Updates all BigQuery positions with exact quantities, average entry prices, "
+        "trim amounts, and proceeds from the IBKR activity statement (Aug 2025 – Mar 6, 2026). "
+        "Closed positions (EVGO, FLNC 13C, RUM) will be marked CLOSED."
+    )
+
+    _IBKR_SYNC_DATA = [
+        # (ticker, strike, expiry, opt_type, qty, avg_px, qty_trimmed, proceeds, mode)
+        ("AEHR",   40.00, "2027-01-15", "C",  25, 3.200,   10,  8400.00, "ACTIVE"),
+        ("DLO",    24.47, "2027-01-15", "C",  45, 1.900,    0,     0.00, "ACTIVE"),
+        ("DLO",    25.00, "2027-12-17", "C",  15, 1.900,    0,     0.00, "ACTIVE"),
+        ("EH",     35.00, "2027-01-15", "C",  70, 1.500,    0,     0.00, "ACTIVE"),
+        ("ENVX",   20.00, "2027-01-15", "C",  52, 2.119,    0,     0.00, "ACTIVE"),
+        ("EVGO",    5.00, "2027-01-15", "C",  80, 1.050,   80,  9600.00, "CLOSED"),
+        ("FIG",   100.00, "2028-01-21", "C",  22, 5.545,    0,     0.00, "ACTIVE"),
+        ("FLNC",   13.00, "2027-01-15", "C",  64, 1.700,   64, 87020.00, "CLOSED"),
+        ("FLNC",   37.00, "2028-01-21", "C",  12, 8.000,    0,     0.00, "ACTIVE"),
+        ("IWM",   195.00, "2027-12-17", "P",   7,11.050,    0,     0.00, "ACTIVE"),
+        ("JMIA",   12.00, "2027-01-15", "C",  60, 1.700,   40, 24000.00, "ACTIVE"),
+        ("LAC",     4.00, "2027-01-15", "C", 150, 0.740,  120, 36000.00, "ACTIVE"),
+        ("MVST",    4.50, "2027-01-15", "C", 100, 0.800,    0,     0.00, "ACTIVE"),
+        ("OKTA",  180.00, "2027-12-17", "C",  14, 4.000,    0,     0.00, "ACTIVE"),
+        ("OPRA",   25.00, "2027-12-17", "C",  22, 3.100,    0,     0.00, "ACTIVE"),
+        ("PACB",    3.00, "2027-01-15", "C", 290, 0.338,  100,  8000.00, "ACTIVE"),
+        ("REAL",   15.00, "2027-01-15", "C",  90, 1.244,   70, 37800.00, "ACTIVE"),
+        ("RUM",    15.00, "2027-01-15", "C",  60, 1.439,   60,  8400.00, "CLOSED"),
+        ("SHLS",   12.00, "2027-01-15", "C", 119, 0.871,   60, 16800.00, "ACTIVE"),
+        ("SILJ",   35.00, "2027-01-15", "C",  35, 2.550,   20, 18000.00, "ACTIVE"),
+        ("XPOF",   15.00, "2026-12-18", "C",  80, 1.200,    0,     0.00, "ACTIVE"),
+    ]
+
+    if st.button("📥 Apply IBKR Sync", type="primary"):
+        _sync_positions = db.get_positions()
+        _sync_log = []
+        _sync_updated = 0
+
+        def _ibkr_find(positions, ticker, strike, expiry):
+            candidates = [
+                p for p in positions
+                if p.get("ticker", "").upper() == ticker.upper()
+                and abs(float(p.get("strike") or 0) - strike) <= 0.5
+                and str(p.get("expiration_date", ""))[:10] == expiry
+            ]
+            if candidates:
+                return candidates[0]
+            by_ticker = [p for p in positions if p.get("ticker","").upper() == ticker.upper()]
+            return by_ticker[0] if len(by_ticker) == 1 else None
+
+        with st.spinner("Syncing positions…"):
+            for (tkr, stk, exp, otype, qty, px, trimmed, proceeds, mode) in _IBKR_SYNC_DATA:
+                pos = _ibkr_find(_sync_positions, tkr, stk, exp)
+                if pos is None:
+                    _sync_log.append({"Ticker": tkr, "Status": "NOT FOUND", "Changes": ""})
+                    continue
+                fields = {
+                    "quantity":            qty,
+                    "entry_price":         round(px, 4),
+                    "quantity_trimmed":    trimmed,
+                    "proceeds_from_trims": round(proceeds, 2),
+                    "mode":                mode,
+                }
+                old_fields = {
+                    "quantity":            pos.get("quantity"),
+                    "entry_price":         pos.get("entry_price"),
+                    "quantity_trimmed":    pos.get("quantity_trimmed"),
+                    "proceeds_from_trims": pos.get("proceeds_from_trims"),
+                    "mode":                pos.get("mode"),
+                }
+                changed = {k: v for k, v in fields.items() if str(old_fields.get(k)) != str(v)}
+                if changed:
+                    db.update_position(str(pos["id"]), changed)
+                    _sync_updated += 1
+                    _sync_log.append({
+                        "Ticker": tkr,
+                        "Status": "UPDATED",
+                        "Changes": " | ".join(f"{k}: {old_fields[k]} → {v}" for k, v in changed.items()),
+                    })
+                else:
+                    _sync_log.append({"Ticker": tkr, "Status": "OK", "Changes": "no changes"})
+
+        st.success(f"Sync complete — {_sync_updated} position(s) updated.")
+        st.cache_data.clear()
+        st.dataframe(pd.DataFrame(_sync_log), use_container_width=True, hide_index=True)
+
+    st.divider()
+
     # ── Full Re-score (with API calls) ────────────────────────────────────────
     st.subheader("↻ Re-score Active Positions (Full Pipeline)")
     rs1, rs2 = st.columns([1, 3])

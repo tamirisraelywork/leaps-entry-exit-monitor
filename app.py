@@ -1431,7 +1431,7 @@ elif page == "📊 Dashboard":
             _orig_cost        = (ep or 0) * int(qty or 0) * 100
             _cost_of_trimmed  = (ep or 0) * qty_trimmed * 100
             _realized_pnl     = proceeds - _cost_of_trimmed
-            _unrealized_pnl   = ((mid - (ep or 0)) * qty_remaining * 100) if (mid and ep) else None
+            _unrealized_pnl   = ((mid - ep) * qty_remaining * 100) if (mid is not None and ep and ep > 0) else None
             _total_pnl        = (_realized_pnl + _unrealized_pnl) if _unrealized_pnl is not None else _realized_pnl
             _cost_recovery    = (proceeds / _orig_cost * 100) if _orig_cost > 0 else 0.0
             _house_money      = _cost_recovery >= 100.0
@@ -1473,8 +1473,8 @@ elif page == "📊 Dashboard":
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
                           delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"),
                           help="Unrealized P&L % on remaining contracts vs avg entry price")
-                m4.metric("Delta",    f"{delta:.2f}" if delta    else "N/A")
-                m5.metric("DTE",      f"{dte_days}d" if dte_days else "N/A")
+                m4.metric("Delta",    f"{delta:.2f}" if delta is not None else "N/A")
+                m5.metric("DTE",      f"{dte_days}d" if dte_days is not None else "N/A")
                 if score is not None:
                     age_label = f" ({score_age}d ago)" if score_age is not None else ""
                     stale     = score_age is not None and score_age > 30

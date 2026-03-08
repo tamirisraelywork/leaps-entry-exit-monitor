@@ -239,7 +239,7 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
         exp_str = details.get("expiration_date", "")
         try:
             expiry = date.fromisoformat(exp_str)
-            dte = (expiry - date.today()).days
+            dte = max(0, (expiry - date.today()).days)
         except Exception:
             expiry = None
             dte = None

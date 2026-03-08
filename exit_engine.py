@@ -311,9 +311,10 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
 
     # Thesis score gap: current vs score at entry (gap analysis)
     # Positive = thesis improved since entry; negative = thesis deteriorated
-    entry_thesis = int(position.get("entry_thesis_score") or 0) or None
+    _ets = position.get("entry_thesis_score")
+    entry_thesis = int(_ets) if _ets is not None else None
     thesis_gap   = (market.get("thesis_score") - entry_thesis
-                    if (market.get("thesis_score") is not None and entry_thesis)
+                    if (market.get("thesis_score") is not None and entry_thesis is not None)
                     else None)
 
     # Dynamic exit threshold — relaxed as more profit is locked in.

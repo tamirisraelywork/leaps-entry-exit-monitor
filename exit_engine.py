@@ -323,13 +323,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # If thesis has IMPROVED since entry, add 5 pts patience.
     # If thesis has DECLINED a lot, tighten by 5 pts.
     if house_money:
-        _thesis_exit = 40     # only exit on near-total collapse when fully covered
+        _thesis_exit = 44     # only exit on near-total collapse when fully covered
     elif cost_recovery_pct >= 70:
-        _thesis_exit = 50
+        _thesis_exit = 54
     elif cost_recovery_pct >= 30:
-        _thesis_exit = 55
+        _thesis_exit = 58
     else:
-        _thesis_exit = 60     # standard
+        _thesis_exit = 65     # standard (new 109pt max)
 
     if thesis_gap is not None:
         if thesis_gap >= 10:       # thesis improved → more patient
@@ -405,13 +405,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 recovery_ctx = (
                     f"\n  POSITION STATUS: HOUSE MONEY ({cost_recovery_pct:.0f}% cost recovered via trims)\n"
                     f"  Your original capital is already safe. The remaining {qty} contracts\n"
-                    f"  represent pure profit. Threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
+                    f"  represent pure profit. Threshold relaxed to {_thesis_exit}/100 (standard: 65).\n"
                     f"  Exiting only because thesis has reached near-total collapse.\n"
                 )
             elif cost_recovery_pct >= 30:
                 recovery_ctx = (
                     f"\n  COST RECOVERY: {cost_recovery_pct:.0f}% recovered via trims.\n"
-                    f"  Thesis exit threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
+                    f"  Thesis exit threshold relaxed to {_thesis_exit}/100 (standard: 65).\n"
                 )
 
             # Thesis gap context
@@ -721,30 +721,67 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     if pnl is not None:
 
         if pnl <= _T["stop_loss"]:
-            alerts.append(Alert(
-                type="EXIT_STOP", severity="RED",
-                subject=f"🔴 STOP LOSS HIT: {ticker}  P&L: {pnl:+.1f}%",
-                body=(
-                    hdr()
-                    + "SIGNAL: STOP LOSS\n"
-                    + f"{'─'*50}\n"
-                    + f"  Position is at {pnl:+.1f}% (stop: {_T['stop_loss']}%).\n"
-                    + "  Below -60%, statistical recovery to breakeven is very unlikely\n"
-                    + "  within a reasonable timeframe.\n\n"
-                    + "  Thesis may still be valid — re-enter fresh LEAPS if it is.\n"
-                    + _divider("IV TIMING")
-                    + _iv_sell_context(iv_rank)
-                    + (
-                        f"\n  Re-entry: IV is {iv_rank:.0f}% — wait for IV to normalize\n"
-                        f"  before buying back in.\n"
-                        if iv_rank and iv_rank >= 50 else ""
-                    )
-                    + _divider("TRADE INSTRUCTION")
-                    + _exit_order(qty)
-                    + "  Exit the full position. Preserve remaining capital.\n"
-                ),
-                context=market,
-            ))
+            _thesis_strong = thesis_score is not None and thesis_score >= 70
+            if _thesis_strong:
+                # Thesis is intact — wrong strike/timing, not wrong thesis.
+                # Recommend rolling down to a higher-delta strike rather than exiting.
+                alerts.append(Alert(
+                    type="ROLL_STOP", severity="AMBER",
+                    subject=f"⚠️ ROLL DOWN SIGNAL: {ticker}  P&L: {pnl:+.1f}%  Thesis: {thesis_score}/109",
+                    body=(
+                        hdr()
+                        + "SIGNAL: ROLL DOWN — STOP LOSS HIT BUT THESIS INTACT\n"
+                        + f"{'─'*50}\n"
+                        + f"  Position is at {pnl:+.1f}% — below the -60% stop level.\n"
+                        + f"  However, thesis score is {thesis_score}/109 (≥70) — the story is still valid.\n"
+                        + "  This is a strike/timing problem, NOT a thesis problem.\n\n"
+                        + "  RECOMMENDED ACTION: ROLL DOWN\n"
+                        + "  • Close current position (limit order at mid)\n"
+                        + "  • Re-enter same ticker, same expiration, lower strike\n"
+                        + "  • Target delta 0.50–0.65 (deeper ITM for higher delta, less time decay)\n"
+                        + "  • Use proceeds + additional capital if conviction warrants it\n\n"
+                        + "  WHY ROLL INSTEAD OF EXIT:\n"
+                        + "  Your current strike is too far OTM given where price is now.\n"
+                        + "  A lower strike gives you a better delta and costs less to rebuild.\n"
+                        + "  Rolling preserves the thesis exposure at a more efficient entry.\n"
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
+                        + (
+                            f"\n  ★ IV is elevated ({iv_rank:.0f}%) — roll when IV normalizes\n"
+                            f"  to get better pricing on the new strike.\n"
+                            if iv_rank and iv_rank >= 50 else ""
+                        )
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
+                        + f"  Then re-enter: buy {qty} calls, same expiry, strike ~10–20% lower.\n"
+                    ),
+                    context=market,
+                ))
+            else:
+                alerts.append(Alert(
+                    type="EXIT_STOP", severity="RED",
+                    subject=f"🔴 STOP LOSS HIT: {ticker}  P&L: {pnl:+.1f}%",
+                    body=(
+                        hdr()
+                        + "SIGNAL: STOP LOSS\n"
+                        + f"{'─'*50}\n"
+                        + f"  Position is at {pnl:+.1f}% (stop: {_T['stop_loss']}%).\n"
+                        + "  Below -60%, statistical recovery to breakeven is very unlikely\n"
+                        + "  within a reasonable timeframe.\n\n"
+                        + "  Thesis may still be valid — re-enter fresh LEAPS if it is.\n"
+                        + _divider("IV TIMING")
+                        + _iv_sell_context(iv_rank)
+                        + (
+                            f"\n  Re-entry: IV is {iv_rank:.0f}% — wait for IV to normalize\n"
+                            f"  before buying back in.\n"
+                            if iv_rank and iv_rank >= 50 else ""
+                        )
+                        + _divider("TRADE INSTRUCTION")
+                        + _exit_order(qty)
+                        + "  Exit the full position. Preserve remaining capital.\n"
+                    ),
+                    context=market,
+                ))
 
         elif pnl >= _T["profit_900"]:
             iv_urgency = ""

@@ -636,9 +636,9 @@ def _build_report(ticker: str, results):
     is_rejected = any(r["Obtained points"] == "rejected" for r in table_rows)
     verdict = (
         "Rejected"              if is_rejected else
-        "Elite LEAPS Candidate" if score >= 75 else
-        "Qualified"             if score >= 60 else
-        "Watchlist"             if score >= 45 else
+        "Elite LEAPS Candidate" if score >= 82 else
+        "Qualified"             if score >= 65 else
+        "Watchlist"             if score >= 49 else
         "Rejected"
     )
 

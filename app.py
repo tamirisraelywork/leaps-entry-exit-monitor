@@ -160,6 +160,12 @@ def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> flo
     return None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _get_snapshot_cached(ticker: str, contract: str) -> dict:
+    """Fetch option snapshot cached 10 min — prevents re-hitting yfinance on every Streamlit rerun."""
+    return options_data.get_option_snapshot(ticker, contract)
+
+
 def _resolve_contract(pos: dict) -> str:
     """
     Return the stored OCC contract symbol, or build one from strike/expiry when
@@ -184,7 +190,7 @@ def _resolve_contract(pos: dict) -> str:
 def _live_market(pos: dict) -> dict:
     ticker   = pos.get("ticker", "")
     contract = _resolve_contract(pos)
-    snapshot = options_data.get_option_snapshot(ticker, contract) if contract else {}
+    snapshot = _get_snapshot_cached(ticker, contract) if contract else {}
     snapshot = snapshot or {}
     # Reuse IV from snapshot to skip the option-chain round-trip in iv_rank
     iv_pct = (snapshot.get("implied_volatility") or 0) * 100 or None
@@ -1342,19 +1348,20 @@ elif page == "📊 Dashboard":
             cost_basis = (ep or 0) * (qty or 0) * 100
 
             with st.spinner(f"Loading {ticker}..."):
+                contract = _resolve_contract(pos)
+                # Persist auto-built contract so future loads don't need to recompute it
+                if contract and not (pos.get("contract") or "").strip():
+                    try:
+                        db.update_position(pos_id, {"contract": contract})
+                    except Exception:
+                        pass
                 if force_check:
+                    # Force-check: bypass cache, clear cached entry first
+                    _get_snapshot_cached.clear()
                     mkt = _live_market(pos)
-                    time.sleep(12)
                     polygon_error = None
                 else:
-                    contract = _resolve_contract(pos)
-                    # Persist auto-built contract so future loads don't need to recompute it
-                    if contract and not (pos.get("contract") or "").strip():
-                        try:
-                            db.update_position(pos_id, {"contract": contract})
-                        except Exception:
-                            pass
-                    snap = options_data.get_option_snapshot(ticker, contract) if contract else {}
+                    snap = _get_snapshot_cached(ticker, contract) if contract else {}
                     snap = snap or {}
                     polygon_error = snap.get("_error")
                     dte_fallback = None
@@ -1992,7 +1999,7 @@ elif page == "➕ Add Position":
         if submitted and ticker_ex and strike_ex and exp_date and entry_price_ex:
             contract_sym = options_data.to_occ(ticker_ex, exp_date, opt_type[0], strike_ex)
             with st.spinner("Fetching live data and saving..."):
-                snap  = options_data.get_option_snapshot(ticker_ex, contract_sym) or {}
+                snap  = _get_snapshot_cached(ticker_ex, contract_sym) or {}
                 score = db.get_leaps_monitor_score(ticker_ex)
 
             snap_error = snap.get("_error")

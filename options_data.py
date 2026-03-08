@@ -10,10 +10,31 @@ This means the app works fully without a paid Polygon subscription.
 
 import math
 import time
+import threading
 import requests
 from datetime import date, datetime, timedelta
 
 from shared.config import cfg
+
+# ---------------------------------------------------------------------------
+# Module-level TTL cache — avoids re-hitting yfinance on every page reload
+# ---------------------------------------------------------------------------
+_cache: dict = {}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 600   # 10 minutes
+
+
+def _cache_get(key: str):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and (time.time() - entry[0]) < _CACHE_TTL:
+            return entry[1]
+    return None
+
+
+def _cache_set(key: str, value):
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +163,8 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         if target_str not in available:
             target_str = min(available, key=lambda d: abs((date.fromisoformat(d) - expiry).days))
         actual_expiry = date.fromisoformat(target_str)
+
+        time.sleep(0.3)  # brief pause between list fetch and chain fetch
 
         # Fetch option chain — also retry on rate-limit
         chain = None
@@ -280,18 +303,25 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     Returns a dict. Check '_error' key for failures; '_source' key
     indicates where data came from ('polygon' or 'yfinance+BS').
     """
+    cache_key = f"{ticker}::{contract}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     key = _api_key()
 
     # --- Try Polygon ---
     if key:
         result = _snapshot_via_polygon(ticker, contract, key)
         if "_error" not in result:
+            _cache_set(cache_key, result)
             return result
         polygon_err = result["_error"]
     else:
         polygon_err = "no API key"
 
-    # --- Fall back to yfinance ---
+    # --- Fall back to yfinance (small delay to avoid simultaneous burst) ---
+    time.sleep(0.5)
     parsed = _parse_occ(contract, ticker)
     if not parsed:
         return {"_error": f"Could not parse contract symbol '{contract}'"}
@@ -304,12 +334,16 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     )
 
     if "_error" not in yf_result:
-        return yf_result   # success via yfinance
+        _cache_set(cache_key, yf_result)
+        return yf_result
 
-    # Both failed
-    return {
+    # Both failed — cache the error briefly (1 min) so we don't keep hammering
+    err_result = {
         "_error": f"All sources failed — Polygon: {polygon_err} | yfinance: {yf_result.get('_error', 'unknown')}"
     }
+    with _cache_lock:
+        _cache[cache_key] = (time.time() - _CACHE_TTL + 60, err_result)  # expire in 1 min
+    return err_result
 
 
 def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:

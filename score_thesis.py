@@ -146,7 +146,7 @@ def calculate_scoring(metric_name, value):
     PILLAR 2 — UPSIDE POTENTIAL (65 pts):
       Revenue Growth(16), Growth-to-Valuation(12), EPS Growth(8),
       Market Cap(7), Business Model/GF Moat(10), CEO Ownership(4),
-      Net Insider Buying(1), Institutional Ownership(4), Short Float(3)
+      Net Insider Buying(4), Institutional Ownership(5), Short Float(3)
 
     Returns (obtained_points, total_points, is_rejected).
     """
@@ -409,25 +409,33 @@ def calculate_scoring(metric_name, value):
             obtained = 1
 
     elif "buying vs selling" in name or "insider buying" in name:
-        total = 1
-        if val_str in _NA:
-            obtained = 0
-        elif val_num > 0:
-            obtained = 1   # any net buying is a positive signal
-        # net selling or 0: 0 pts
-
-    elif "institutional ownership" in name:
         total = 4
         if val_str in _NA:
+            obtained = 1   # unknown — neutral
+        elif val_num >= 5:
+            obtained = 4   # strong insider conviction (≥5% net buying)
+        elif val_num >= 1:
+            obtained = 3   # meaningful net buying
+        elif val_num > 0:
+            obtained = 2   # any net buying is a positive signal
+        elif val_num == 0:
+            obtained = 1   # neutral
+        # net selling: 0 pts
+
+    elif "institutional ownership" in name:
+        total = 5
+        if val_str in _NA:
             obtained = 2
-        elif 30 <= val_num <= 70:
-            obtained = 4   # sweet spot: smart money in, not over-crowded
-        elif 10 <= val_num < 30:
-            obtained = 3   # some institutional validation
-        elif val_num > 70:
-            obtained = 2   # over-owned — limited upside from further inst. buying
+        elif val_num < 10:
+            obtained = 5   # undiscovered gem — massive upside when institutions enter
+        elif val_num < 20:
+            obtained = 4   # early discovery phase — still room to run
+        elif val_num <= 50:
+            obtained = 3   # moderate institutional presence
+        elif val_num <= 70:
+            obtained = 2   # mainstream — limited further institutional buying
         else:
-            obtained = 1   # < 10%: largely undiscovered or avoided
+            obtained = 1   # over-owned — little room for new institutional demand
 
     elif "short float" in name:
         total = 3

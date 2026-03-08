@@ -779,31 +779,29 @@ if page == "🔍 New Analysis":
         if report:
             # ── Metrics table ─────────────────────────────────────────────────
             st.subheader("Financial Metrics")
-            _DEPRECATED_METRICS = {
-                "cash burn", "capital structure", "operating leverage", "(dol)",
-                "total insider ownership", "iv rank",
-            }
-            def _is_deprecated(name):
+            # Truly deprecated metrics — hide from display entirely
+            _HIDDEN_KW = {"cash burn", "capital structure", "operating leverage", "(dol)"}
+            def _is_hidden(name):
                 n = str(name).lower()
-                return any(d in n for d in _DEPRECATED_METRICS)
+                return any(d in n for d in _HIDDEN_KW)
 
-            # Build clean display table, skip deprecated (0/0) rows
+            # Build display table — show ALL metrics, info-only rows show "—"
             disp_rows = []
             for r in report:
                 mn = r.get("Metric Name", "")
-                if _is_deprecated(mn):
+                if _is_hidden(mn):
                     continue
                 obt = r.get("Obtained points", "")
                 tot = r.get("Total points", "")
-                # Show blank row if metric contributes nothing (no pts defined)
-                if str(obt) == "" and str(tot) == "":
-                    continue
+                # Info-only rows (no scoring): show value but mark Score as "—"
+                score_display = str(obt) if str(obt) != "" else "—"
+                max_display   = str(tot) if str(tot) not in ("", "0") else ("—" if str(obt) == "" else "")
                 disp_rows.append({
                     "Metric":  mn,
                     "Source":  r.get("Source", ""),
                     "Value":   r.get("Value", ""),
-                    "Score":   str(obt),
-                    "Max":     str(tot) if str(tot) not in ("", "0") else "",
+                    "Score":   score_display,
+                    "Max":     max_display,
                 })
 
             if disp_rows:
@@ -1153,22 +1151,20 @@ elif page == "📋 Past Analyses":
             st.caption(f"Analysis Date: {date_val}")
 
             QUAL = {"Risks","Rewards","Company Description","Value Proposition","Moat Analysis","DATE"}
-            _DEPRECATED_KW = {"cash burn","capital structure","operating leverage","(dol)",
-                               "total insider ownership","iv rank","net debt\x00","ebitda\x00"}
 
             def _is_dep(name):
                 n = str(name).lower()
                 return any(d in n for d in
-                           ("cash burn","capital structure","operating leverage","(dol)",
-                            "total insider ownership"))
+                           ("cash burn","capital structure","operating leverage","(dol)"))
 
             metrics_df = df[~df[m_col].isin(QUAL)].copy()
-            # Remove deprecated and zero-total rows from display
-            if t_col in metrics_df.columns:
-                metrics_df = metrics_df[
-                    ~metrics_df[m_col].apply(_is_dep) &
-                    (metrics_df[t_col].apply(safe_float) > 0)
-                ].copy()
+            # Remove only truly deprecated rows; keep info-only rows (total=0) for display
+            metrics_df = metrics_df[~metrics_df[m_col].apply(_is_dep)].copy()
+            # Replace empty/zero score values with "—" for info-only rows
+            if s_col in metrics_df.columns and t_col in metrics_df.columns:
+                mask = metrics_df[t_col].apply(safe_float) == 0
+                metrics_df.loc[mask, s_col] = metrics_df.loc[mask, s_col].replace("", "—").fillna("—")
+                metrics_df.loc[mask, t_col] = "—"
 
             # Rename columns for clean display
             col_rename = {m_col: "Metric", "Source": "Source", "Value": "Value",

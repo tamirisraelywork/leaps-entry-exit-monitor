@@ -1394,6 +1394,7 @@ elif page == "📊 Dashboard":
                         "dte":          snap.get("dte") or dte_fallback,
                         "iv_rank":      _get_iv_rank_cached(ticker, iv_pct_dash),
                         "thesis_score": None,
+                        "_mid_source":  snap.get("_mid_source", "market"),
                     }
 
             mid      = mkt.get("mid")
@@ -1487,8 +1488,13 @@ elif page == "📊 Dashboard":
                     )
 
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Avg. Price",   f"${ep:.2f}"   if ep       else "N/A")
-                m2.metric("Current Mid",  f"${mid:.2f}"  if mid      else "N/A")
+                _mid_source = mkt.get("_mid_source", "market")
+                _mid_label  = "Current Mid" if _mid_source == "market" else "Mid (theoretical)"
+                m1.metric("Avg. Price",  f"${ep:.2f}"  if ep  else "N/A")
+                m2.metric(_mid_label,    f"${mid:.2f}" if mid else "N/A",
+                          help=None if _mid_source == "market" else
+                          "No live bid/ask — Black-Scholes fair value using current stock price & IV. "
+                          "Verify against your broker.")
                 m3.metric("Unrlzd P&L",
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
                           delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"),

@@ -78,6 +78,12 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
         )
         theta = theta_raw / 365.0                         # per calendar day
 
+        # Theoretical option price (Black-Scholes)
+        if is_call:
+            price = S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+        else:
+            price = K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
         # Sanity-check delta
         if not (0.001 <= abs(delta) <= 0.999):
             delta = None
@@ -87,6 +93,7 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
             "gamma": round(gamma, 6),
             "theta": round(theta, 4),
             "vega":  round(vega,  4),
+            "bs_price": round(max(price, 0.01), 2),  # theoretical fair value
         }
     except Exception:
         return {}
@@ -192,14 +199,15 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         bid  = float(row.get("bid")       or 0)
         ask  = float(row.get("ask")       or 0)
         last = float(row.get("lastPrice") or 0)
-        mid  = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else (last or None)
+        mid  = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else None
 
         # IV — cap at 200% to avoid BS degeneration on illiquid options
         raw_iv = float(row.get("impliedVolatility") or 0)
         iv = min(raw_iv, 2.0) if raw_iv > 0 else None
 
-        # Full Black-Scholes Greeks (delta, gamma, theta, vega)
+        # Full Black-Scholes Greeks + theoretical price (delta, gamma, theta, vega, bs_price)
         greeks = {}
+        mid_source = "market"
         try:
             fi = t.fast_info
             S  = fi.last_price or fi.previous_close
@@ -208,6 +216,17 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
                 greeks = _bs_greeks(float(S), float(strike), T, 0.045, iv, option_type)
         except Exception:
             pass
+
+        # For illiquid options with no live bid/ask, use BS theoretical price
+        # instead of stale lastPrice (which is often the user's own entry trade)
+        if mid is None:
+            bs_price = greeks.get("bs_price")
+            if bs_price:
+                mid = bs_price
+                mid_source = "theoretical (no live market)"
+            elif last > 0:
+                mid = last
+                mid_source = "last trade (stale)"
 
         return {
             "delta":              greeks.get("delta"),
@@ -223,6 +242,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             "strike":             float(row.get("strike", strike)),
             "open_interest":      int(row.get("openInterest") or 0) or None,
             "_source":            "yfinance+BS",
+            "_mid_source":        mid_source,
         }
 
     except Exception as e:

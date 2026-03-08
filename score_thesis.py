@@ -143,10 +143,11 @@ def calculate_scoring(metric_name, value):
       Cash Runway(10), Assets/Liab(5), Net Debt/EBITDA(7),
       Share Count Growth(4), Gross Margin(5), Expiration Date(4)
 
-    PILLAR 2 — UPSIDE POTENTIAL (65 pts):
+    PILLAR 2 — UPSIDE POTENTIAL (70 pts):
       Revenue Growth(16), Growth-to-Valuation(12), EPS Growth(8),
       Market Cap(7), Business Model/GF Moat(10), CEO Ownership(4),
-      Net Insider Buying(4), Institutional Ownership(5), Short Float(3)
+      Net Insider Buying(4), Institutional Ownership(5), Short Float(3),
+      Degree of Operating Leverage(5)
 
     Returns (obtained_points, total_points, is_rejected).
     """
@@ -159,7 +160,6 @@ def calculate_scoring(metric_name, value):
 
     # ── Deprecated metrics — contribute 0 pts, never reject ──────────────────
     if ("burn" in name or "capital structure" in name
-            or "operating leverage" in name or "(dol)" in name
             or "total insider ownership" in name):
         return (0, 0, False)
 
@@ -290,6 +290,20 @@ def calculate_scoring(metric_name, value):
                 obtained = 0   # Can't parse — skip, don't reject
 
     # ── PILLAR 2: UPSIDE POTENTIAL ────────────────────────────────────────────
+
+    elif "operating leverage" in name or "(dol)" in name:
+        total = 5
+        if val_str in _NA:
+            obtained = 1   # unknown — neutral
+        elif val_num >= 3:
+            obtained = 5   # very high leverage — earnings explode with revenue growth
+        elif val_num >= 2:
+            obtained = 4   # high leverage — strong amplification
+        elif val_num >= 1:
+            obtained = 2   # moderate — some amplification
+        elif val_num > 0:
+            obtained = 1   # low leverage
+        # ≤ 0 (declining or negative): 0 pts
 
     elif "revenue growth" in name:
         total = 16

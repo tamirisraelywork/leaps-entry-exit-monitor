@@ -780,7 +780,7 @@ if page == "🔍 New Analysis":
             # ── Metrics table ─────────────────────────────────────────────────
             st.subheader("Financial Metrics")
             # Truly deprecated metrics — hide from display entirely
-            _HIDDEN_KW = {"cash burn", "capital structure", "operating leverage", "(dol)"}
+            _HIDDEN_KW = {"cash burn", "capital structure"}
             def _is_hidden(name):
                 n = str(name).lower()
                 return any(d in n for d in _HIDDEN_KW)
@@ -1154,8 +1154,7 @@ elif page == "📋 Past Analyses":
 
             def _is_dep(name):
                 n = str(name).lower()
-                return any(d in n for d in
-                           ("cash burn","capital structure","operating leverage","(dol)"))
+                return any(d in n for d in ("cash burn","capital structure"))
 
             metrics_df = df[~df[m_col].isin(QUAL)].copy()
             # Remove only truly deprecated rows; keep info-only rows (total=0) for display

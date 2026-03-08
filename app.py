@@ -160,11 +160,28 @@ def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> flo
     return None
 
 
+def _clear_snapshot_cache(ticker: str, contract: str):
+    """Remove a specific snapshot from session-state cache."""
+    key = f"_snap::{ticker}::{contract}"
+    st.session_state.pop(key, None)
+    # Also clear the module-level cache in options_data
+    options_data._cache.pop(f"{ticker}::{contract}", None)
+
+
+def _clear_all_snapshot_cache():
+    """Remove all snapshot cache entries from session state and module cache."""
+    keys = [k for k in st.session_state if k.startswith("_snap::")]
+    for k in keys:
+        del st.session_state[k]
+    with options_data._cache_lock:
+        options_data._cache.clear()
+
+
 def _get_snapshot_cached(ticker: str, contract: str) -> dict:
     """
     Fetch option snapshot with session-state caching (10 min TTL).
-    Errors are NOT cached — they retry immediately on next load.
-    Only successful results (with actual mid/delta) are cached.
+    Errors are NOT cached — retry immediately on next load.
+    Results where mid == 0 or mid is suspiciously stale are NOT cached.
     """
     import time as _time
     key = f"_snap::{ticker}::{contract}"
@@ -174,7 +191,8 @@ def _get_snapshot_cached(ticker: str, contract: str) -> dict:
         if _time.time() - ts < 600 and "_error" not in result:
             return result
     result = options_data.get_option_snapshot(ticker, contract)
-    if "_error" not in result and result.get("mid") is not None:
+    # Only cache if we have a real mid (not zero, not error)
+    if "_error" not in result and result.get("mid") and result.get("mid", 0) > 0:
         st.session_state[key] = (_time.time(), result)
     return result
 
@@ -1298,9 +1316,14 @@ elif page == "📋 Past Analyses":
 elif page == "📊 Dashboard":
     st.title("Portfolio Dashboard")
 
-    col_refresh, col_spacer = st.columns([1, 5])
+    col_refresh, col_bust, col_spacer = st.columns([1, 1, 4])
     with col_refresh:
         force_check = st.button("🔄 Run Check Now", use_container_width=True)
+    with col_bust:
+        if st.button("🗑️ Refresh Data", use_container_width=True,
+                     help="Clear cached prices and re-fetch all positions from scratch"):
+            _clear_all_snapshot_cache()
+            st.rerun()
 
     try:
         positions = db.get_positions()
@@ -1369,8 +1392,8 @@ elif page == "📊 Dashboard":
                     except Exception:
                         pass
                 if force_check:
-                    # Force-check: bypass cache, clear cached entry first
-                    _get_snapshot_cached.clear()
+                    # Force-check: clear this position's cache entry then re-fetch
+                    _clear_snapshot_cache(ticker, contract)
                     mkt = _live_market(pos)
                     polygon_error = None
                 else:

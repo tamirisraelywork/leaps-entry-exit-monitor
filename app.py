@@ -160,10 +160,23 @@ def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> flo
     return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def _get_snapshot_cached(ticker: str, contract: str) -> dict:
-    """Fetch option snapshot cached 10 min — prevents re-hitting yfinance on every Streamlit rerun."""
-    return options_data.get_option_snapshot(ticker, contract)
+    """
+    Fetch option snapshot with session-state caching (10 min TTL).
+    Errors are NOT cached — they retry immediately on next load.
+    Only successful results (with actual mid/delta) are cached.
+    """
+    import time as _time
+    key = f"_snap::{ticker}::{contract}"
+    entry = st.session_state.get(key)
+    if entry:
+        ts, result = entry
+        if _time.time() - ts < 600 and "_error" not in result:
+            return result
+    result = options_data.get_option_snapshot(ticker, contract)
+    if "_error" not in result and result.get("mid") is not None:
+        st.session_state[key] = (_time.time(), result)
+    return result
 
 
 def _resolve_contract(pos: dict) -> str:
@@ -1631,6 +1644,14 @@ elif page == "📊 Dashboard":
 
                 if polygon_error:
                     st.warning(f"⚠️ Live data unavailable: {polygon_error}")
+                    # If we can't get live price, warn explicitly that stop-loss can't be evaluated
+                    if ep and ep > 0:
+                        _stop_price = round(ep * 0.40, 2)   # -60% stop level
+                        st.error(
+                            f"🔴 **Cannot evaluate exit signals without live price.** "
+                            f"Check your broker — if current mid is below "
+                            f"**${_stop_price:.2f}** (-60% stop), EXIT immediately."
+                        )
 
                 if worst_alert:
                     sig_color = _SEVERITY_COLOR.get(worst_alert.severity, "#FFA500")

@@ -1,5 +1,6 @@
-import streamlit as st
 import requests
+
+from shared.config import cfg
 
 
 def get_forward_eps_growth(symbol, api_key):
@@ -27,12 +28,8 @@ def get_forward_eps_growth(symbol, api_key):
         pass  # Proceed to secondary on request failure
 
     # Build proxy from PROXY_USER/PROXY_PASS (or use pre-built proxies dict if set)
-    raw_proxies = st.secrets.get("proxies")
-    if raw_proxies:
-        proxies = dict(raw_proxies)
-    else:
-        proxy_url = f"http://{st.secrets['PROXY_USER']}:{st.secrets['PROXY_PASS']}@gw.dataimpulse.com:823"
-        proxies = {"http": proxy_url, "https": proxy_url}
+    proxy_url = f"http://{cfg('PROXY_USER')}:{cfg('PROXY_PASS')}@gw.dataimpulse.com:823"
+    proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
         response = requests.get(url, proxies=proxies, timeout=15)
@@ -58,8 +55,8 @@ def get_forward_eps_growth(symbol, api_key):
 
 
 if __name__ == "__main__":
-    MY_API_KEY = st.secrets.get("ALPHA_VANTAGE_API_KEY_1", "")
-    MY_API_KEY2 = st.secrets.get("ALPHA_VANTAGE_API_KEY_2", "")
+    MY_API_KEY = cfg("ALPHA_VANTAGE_API_KEY_1")
+    MY_API_KEY2 = cfg("ALPHA_VANTAGE_API_KEY_2")
     ticker = input("Enter Stock Ticker (e.g., NVDA, AAPL): ").strip().upper()
 
     if ticker:

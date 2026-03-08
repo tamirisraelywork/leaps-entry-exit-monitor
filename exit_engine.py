@@ -966,6 +966,213 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 ))
 
     # -----------------------------------------------------------------------
+    # PILLAR 5 — Earnings & Catalyst: Pre/post earnings + news sentiment
+    # -----------------------------------------------------------------------
+    # Fires on earnings calendar state and earnings call tone.
+    # These are the highest-signal events for a 12–24 month LEAPS thesis.
+
+    earnings_state           = market.get("earnings_state")
+    earnings_tone_score      = market.get("earnings_tone_score")
+    earnings_guidance_change = market.get("earnings_guidance_change")
+    earnings_tone_delta      = market.get("earnings_tone_delta")
+    news_sentiment_score     = market.get("news_sentiment_score")
+
+    # ── PRE-EARNINGS: IV expanded + profitable → optimal sell window ─────────
+    if earnings_state in ("imminent", "week_of") and pnl is not None and pnl > 0:
+        iv_val = iv_rank or 0
+        if iv_val >= 50:
+            days_label = {"imminent": "7–14 days", "week_of": "< 7 days"}.get(earnings_state, "")
+            alerts.append(Alert(
+                type="PRE_EARNINGS_SELL", severity="BLUE",
+                subject=(
+                    f"🔵 PRE-EARNINGS SELL WINDOW: {ticker}  "
+                    f"IV {iv_val:.0f}%  P&L: {pnl:+.1f}%  ({days_label} to earnings)"
+                ),
+                body=(
+                    hdr()
+                    + _divider("PILLAR 5 — PRE-EARNINGS IV SELL WINDOW")
+                    + f"  Earnings in: {days_label}\n"
+                    + f"  Current IV Rank: {iv_val:.0f}% — IV elevated before earnings\n"
+                    + f"  Current P&L: {pnl:+.1f}% — position profitable\n\n"
+                    + "  This is the optimal window to capture extrinsic premium:\n"
+                    + "  • IV is inflated pre-earnings (buyers paying fear premium)\n"
+                    + "  • After the announcement, IV will crush 30-60% overnight\n"
+                    + "  • Your contract is worth more TODAY than it will be post-earnings\n\n"
+                    + "  OPTIONS:\n"
+                    + "  A) SELL NOW (recommended if thesis has played out)\n"
+                    + f"     → Capture elevated premium before IV crush\n"
+                    + "  B) HOLD if you have strong conviction on the earnings move direction\n"
+                    + "     → Risk: IV crush can offset even a correct directional move\n\n"
+                    + _divider("TRADE INSTRUCTION  (if executing A)")
+                    + _exit_order(qty)
+                    + _iv_sell_context(iv_val)
+                ),
+                context=market,
+            ))
+
+    # ── EARNINGS DAY: Decide hold vs sell before close ────────────────────────
+    elif earnings_state == "day_of":
+        alerts.append(Alert(
+            type="EARNINGS_DAY", severity="AMBER",
+            subject=f"⚠️ EARNINGS TODAY: {ticker} — decide HOLD or SELL before close",
+            body=(
+                hdr()
+                + _divider("PILLAR 5 — EARNINGS DAY DECISION")
+                + "  Earnings are reported TODAY.\n\n"
+                + "  SELL BEFORE CLOSE if:\n"
+                + "  • IV Rank is high (≥ 50%) — you'll lose premium to IV crush\n"
+                + "  • Thesis has already played out (position profitable)\n"
+                + "  • You're uncertain about the earnings direction\n\n"
+                + "  HOLD THROUGH if:\n"
+                + "  • You have high conviction on the earnings beat magnitude\n"
+                + "  • Position is a small % of portfolio (risk defined)\n"
+                + "  • IV Rank is already low (little crush risk)\n\n"
+                + (f"  Current IV Rank: {iv_rank:.0f}%\n" if iv_rank else "")
+                + (f"  Current P&L: {pnl:+.1f}%\n" if pnl is not None else "")
+            ),
+            context=market,
+        ))
+
+    # ── POST-EARNINGS: IV crushed, reassess thesis and rolling ───────────────
+    elif earnings_state == "post":
+        alerts.append(Alert(
+            type="POST_EARNINGS_REASSESS", severity="GREEN",
+            subject=f"🟢 POST-EARNINGS: {ticker} — IV crushed, reassess thesis & roll economics",
+            body=(
+                hdr()
+                + _divider("PILLAR 5 — POST-EARNINGS REASSESSMENT")
+                + "  Earnings were reported in the last 1–3 days.\n"
+                + "  IV has likely crushed 30–60% — options are now CHEAPER.\n\n"
+                + "  ACTION ITEMS:\n"
+                + "  1. Check earnings call tone — did management raise or cut guidance?\n"
+                + "  2. Re-assess thesis: is the 12-24 month LEAPS case still intact?\n"
+                + "  3. If planning to ROLL: NOW is the best time to buy the new contract\n"
+                + "     (IV crush = cheap extrinsic on the new position)\n"
+                + "  4. If thesis broke (guidance cut, tone shift) → EXIT per Pillar 1\n\n"
+                + (f"  Current IV Rank: {iv_rank:.0f}% (post-crush baseline)\n" if iv_rank else "")
+                + _iv_roll_context(iv_rank or 0)
+            ),
+            context=market,
+        ))
+
+    # ── EARNINGS THESIS BREAK: Tone very negative + thesis weakened ──────────
+    if (
+        earnings_tone_score is not None
+        and earnings_tone_score < -0.4
+        and market.get("thesis_impact") == "WEAKENED"
+    ):
+        alerts.append(Alert(
+            type="EARNINGS_THESIS_BREAK", severity="RED",
+            subject=(
+                f"🔴 EARNINGS THESIS BREAK: {ticker} — "
+                f"call tone {earnings_tone_score:+.2f} + guidance weakened"
+            ),
+            body=(
+                hdr()
+                + _divider("PILLAR 5 — EARNINGS CALL THESIS BREAK")
+                + f"  Earnings Call Tone Score: {earnings_tone_score:+.2f}  (threshold: -0.40)\n"
+                + f"  Thesis Impact: WEAKENED\n"
+                + (f"  Guidance Change: {earnings_guidance_change}\n" if earnings_guidance_change else "")
+                + (f"  Tone Trend: {earnings_tone_delta}\n" if earnings_tone_delta else "")
+                + "\n  Management language signals thesis deterioration.\n"
+                + "  Language detected: vague guidance, headwinds, elongated cycles,\n"
+                + "  or management confidence declining vs prior quarters.\n\n"
+                + "  RECOMMENDATION: EXIT this position.\n"
+                + "  The LEAPS thesis depends on 12-24 month trajectory.\n"
+                + "  Management's own language suggests that trajectory has weakened.\n\n"
+                + _divider("TRADE INSTRUCTION")
+                + _exit_order(qty)
+                + _iv_sell_context(iv_rank or 0)
+            ),
+            context=market,
+        ))
+
+    # ── EARNINGS GUIDANCE CUT: Management lowered forward guidance ────────────
+    if earnings_guidance_change == "LOWERED":
+        alerts.append(Alert(
+            type="EARNINGS_GUIDANCE_CUT", severity="RED",
+            subject=f"🔴 GUIDANCE CUT: {ticker} — management lowered forward guidance",
+            body=(
+                hdr()
+                + _divider("PILLAR 5 — FORWARD GUIDANCE LOWERED")
+                + "  Management has LOWERED forward guidance this quarter.\n"
+                + "  This is a direct LEAPS thesis impact — your 12-24 month bet\n"
+                + "  is predicated on the company hitting its growth trajectory.\n\n"
+                + "  RECOMMENDATION: Trigger full thesis re-score immediately.\n"
+                + "  If new score < exit threshold → EXIT per Pillar 1.\n\n"
+                + _divider("TRADE INSTRUCTION  (if re-score confirms exit)")
+                + _exit_order(qty)
+            ),
+            context=market,
+        ))
+
+    # ── EARNINGS BULLISH: Guidance raised ────────────────────────────────────
+    elif earnings_guidance_change == "RAISED" and earnings_tone_score and earnings_tone_score > 0.3:
+        alerts.append(Alert(
+            type="EARNINGS_BULLISH", severity="GREEN",
+            subject=f"🟢 EARNINGS BULLISH: {ticker} — guidance RAISED, thesis strengthened",
+            body=(
+                hdr()
+                + _divider("PILLAR 5 — EARNINGS CALL BULLISH SIGNAL")
+                + f"  Guidance Change: RAISED\n"
+                + f"  Tone Score: {earnings_tone_score:+.2f}\n"
+                + (f"  Tone Trend: {earnings_tone_delta}\n" if earnings_tone_delta else "")
+                + "\n  Management raised forward guidance — thesis strengthened.\n"
+                + "  HOLD and consider adding on dips if IV permits.\n"
+                + "  Review roll economics if DTE < 270 days.\n"
+            ),
+            context=market,
+        ))
+
+    # ── NEWS SENTIMENT: Breaking bearish news ────────────────────────────────
+    if news_sentiment_score is not None:
+        if news_sentiment_score < -0.35:
+            alerts.append(Alert(
+                type="NEWS_VERY_BEARISH", severity="RED",
+                subject=(
+                    f"🔴 VERY BEARISH NEWS: {ticker} — "
+                    f"sentiment {news_sentiment_score:+.2f}"
+                ),
+                body=(
+                    hdr()
+                    + _divider("PILLAR 5 — VERY BEARISH NEWS SIGNAL")
+                    + f"  News Sentiment Score: {news_sentiment_score:+.3f}  (VERY BEARISH)\n\n"
+                    + "  Major negative news detected. Potential thesis impacts:\n"
+                    + "  • FDA rejection / clinical trial failure\n"
+                    + "  • Guidance withdrawal or profit warning\n"
+                    + "  • M&A deal collapse or regulatory block\n"
+                    + "  • CEO/CFO unexpected departure\n\n"
+                    + "  RECOMMENDATION: Verify news and re-assess thesis IMMEDIATELY.\n"
+                    + "  If thesis is broken → EXIT before further decline.\n\n"
+                    + _divider("CONTINGENCY TRADE INSTRUCTION")
+                    + _exit_order(qty)
+                ),
+                context=market,
+            ))
+        elif news_sentiment_score < -0.15:
+            alerts.append(Alert(
+                type="NEWS_BEARISH", severity="AMBER",
+                subject=(
+                    f"⚠️ BEARISH NEWS: {ticker} — "
+                    f"sentiment {news_sentiment_score:+.2f}"
+                ),
+                body=(
+                    hdr()
+                    + _divider("PILLAR 5 — BEARISH NEWS SIGNAL")
+                    + f"  News Sentiment Score: {news_sentiment_score:+.3f}  (BEARISH)\n\n"
+                    + "  Negative news sentiment detected. Monitor closely.\n"
+                    + "  Verify whether this news affects your LEAPS thesis fundamentals.\n"
+                    + "  If temporary noise → document and continue monitoring.\n"
+                    + "  If thesis-relevant → re-score and apply Pillar 1 thresholds.\n"
+                ),
+                context=market,
+            ))
+
+    # Adjust Pillar 1 exit threshold if tone is deteriorating consecutive quarters
+    if earnings_tone_delta == "DETERIORATING":
+        _thesis_exit = min(70, _thesis_exit + 5)
+
+    # -----------------------------------------------------------------------
     # PILLAR 6 — IV Timing: Strike while the iron is hot
     # -----------------------------------------------------------------------
     # These fire ON TOP OF Pillars 1-5 when IV rank creates an especially

@@ -4,7 +4,8 @@ import time
 import random
 from bs4 import BeautifulSoup
 import logging
-import streamlit as st
+
+from shared.config import cfg
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,8 +45,8 @@ def scrape_finviz(ticker):
 
     # Build proxy URL from PROXY_USER/PROXY_PASS (or use proxy_url directly if set)
     proxy_url = (
-        st.secrets.get("proxy_url")
-        or f"http://{st.secrets['PROXY_USER']}:{st.secrets['PROXY_PASS']}@gw.dataimpulse.com:823"
+        cfg("proxy_url")
+        or f"http://{cfg('PROXY_USER')}:{cfg('PROXY_PASS')}@gw.dataimpulse.com:823"
     )
 
     proxies = {

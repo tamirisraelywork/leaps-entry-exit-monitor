@@ -4,16 +4,17 @@ from datetime import datetime
 import time
 import random
 import logging
-import streamlit as st
 import requests
 from curl_cffi import requests as crequests
 import sys
 
+from shared.config import cfg
+
 # --- API Key from Secrets (try key 3 first, fall back to 1 or 2) ---
 ALPHA_VANTAGE_KEY = (
-    st.secrets.get("ALPHA_VANTAGE_API_KEY_3")
-    or st.secrets.get("ALPHA_VANTAGE_API_KEY_1")
-    or st.secrets.get("ALPHA_VANTAGE_API_KEY_2", "")
+    cfg("ALPHA_VANTAGE_API_KEY_3")
+    or cfg("ALPHA_VANTAGE_API_KEY_1")
+    or cfg("ALPHA_VANTAGE_API_KEY_2")
 )
 
 # --- Configured logging to track errors and retries ---
@@ -55,8 +56,8 @@ def get_latest_metric(df, possible_keys):
 
 def run_comprehensive_analysis(ticker_symbol):
     # Proxy Configuration from first code
-    PROXY_USER = st.secrets["PROXY_USER"]
-    PROXY_PASS = st.secrets["PROXY_PASS"]
+    PROXY_USER = cfg("PROXY_USER")
+    PROXY_PASS = cfg("PROXY_PASS")
     PROXY_HOST = "gw.dataimpulse.com"
     PROXY_PORT = "823"
     proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
@@ -210,7 +211,7 @@ def run_comprehensive_analysis(ticker_symbol):
             # Polygon.io fallback for options expiration date
             if latest_expiry == "N/A":
                 try:
-                    polygon_key = st.secrets.get("POLYGON_API_KEY_2")
+                    polygon_key = cfg("POLYGON_API_KEY_2")
                     if polygon_key:
                         today_str = datetime.now().strftime("%Y-%m-%d")
                         poly_url = (
@@ -273,30 +274,59 @@ def run_comprehensive_analysis(ticker_symbol):
             if total_assets and total_liabilities and total_liabilities != 0:
                 al_ratio = round(total_assets / total_liabilities, 2)
 
-            # 8. Runway (Quarterly Cash / Monthly Burn)
+            # 8. Runway (Cash + ST Investments) / TTM Monthly Burn
+            # Use combined cash+short-term investments first (more complete picture),
+            # then fall back to cash-only.
             current_cash, _ = get_latest_metric(q_balance_sheet, [
-                'Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments'
+                'Cash Cash Equivalents And Short Term Investments',
+                'Cash And Cash Equivalents',
             ])
-            quarterly_ocf, _ = get_latest_metric(q_cash_flow, ['Operating Cash Flow'])
 
-            # --- Alpha Vantage Fallback for Runway (from second code) ---
-            if current_cash is None or quarterly_ocf is None:
+            # TTM OCF: sum of last 4 quarters — more stable than a single quarter
+            # which can be distorted by one-time payments or timing differences.
+            ttm_ocf = None
+            if q_cash_flow is not None and 'Operating Cash Flow' in q_cash_flow.index:
+                try:
+                    ocf_series = q_cash_flow.loc['Operating Cash Flow'].dropna()
+                    if len(ocf_series) >= 4:
+                        ttm_ocf = float(ocf_series.iloc[:4].sum())
+                    elif len(ocf_series) >= 1:
+                        # Annualise from however many quarters we have
+                        n = len(ocf_series)
+                        ttm_ocf = float(ocf_series.iloc[:n].sum() / n * 4)
+                except Exception:
+                    ttm_ocf = None
+
+            # --- Alpha Vantage Fallback for Runway ---
+            if current_cash is None or ttm_ocf is None:
                 try:
                     av_bs_url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker_symbol}&apikey={ALPHA_VANTAGE_KEY}"
                     av_cf_url = f"https://www.alphavantage.co/query?function=CASH_FLOW&symbol={ticker_symbol}&apikey={ALPHA_VANTAGE_KEY}"
                     if current_cash is None:
                         av_bs_resp = requests.get(av_bs_url, proxies=proxies, timeout=15)
-                        current_cash = av_clean(av_bs_resp.json().get("quarterlyReports", [{}])[0].get("cashAndCashEquivalentsAtCarryingValue"))
-                    if quarterly_ocf is None:
+                        av_rep = av_bs_resp.json().get("quarterlyReports", [{}])[0]
+                        # Prefer combined cash+ST investments
+                        av_cash_st = av_clean(av_rep.get("cashAndShortTermInvestments"))
+                        av_cash    = av_clean(av_rep.get("cashAndCashEquivalentsAtCarryingValue"))
+                        current_cash = av_cash_st if av_cash_st else av_cash
+                    if ttm_ocf is None:
                         av_cf_resp = requests.get(av_cf_url, proxies=proxies, timeout=15)
-                        quarterly_ocf = av_clean(av_cf_resp.json().get("quarterlyReports", [{}])[0].get("operatingCashflow"))
-                except:
+                        # Use last 4 quarterly reports for TTM
+                        q_reports = av_cf_resp.json().get("quarterlyReports", [])
+                        ocf_vals = [av_clean(r.get("operatingCashflow")) for r in q_reports[:4]]
+                        ocf_vals = [v for v in ocf_vals if v is not None]
+                        if len(ocf_vals) >= 2:
+                            ttm_ocf = sum(ocf_vals) / len(ocf_vals) * 4
+                        elif len(ocf_vals) == 1:
+                            ttm_ocf = ocf_vals[0] * 4
+                except Exception:
                     pass
 
-            if current_cash is not None and quarterly_ocf is not None:
-                if quarterly_ocf < 0:
-                    monthly_burn = abs(quarterly_ocf) / 3
-                    runway_val = f"{current_cash / monthly_burn:.2f} Months"
+            if current_cash is not None and ttm_ocf is not None:
+                if ttm_ocf < 0:
+                    monthly_burn = abs(ttm_ocf) / 12
+                    runway_months = current_cash / monthly_burn
+                    runway_val = f"{runway_months:.1f} Months"
                 else:
                     runway_val = "Positive OCF (No Burn)"
 

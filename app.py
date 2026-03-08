@@ -34,7 +34,8 @@ import score_thesis
 from recommender import recommend_options, format_recommendation
 from technical import get_price_and_range, get_weekly_rsi
 from exit_engine import evaluate, evaluate_entry
-from monitor import start_scheduler
+# Monitor engine runs as a separate process (monitor_engine/main.py).
+# The Streamlit UI reads alerts + positions from BigQuery — no direct scheduler import needed.
 
 # ---------------------------------------------------------------------------
 # Page config & startup
@@ -53,9 +54,6 @@ try:
     db.ensure_tables()
 except Exception as e:
     st.error(f"BigQuery setup error: {e}")
-
-start_scheduler()
-
 
 # ---------------------------------------------------------------------------
 # Shared state for background analysis jobs
@@ -227,11 +225,11 @@ def safe_float(val):
 def _verdict_from_score(score, is_rejected):
     if is_rejected:
         return "❌ Rejected"
-    if score >= 80:
+    if score >= 75:
         return "🔥 Elite LEAPS Candidate"
-    if score >= 70:
-        return "✅ Qualified"
     if score >= 60:
+        return "✅ Qualified"
+    if score >= 45:
         return "⚠️ Watchlist"
     return "❌ Rejected"
 
@@ -366,7 +364,14 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
         old_score   = int(safe_float(old_df["Score"].iloc[0]))   if not old_df.empty else 0
         old_verdict = str(old_df["Verdict"].iloc[0])              if not old_df.empty else "N/A"
 
-        detail_df = client.query(f"SELECT * FROM `{ticker_path}`").to_dataframe()
+        try:
+            detail_df = client.query(f"SELECT * FROM `{ticker_path}`").to_dataframe()
+        except Exception as tbl_err:
+            _emsg = str(tbl_err).lower()
+            if "404" in _emsg or "not found" in _emsg:
+                # No detail table — ticker was added to watchlist but never analyzed; skip
+                return old_score, old_score, old_verdict, old_verdict
+            raise
         if detail_df.empty:
             return old_score, old_score, old_verdict, old_verdict
 
@@ -376,18 +381,37 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
 
         QUAL = {"Risks","Rewards","Company Description","Value Proposition","Moat Analysis","DATE"}
 
-        # Seed thread_local scratch for Net Debt / EBITDA metric
+        # ── Full pre-pass: seed all thread-local values before scoring ────────
+        # This ensures correct ordering regardless of BQ row order —
+        # Net Debt / EBITDA sign check and Business Model (uses GF moat score)
+        # both depend on values from other metric rows.
         tl = score_thesis._thread_local
+        tl.gf_score     = 0.0
+        tl.net_debt_val = None
+        tl.ebitda_val   = None
         for _, row in detail_df.iterrows():
-            mn = str(row.get(m_col, "")).lower()
+            mn  = str(row.get(m_col, "")).lower()
+            val = str(row.get("Value", ""))
             if mn == "net debt":
-                tl.net_debt_val = row.get("Value", None)
+                tl.net_debt_val = val
             elif mn == "ebitda":
-                tl.ebitda_val = row.get("Value", None)
+                tl.ebitda_val = val
+            elif "moat score" in mn:
+                # Pre-seed GF moat score so Business Model scores correctly even if
+                # BQ returns it after the Business Model row.
+                try:
+                    tl.gf_score = float(score_thesis.safe_float(val))
+                except Exception:
+                    pass
 
         new_rows    = []
         total_score = 0.0
         is_rejected = False
+
+        # Expiration date is time-sensitive: a date stored 2 years ago may now
+        # appear expired and falsely trigger rejection.  Preserve the stored
+        # score/total for this metric instead of re-evaluating with today's date.
+        SKIP_RESCORE = {"latest expiration date", "expiration date"}
 
         for _, row in detail_df.iterrows():
             r           = row.to_dict()
@@ -395,6 +419,18 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
             if metric_name in QUAL or not metric_name:
                 new_rows.append(r)
                 continue
+
+            # Preserve stored score for time-sensitive expiration metric
+            if metric_name.lower() in SKIP_RESCORE:
+                stored_pts = safe_float(str(r.get(s_col, "0") or "0"))
+                stored_tot = safe_float(str(r.get(t_col, "0") or "0"))
+                if str(r.get(s_col, "")).lower() == "rejected":
+                    is_rejected = True
+                elif stored_tot > 0:
+                    total_score += stored_pts
+                new_rows.append(r)
+                continue
+
             value              = str(r.get("Value", "N/A"))
             pts, total_pts, rej = score_thesis.calculate_scoring(metric_name, value)
             if rej:
@@ -408,8 +444,10 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
                     total_score += pts
             new_rows.append(r)
 
+        # Replace NaN with None so BigQuery doesn't reject string columns
+        rows_df = pd.DataFrame(new_rows).where(pd.notnull(pd.DataFrame(new_rows)), None)
         client.load_table_from_dataframe(
-            pd.DataFrame(new_rows), ticker_path,
+            rows_df, ticker_path,
             job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
         ).result()
 
@@ -428,8 +466,8 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
         return old_score, new_score, old_verdict, new_verdict
 
     except Exception as e:
-        logger.error(f"rescore_ticker_in_bq failed for {ticker}: {e}")
-        return 0, 0, "Error", str(e)
+        logger.error(f"rescore_ticker_in_bq failed for {ticker}: {e}", exc_info=True)
+        return 0, 0, "⚠️ Error", f"[{ticker}] {e}"
 
 
 def delete_eval_ticker(ticker: str) -> bool:
@@ -465,14 +503,16 @@ def delete_all_eval_tickers(tickers: list) -> bool:
 
 
 def send_alert_email(to_addr: str, subject: str, body: str) -> tuple[bool, str | None]:
-    """Send an HTML email via SMTP. Uses ALERT_EMAIL_* secrets."""
+    """Send an HTML email via SMTP. Reads credentials from secrets (GMAIL_SENDER or ALERT_EMAIL_FROM)."""
     try:
-        from_addr = st.secrets.get("ALERT_EMAIL_FROM", "")
-        password  = st.secrets.get("ALERT_EMAIL_PASS",  "")
-        smtp_host = st.secrets.get("ALERT_SMTP_HOST",   "smtp.gmail.com")
-        smtp_port = int(st.secrets.get("ALERT_SMTP_PORT", 587))
+        from shared.config import cfg as _cfg
+        # Accept both key name conventions
+        from_addr = _cfg("ALERT_EMAIL_FROM") or _cfg("GMAIL_SENDER")
+        password  = _cfg("ALERT_EMAIL_PASS") or _cfg("GMAIL_APP_PASSWORD")
+        smtp_host = _cfg("ALERT_SMTP_HOST") or "smtp.gmail.com"
+        smtp_port = int(_cfg("ALERT_SMTP_PORT") or 587)
         if not from_addr or not password or not to_addr:
-            return False, "Missing email credentials or recipient"
+            return False, "Missing email credentials or recipient (add GMAIL_SENDER + GMAIL_APP_PASSWORD to secrets)"
         msg            = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = from_addr
@@ -737,19 +777,62 @@ if page == "🔍 New Analysis":
         st.markdown(f"## Results: {ticker}")
 
         if report:
+            # ── Metrics table ─────────────────────────────────────────────────
             st.subheader("Financial Metrics")
-            df = pd.DataFrame(report)
-            for c in ("Obtained points", "Total points"):
-                if c in df.columns:
-                    df[c] = df[c].astype(str)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            _DEPRECATED_METRICS = {
+                "cash burn", "capital structure", "operating leverage", "(dol)",
+                "total insider ownership", "iv rank",
+            }
+            def _is_deprecated(name):
+                n = str(name).lower()
+                return any(d in n for d in _DEPRECATED_METRICS)
+
+            # Build clean display table, skip deprecated (0/0) rows
+            disp_rows = []
+            for r in report:
+                mn = r.get("Metric Name", "")
+                if _is_deprecated(mn):
+                    continue
+                obt = r.get("Obtained points", "")
+                tot = r.get("Total points", "")
+                # Show blank row if metric contributes nothing (no pts defined)
+                if str(obt) == "" and str(tot) == "":
+                    continue
+                disp_rows.append({
+                    "Metric":  mn,
+                    "Source":  r.get("Source", ""),
+                    "Value":   r.get("Value", ""),
+                    "Score":   str(obt),
+                    "Max":     str(tot) if str(tot) not in ("", "0") else "",
+                })
+
+            if disp_rows:
+                metrics_display = pd.DataFrame(disp_rows)
+                # Colour rejected rows red via styling
+                def _style_row(row):
+                    if str(row["Score"]).lower() == "rejected":
+                        return ["background-color:#fee2e2;color:#991b1b;font-weight:600"] * len(row)
+                    if row["Score"] not in ("", "0") and row["Max"] not in ("", "0"):
+                        try:
+                            pct = float(row["Score"]) / float(row["Max"])
+                            if pct == 1.0:
+                                return ["background-color:#dcfce7"] * len(row)
+                        except Exception:
+                            pass
+                    return [""] * len(row)
+                st.dataframe(
+                    metrics_display.style.apply(_style_row, axis=1),
+                    use_container_width=True, hide_index=True,
+                )
 
             st.markdown("<br>", unsafe_allow_html=True)
             st.subheader("Score Summary")
 
+            # ── Two-pillar score breakdown ─────────────────────────────────────
             def _pts(k1, k2=None):
                 for r in report:
                     n = r["Metric Name"].lower()
+                    if r.get("Obtained points") in ("rejected", ""): continue
                     if k2 and k1 in n and k2 in n: return r["Obtained points"]
                     elif not k2 and k1 in n:        return r["Obtained points"]
                 return "0"
@@ -758,31 +841,51 @@ if page == "🔍 New Analysis":
                 try:    return float(v)
                 except: return 0.0
 
-            s1 = (_f(_pts("runway")) + _f(_pts("net debt","ebitda")) +
-                  _f(_pts("assets","liabilities")) + _f(_pts("burn")) +
-                  _f(_pts("share count")) + _f(_pts("capital structure")))
-            s2 = (_f(_pts("market cap")) + _f(_pts("revenue growth")) +
-                  _f(_pts("gross margin")) + _f(_pts("eps growth")) +
-                  _f(_pts("operating leverage")) + _f(_pts("iv rank")) +
-                  _f(_pts("short float")) + _f(_pts("institutional ownership")))
-            s3 = (_f(_pts("total insider ownership")) + _f(_pts("ceo ownership")) +
-                  _f(_pts("buying vs selling")))
-            s4 = (_f(_pts("moat score")) + _f(_pts("business model")) +
-                  _f(_pts("growth-to-valuation")))
-            final_score = s1 + s2 + s3 + s4
+            # Pillar 1 — Sustainability (35 pts max)
+            p1 = (_f(_pts("runway")) + _f(_pts("assets","liabilities")) +
+                  _f(_pts("net debt","ebitda")) + _f(_pts("share count")) +
+                  _f(_pts("gross margin")) + _f(_pts("expiration")))
+            # Pillar 2 — Upside Potential (65 pts max)
+            p2 = (_f(_pts("revenue growth")) + _f(_pts("growth-to-val")) +
+                  _f(_pts("eps growth")) + _f(_pts("market cap")) +
+                  _f(_pts("business model")) + _f(_pts("ceo ownership")) +
+                  _f(_pts("buying vs selling")) +
+                  _f(_pts("institutional")) + _f(_pts("short float")))
+
+            final_score = p1 + p2
             is_rej      = any(r["Obtained points"] == "rejected" for r in report)
             verdict     = _verdict_from_score(final_score, is_rej)
+            vc          = _verdict_color(verdict)
 
-            vc = _verdict_color(verdict)
-            st.dataframe(pd.DataFrame([{
-                "Ticker":                             ticker,
-                "Financial Survival & Balance Sheet": s1,
-                "Growth & Asymmetric Upside":         s2,
-                "Insider Alignment":                  s3,
-                "Moat & Conviction":                  s4,
-                "Final Score":                        str(int(final_score)),
-                "Verdict":                            verdict,
-            }]), use_container_width=True, hide_index=True)
+            bar_p1 = min(int(p1 / 35 * 100), 100)
+            bar_p2 = min(int(p2 / 65 * 100), 100)
+            st.markdown(f"""
+<div style="background:#0f172a;padding:20px 24px;border-radius:12px;margin:8px 0">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <span style="color:#94a3b8;font-size:0.85em;letter-spacing:0.05em">FINAL SCORE — {ticker}</span>
+    <span style="background:{vc};color:white;padding:5px 14px;border-radius:6px;font-weight:bold;font-size:0.95em">{verdict}</span>
+  </div>
+  <div style="font-size:2.8em;font-weight:800;color:white;margin-bottom:18px">{int(final_score)}<span style="font-size:0.4em;color:#94a3b8;font-weight:400"> / 100</span></div>
+  <div style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span style="color:#60a5fa;font-size:0.82em;font-weight:600">Pillar 1 — Sustainability</span>
+      <span style="color:#e2e8f0;font-size:0.82em">{int(p1)} / 35</span>
+    </div>
+    <div style="background:#1e293b;border-radius:6px;height:10px">
+      <div style="background:#3b82f6;width:{bar_p1}%;height:10px;border-radius:6px;transition:width .3s"></div>
+    </div>
+  </div>
+  <div>
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span style="color:#a78bfa;font-size:0.82em;font-weight:600">Pillar 2 — Upside Potential</span>
+      <span style="color:#e2e8f0;font-size:0.82em">{int(p2)} / 65</span>
+    </div>
+    <div style="background:#1e293b;border-radius:6px;height:10px">
+      <div style="background:#8b5cf6;width:{bar_p2}%;height:10px;border-radius:6px;transition:width .3s"></div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
             # Add to watchlist button (no rerun to keep results visible)
             existing_pos = db.get_positions()
@@ -1050,40 +1153,106 @@ elif page == "📋 Past Analyses":
             st.caption(f"Analysis Date: {date_val}")
 
             QUAL = {"Risks","Rewards","Company Description","Value Proposition","Moat Analysis","DATE"}
-            metrics_df   = df[~df[m_col].isin(QUAL)].copy()
-            display_cols = [c for c in [m_col, "Source", "Value", s_col, t_col] if c in df.columns]
-            score_sum    = metrics_df[s_col].apply(safe_float).sum() if s_col in metrics_df.columns else 0
-            total_row    = pd.DataFrame([{
-                m_col: "Total Score", "Source": "", "Value": "",
-                s_col: int(round(score_sum)), t_col: "—",
-            }])
+            _DEPRECATED_KW = {"cash burn","capital structure","operating leverage","(dol)",
+                               "total insider ownership","iv rank","net debt\x00","ebitda\x00"}
+
+            def _is_dep(name):
+                n = str(name).lower()
+                return any(d in n for d in
+                           ("cash burn","capital structure","operating leverage","(dol)",
+                            "total insider ownership"))
+
+            metrics_df = df[~df[m_col].isin(QUAL)].copy()
+            # Remove deprecated and zero-total rows from display
+            if t_col in metrics_df.columns:
+                metrics_df = metrics_df[
+                    ~metrics_df[m_col].apply(_is_dep) &
+                    (metrics_df[t_col].apply(safe_float) > 0)
+                ].copy()
+
+            # Rename columns for clean display
+            col_rename = {m_col: "Metric", "Source": "Source", "Value": "Value",
+                          s_col: "Score", t_col: "Max"}
+            display_cols = [c for c in [m_col, "Source", "Value", s_col, t_col]
+                            if c in metrics_df.columns]
+            disp_df = metrics_df[display_cols].rename(columns=col_rename)
+
+            def _style_past_row(row):
+                score_val = str(row.get("Score", "")).lower()
+                if score_val == "rejected":
+                    return ["background-color:#fee2e2;color:#991b1b;font-weight:600"] * len(row)
+                try:
+                    if float(row["Score"]) == float(row["Max"]) and float(row["Max"]) > 0:
+                        return ["background-color:#dcfce7"] * len(row)
+                except Exception:
+                    pass
+                return [""] * len(row)
+
+            score_sum = metrics_df[s_col].apply(safe_float).sum() if s_col in metrics_df.columns else 0
             st.subheader("Financial Metrics")
-            st.table(pd.concat([metrics_df[display_cols], total_row], ignore_index=True))
+            st.dataframe(
+                disp_df.style.apply(_style_past_row, axis=1),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(f"Sum of scored rows: **{int(round(score_sum))}** pts")
 
-            def _section_score(metric_list):
+            # ── Two-pillar score summary (substring matching — robust across BQ schema variants) ──
+            def _pillar_score(keywords):
+                """Sum obtained scores for metrics whose name contains any of the given keywords."""
                 if s_col not in df.columns: return 0
-                return int(round(df[df[m_col].isin(metric_list)][s_col].apply(safe_float).sum()))
+                total = 0.0
+                for _, row in df.iterrows():
+                    name = str(row.get(m_col, "")).lower()
+                    val  = str(row.get(s_col, ""))
+                    if val.lower() in ("rejected", "", "nan"): continue
+                    if any(kw in name for kw in keywords):
+                        total += safe_float(val)
+                return int(round(total))
 
-            s1 = _section_score(["Runway","Net Debt / EBITDA","Assets / Liabilities Ratio",
-                                  "Cash Burn Severity","Share Count Growth","Capital Structure Pressure"])
-            s2 = _section_score(["Market cap","Revenue Growth YoY (%)","Gross Margin (%)",
-                                  "Forward EPS Growth (%)","Degree of Operating Leverage",
-                                  "IV Rank","Short Float (%)","Institutional Ownership (%)"])
-            s3 = _section_score(["Total insider ownership %","CEO Ownership %",
-                                  "Net Insider Buying vs Selling (%)"])
-            s4 = _section_score(["GuruFocus Moat Score","Business Model & Value Proposition",
-                                  "Growth-to-Valuation Score"])
-            final   = s1 + s2 + s3 + s4
+            P1_KW = ["runway", "assets", "liabilities", "net debt / ebitda", "share count",
+                     "gross margin", "expiration"]
+            P2_KW = ["revenue growth", "growth-to-val", "eps growth", "market cap",
+                     "business model", "ceo ownership", "buying vs selling",
+                     "institutional", "short float"]
+
+            p1      = _pillar_score(P1_KW)
+            p2      = _pillar_score(P2_KW)
+            final   = p1 + p2
             is_rej  = "rejected" in df[s_col].astype(str).str.lower().values if s_col in df.columns else False
             verdict = _verdict_from_score(final, is_rej)
+            vc      = _verdict_color(verdict)
+
+            bar_p1 = min(int(p1 / 35 * 100), 100)
+            bar_p2 = min(int(p2 / 65 * 100), 100)
 
             st.subheader("Score Summary")
-            st.table(pd.DataFrame([{
-                "Ticker": ticker,
-                "Financial Survival": s1, "Growth & Upside": s2,
-                "Insider Alignment":  s3, "Moat & Conviction": s4,
-                "Final Score": final,     "Verdict": verdict,
-            }]))
+            st.markdown(f"""
+<div style="background:#0f172a;padding:20px 24px;border-radius:12px;margin:8px 0">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <span style="color:#94a3b8;font-size:0.85em;letter-spacing:0.05em">LEAPS SCORE — {ticker}</span>
+    <span style="background:{vc};color:white;padding:5px 14px;border-radius:6px;font-weight:bold;font-size:0.95em">{verdict}</span>
+  </div>
+  <div style="font-size:2.8em;font-weight:800;color:white;margin-bottom:18px">{final}<span style="font-size:0.4em;color:#94a3b8;font-weight:400"> / 100</span></div>
+  <div style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span style="color:#60a5fa;font-size:0.82em;font-weight:600">Pillar 1 — Sustainability</span>
+      <span style="color:#e2e8f0;font-size:0.82em">{p1} / 35</span>
+    </div>
+    <div style="background:#1e293b;border-radius:6px;height:10px">
+      <div style="background:#3b82f6;width:{bar_p1}%;height:10px;border-radius:6px"></div>
+    </div>
+  </div>
+  <div>
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span style="color:#a78bfa;font-size:0.82em;font-weight:600">Pillar 2 — Upside Potential</span>
+      <span style="color:#e2e8f0;font-size:0.82em">{p2} / 65</span>
+    </div>
+    <div style="background:#1e293b;border-radius:6px;height:10px">
+      <div style="background:#8b5cf6;width:{bar_p2}%;height:10px;border-radius:6px"></div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
             def _llm(metric):
                 if m_col not in df.columns or "LLM" not in df.columns: return "N/A"
@@ -1237,6 +1406,25 @@ elif page == "📊 Dashboard":
                 severity      = "GREEN"
                 posture_label = "HOLD"
 
+            # Auto-email EXIT/ROLL signals (once per session per alert key)
+            _ae = st.session_state.get("alert_email", "")
+            if _ae and st.session_state.get("alert_enabled", False):
+                _emailed = st.session_state.setdefault("emailed_alerts", set())
+                for _alert in position_alerts:
+                    if _alert.severity in ("RED", "BLUE"):
+                        _ekey = f"{ticker}_{_alert.type}"
+                        if _ekey not in _emailed:
+                            _ok, _ = send_alert_email(
+                                _ae,
+                                f"LEAPS Alert: {ticker} — {_alert.subject}",
+                                f"<html><body style='font-family:Arial,sans-serif'>"
+                                f"<h2>LEAPS Exit Alert — {ticker}</h2>"
+                                f"<pre style='background:#f1f3f5;padding:12px;border-radius:4px'>"
+                                f"{_alert.body}</pre></body></html>",
+                            )
+                            if _ok:
+                                _emailed.add(_ekey)
+
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
             emoji = _POSTURE_EMOJI.get(severity, "🟢")
 
@@ -1345,6 +1533,66 @@ elif page == "📊 Dashboard":
                         th4.metric("Days Held", f"{_days_held}d",
                                    help=f"Position entered on {str(_entry_date)[:10]}")
 
+                # ── Earnings & News chips ─────────────────────────────────────
+                _earnings_date = pos.get("earnings_date")
+                _earnings_state = None
+                if _earnings_date:
+                    try:
+                        from monitor_engine.earnings_calendar import get_earnings_state, _to_date
+                        _ed_date = _to_date(_earnings_date)
+                        _earnings_state = get_earnings_state(ticker, _ed_date)
+                    except Exception:
+                        pass
+
+                _call_data = None
+                try:
+                    from monitor_engine.earnings_call_analysis import get_latest_call_data
+                    _call_data = get_latest_call_data(ticker)
+                except Exception:
+                    pass
+
+                _news_chip_cols = []
+                if _earnings_state and _earnings_state not in ("unknown", "far"):
+                    _state_cfg = {
+                        "day_of":    ("#dc2626", "⚠️ EARNINGS TODAY"),
+                        "week_of":   ("#b91c1c", "🔴"),
+                        "imminent":  ("#2563eb", "🔵"),
+                        "approaching": ("#d97706", "🟡"),
+                        "post":      ("#16a34a", "🟢"),
+                    }
+                    _sc, _slabel = _state_cfg.get(_earnings_state, ("#6b7280", "📅"))
+                    try:
+                        from monitor_engine.earnings_calendar import _to_date
+                        _edelta = (_to_date(_earnings_date) - date.today()).days
+                        _days_txt = f"{_edelta}d" if _edelta >= 0 else f"{abs(_edelta)}d ago"
+                    except Exception:
+                        _days_txt = ""
+                    _earnings_chip = (
+                        f"<span style='background:{_sc};color:white;padding:3px 10px;"
+                        f"border-radius:12px;font-size:0.78em;font-weight:600'>"
+                        f"📅 {_slabel} earnings {_days_txt}</span>"
+                    )
+                    _news_chip_cols.append(_earnings_chip)
+
+                if _call_data:
+                    _ct = _call_data.get("overall_tone", "NEUTRAL")
+                    _cq = _call_data.get("quarter", "")
+                    _cg = _call_data.get("forward_guidance", "")
+                    _tc, _ti = {"BULLISH": ("#16a34a", "🟢"), "BEARISH": ("#dc2626", "🔴")}.get(_ct, ("#6b7280", "🟡"))
+                    _guide_txt = f" · guidance {_cg.lower()}" if _cg and _cg != "NOT_PROVIDED" else ""
+                    _call_chip = (
+                        f"<span style='background:{_tc};color:white;padding:3px 10px;"
+                        f"border-radius:12px;font-size:0.78em;font-weight:600'>"
+                        f"{_ti} {_cq}: {_ct.capitalize()}{_guide_txt}</span>"
+                    )
+                    _news_chip_cols.append(_call_chip)
+
+                if _news_chip_cols:
+                    st.markdown(
+                        "&nbsp;&nbsp;".join(_news_chip_cols),
+                        unsafe_allow_html=True,
+                    )
+
                 # ── P&L breakdown row ─────────────────────────────────────────
                 if qty_trimmed > 0 or _unrealized_pnl is not None:
                     p1, p2, p3, p4 = st.columns(4)
@@ -1390,6 +1638,23 @@ elif page == "📊 Dashboard":
                         f"<strong>Active Signal:</strong>&nbsp; {worst_alert.subject}</div>",
                         unsafe_allow_html=True,
                     )
+                    # Surface limit price directly on card for RED/BLUE signals
+                    if worst_alert.severity in ("RED", "BLUE"):
+                        _lp_m = re.search(r"limit \$([\d.]+)/share", worst_alert.body or "")
+                        _pr_m = re.search(r"Estimated proceeds: ~\$([\d,]+)", worst_alert.body or "")
+                        if _lp_m:
+                            _lp_str  = _lp_m.group(1)
+                            _pr_str  = f"  ·  est. proceeds ~${_pr_m.group(1)}" if _pr_m else ""
+                            _av      = "EXIT" if worst_alert.severity == "RED" else "ROLL"
+                            _lp_col  = "#dc2626" if worst_alert.severity == "RED" else "#2563eb"
+                            st.markdown(
+                                f"<div style='background:#1e293b;color:#f8fafc;padding:7px 14px;"
+                                f"border-left:4px solid {_lp_col};border-radius:4px;"
+                                f"font-size:0.92em;margin:4px 0'>"
+                                f"💰 <strong>{_av} limit order:</strong> "
+                                f"${_lp_str}/share{_pr_str}</div>",
+                                unsafe_allow_html=True,
+                            )
                     with st.expander("📋 View recommendation & trade instruction"):
                         st.code(worst_alert.body, language=None)
                         others = [a for a in position_alerts if a is not worst_alert]
@@ -1856,11 +2121,41 @@ elif page == "🔔 Alert History":
 elif page == "⚙️ Settings":
     st.title("Settings")
 
+    # Auto-trigger fast rescore once per session when settings page first loads
+    if not st.session_state.get("_auto_rescore_done"):
+        st.session_state["_auto_rescore_done"] = True
+        _auto_master = get_eval_master_data()
+        if not _auto_master.empty:
+            _auto_tickers = _auto_master["Ticker"].tolist()
+            _auto_results = []
+            _prog = st.progress(0.0, text="Auto-rescoring all analyses with updated rules…")
+            for _i, _tk in enumerate(_auto_tickers):
+                _os, _ns, _ov, _nv = rescore_ticker_in_bq(_tk)
+                _auto_results.append({
+                    "Ticker": _tk, "Old Score": _os, "New Score": _ns,
+                    "Score Δ": _ns - _os, "Old Verdict": _ov, "New Verdict": _nv,
+                    "Changed": "✅" if (_os != _ns or _ov != _nv) else "—",
+                })
+                _prog.progress((_i + 1) / len(_auto_tickers))
+            st.session_state.rescore_results = _auto_results
+            st.cache_data.clear()
+            _prog.empty()
+            _changed_count  = sum(1 for r in _auto_results if r["Changed"] == "✅")
+            _error_count    = sum(1 for r in _auto_results if "⚠️ Error" in str(r.get("Old Verdict", "")))
+            if _changed_count:
+                st.success(f"Auto-rescored {len(_auto_tickers)} tickers — {_changed_count} updated with new scoring rules.")
+            else:
+                st.info(f"Auto-rescored {len(_auto_tickers)} tickers — all scores are already up to date.")
+            if _error_count:
+                st.warning(f"{_error_count} ticker(s) had errors — see results table below for details.")
+
     # ── Thesis Rescore ────────────────────────────────────────────────────────
     st.subheader("🔄 Rescore All Analyses")
     st.caption(
         "Re-applies the **current scoring rules** to stored BigQuery values. "
-        "No new API calls — fast, and fixes score discrepancies from rule changes."
+        "No new API calls — fast, and fixes score discrepancies from rule changes. "
+        "**If scores look wrong** (e.g. incorrect values for Revenue Growth, Runway), "
+        "use **🚀 Re-analyze All Tickers** below to fetch fresh data."
     )
 
     if st.button("🔄 Rescore All", type="primary"):
@@ -1888,8 +2183,20 @@ elif page == "⚙️ Settings":
 
             st.session_state.rescore_results = results
             st.cache_data.clear()
-            status.success(f"✅ Rescored **{len(tickers)}** tickers.")
             prog.empty()
+
+            changed_count = sum(1 for r in results if r["Changed"] == "✅")
+            error_count   = sum(1 for r in results if "⚠️ Error" in str(r.get("Old Verdict", "")))
+            if error_count:
+                status.warning(
+                    f"Rescored **{len(tickers)}** tickers — "
+                    f"**{changed_count}** updated, **{error_count}** had errors. "
+                    f"See 'New Verdict' column below for error details."
+                )
+            elif changed_count:
+                status.success(f"✅ Rescored **{len(tickers)}** tickers — **{changed_count}** scores updated.")
+            else:
+                status.info(f"✅ Rescored **{len(tickers)}** tickers — all scores are already up to date with current rules.")
 
             # Email alerts for active positions that changed
             if st.session_state.alert_enabled and st.session_state.alert_email:
@@ -1928,13 +2235,82 @@ elif page == "⚙️ Settings":
                         f"LEAPS: {len(changed)} position(s) changed",
                         body,
                     )
-                    st.success(f"Alert sent for {len(changed)} position(s).") if ok \
-                        else st.warning(f"Email failed: {err}")
+                    if ok:
+                        st.success(f"Alert sent for {len(changed)} position(s).")
+                    else:
+                        st.warning(f"Email failed: {err}")
 
     if st.session_state.rescore_results:
+        _rs_df  = pd.DataFrame(st.session_state.rescore_results)
+        _errors = _rs_df[_rs_df["Old Verdict"].astype(str).str.contains("⚠️ Error", na=False)]
+        _changed_rs = _rs_df[_rs_df["Changed"] == "✅"]
+        _no_detail  = _rs_df[
+            (_rs_df["Changed"] == "—") &
+            (_rs_df["Old Score"] == _rs_df["New Score"])
+        ]
+
         st.markdown("#### Last Rescore Results")
-        st.dataframe(pd.DataFrame(st.session_state.rescore_results),
+        if not _errors.empty:
+            with st.expander(f"⚠️ {len(_errors)} ticker(s) with errors — click to expand", expanded=True):
+                for _, _er in _errors.iterrows():
+                    st.error(f"**{_er['Ticker']}**: {_er['New Verdict']}")
+
+        if not _changed_rs.empty:
+            st.markdown(f"**{len(_changed_rs)} score(s) updated:**")
+        st.dataframe(_rs_df[["Ticker", "Old Score", "New Score", "Score Δ", "Old Verdict", "New Verdict", "Changed"]],
                      use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Full Re-analyze All Tickers (with API calls, rate-limited) ──────────────
+    st.subheader("🚀 Re-analyze All Tickers (Live Data)")
+    st.caption(
+        "Runs the full 7-source pipeline for **every ticker** in the database "
+        "(active + past analyses). Uses an 8-second delay between tickers to avoid rate-limiting. "
+        "Runs in the background — safe to navigate away."
+    )
+    rall1, rall2 = st.columns([1, 3])
+    with rall1:
+        reanalyze_all = st.button("🚀 Re-analyze All", type="primary",
+                                  help="Full 7-source re-analysis for all ~150 tickers (~20 min total).")
+    with rall2:
+        _bj_ref = _ES["batch_job"]
+        _bl_ref = _ES["batch_lock"]
+        with _bl_ref:
+            _bj_status  = _bj_ref.get("status", "idle")
+            _bj_done    = _bj_ref.get("done", 0)
+            _bj_total   = _bj_ref.get("total", 0)
+            _bj_current = _bj_ref.get("current", "")
+            _bj_results = list(_bj_ref.get("results", []))
+        if _bj_status == "running":
+            _pct = (_bj_done / _bj_total) if _bj_total else 0
+            st.progress(_pct, text=f"Analyzing {_bj_current} ({_bj_done}/{_bj_total})…")
+        elif _bj_status == "complete" and _bj_results:
+            st.success(f"Done — {_bj_done}/{_bj_total} tickers analyzed.")
+
+    if reanalyze_all:
+        master_df = get_eval_master_data()
+        all_tickers = master_df["Ticker"].tolist() if not master_df.empty else []
+        if not all_tickers:
+            st.warning("No tickers found in database.")
+        else:
+            with _ES["batch_lock"]:
+                if _ES["batch_job"].get("status") == "running":
+                    st.warning("A batch job is already running.")
+                else:
+                    _ES["batch_job"] = {
+                        "status": "running", "total": len(all_tickers),
+                        "done": 0, "current": "", "results": [], "error": None,
+                    }
+                    threading.Thread(
+                        target=_batch_worker, args=(all_tickers, 8), daemon=False
+                    ).start()
+                    st.info(f"Started re-analysis of {len(all_tickers)} tickers in background (8s delay). Refresh to check progress.")
+                    st.cache_data.clear()
+
+    if _bj_status == "complete" and _bj_results:
+        st.markdown("#### Last Batch Results")
+        st.dataframe(pd.DataFrame(_bj_results), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -2096,19 +2472,22 @@ elif page == "⚙️ Settings":
 
     # ── Position Manager email ─────────────────────────────────────────────────
     st.subheader("📧 Position Manager Alerts (Exit / Entry)")
-    try:
-        sender    = st.secrets.get("GMAIL_SENDER", "not configured")
-        recipient = st.secrets.get("ALERT_RECIPIENT_EMAIL", sender)
-        st.info(f"Alerts sent from **{sender}** to **{recipient}**\n"
-                f"Change via secrets.toml in Streamlit Cloud.")
-    except Exception:
-        st.warning("Gmail secrets not configured. Add GMAIL_SENDER, GMAIL_APP_PASSWORD, "
-                   "ALERT_RECIPIENT_EMAIL to secrets.")
+    from shared.config import cfg as _cfg
+    _sender    = _cfg("GMAIL_SENDER") or _cfg("ALERT_EMAIL_FROM") or "not configured"
+    _recipient = _cfg("ALERT_RECIPIENT_EMAIL") or _sender
+    if _sender != "not configured":
+        st.info(f"Alerts sent from **{_sender}** to **{_recipient}**  \n"
+                f"Change via Streamlit Cloud → App settings → Secrets.")
+    else:
+        st.warning("Gmail not configured. Add **GMAIL_SENDER** and **GMAIL_APP_PASSWORD** to Streamlit Cloud secrets.")
 
     if st.button("Send Test Exit-Alert Email"):
         with st.spinner("Sending..."):
-            ok = email_alerts.send_test_email()
-        st.success("Test email sent.") if ok else st.error("Test email failed.")
+            ok, err = email_alerts.send_test_email()
+        if ok:
+            st.success("Test email sent successfully!")
+        else:
+            st.error(f"Test email failed: {err}")
 
     st.divider()
 
@@ -2138,15 +2517,22 @@ elif page == "⚙️ Settings":
                 "LEAPS Command Center — Test Alert",
                 "<html><body><h2>Test alert ✅</h2><p>Email alerts are configured.</p></body></html>",
             )
-            st.success("Test email sent.") if ok else st.error(f"Failed: {err}")
+            if ok:
+                st.success("Test email sent successfully!")
+            else:
+                st.error(f"Email failed: {err}")
 
     with st.expander("Required secrets for evaluator email"):
         st.code("""
 # Add to .streamlit/secrets.toml
-ALERT_EMAIL_FROM = "your-gmail@gmail.com"
-ALERT_EMAIL_PASS = "your-app-password"
-ALERT_SMTP_HOST  = "smtp.gmail.com"   # optional default
-ALERT_SMTP_PORT  = "587"              # optional default
+# Either key name works (GMAIL_SENDER is preferred):
+GMAIL_SENDER          = "your-gmail@gmail.com"
+GMAIL_APP_PASSWORD    = "your-16-char-app-password"
+ALERT_RECIPIENT_EMAIL = "recipient@example.com"  # optional, defaults to sender
+
+# Legacy key names (also supported as fallback):
+# ALERT_EMAIL_FROM = "your-gmail@gmail.com"
+# ALERT_EMAIL_PASS = "your-app-password"
         """, language="toml")
 
     st.divider()

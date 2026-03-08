@@ -4,13 +4,14 @@ import sys
 import requests
 from google.cloud import bigquery
 from google.oauth2 import service_account
-import streamlit as st
+
+from shared.config import cfg, cfg_dict
 
 PROXY_HOST = "gw.dataimpulse.com"
 PROXY_PORT = "823"
-PROXY_USER = st.secrets["PROXY_USER"]
-PROXY_PASS = st.secrets["PROXY_PASS"]
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+PROXY_USER = cfg("PROXY_USER")
+PROXY_PASS = cfg("PROXY_PASS")
+GEMINI_API_KEY = cfg("GEMINI_API_KEY")
 
 
 def get_moat_score(ticker: str):
@@ -18,14 +19,14 @@ def get_moat_score(ticker: str):
     result = "N/A"
 
     # --- TIER 1: BIGQUERY LOOKUP ---
-    TABLE_ID = st.secrets.get("TABLE_ID") or st.secrets.get("MOAT_TABLE_ID")
+    TABLE_ID = cfg("TABLE_ID") or cfg("MOAT_TABLE_ID")
     if TABLE_ID:
         sys.stderr.write(f"INFO: TIER 1 - Initializing bigquery connection for {ticker}\n")
         try:
-            if "SERVICE_ACCOUNT_JSON" not in st.secrets:
-                sys.stderr.write("ERROR: 'SERVICE_ACCOUNT_JSON' not found in st.secrets\n")
+            service_info = cfg_dict("SERVICE_ACCOUNT_JSON")
+            if not service_info:
+                sys.stderr.write("ERROR: 'SERVICE_ACCOUNT_JSON' not found in config\n")
             else:
-                service_info = dict(st.secrets["SERVICE_ACCOUNT_JSON"])
 
                 if "private_key" in service_info:
                     service_info["private_key"] = service_info["private_key"].replace("\\n", "\n")

@@ -28,9 +28,10 @@ import datetime
 import logging
 from datetime import date
 
-import streamlit as st
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+from shared.config import cfg, cfg_dict
 
 # Import the exact same analysis modules as the LEAPS Evaluator
 from yahoo_finance import run_comprehensive_analysis
@@ -52,18 +53,17 @@ _thread_local = threading.local()
 # ---------------------------------------------------------------------------
 
 def _bq_client() -> bigquery.Client:
-    raw = st.secrets["SERVICE_ACCOUNT_JSON"]
-    sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    sa = cfg_dict("SERVICE_ACCOUNT_JSON")
+    if not sa:
+        raw = cfg("SERVICE_ACCOUNT_JSON")
+        sa = json.loads(raw) if raw else {}
     sa["private_key"] = sa.get("private_key", "").replace("\\n", "\n")
     creds = service_account.Credentials.from_service_account_info(sa)
     return bigquery.Client(credentials=creds, project=sa["project_id"])
 
 
 def _master_table_path(client: bigquery.Client) -> str:
-    raw = (
-        st.secrets.get("DATASET_ID")
-        or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
-    )
+    raw = cfg("DATASET_ID") or cfg("LEAPS_MONITOR_DATASET", "leaps_monitor")
     if "." in str(raw):
         return f"{raw}.master_table"
     return f"{client.project}.{raw}.master_table"
@@ -137,14 +137,37 @@ def safe_float(val):
 
 
 def calculate_scoring(metric_name, value):
-    """Returns (obtained_points, total_points, is_rejected).
-    Exact replica of calculate_scoring() in the LEAPS Evaluator app.py."""
+    """Two-pillar LEAPS scoring system (100 pts total).
+
+    PILLAR 1 — SUSTAINABILITY (35 pts):
+      Cash Runway(10), Assets/Liab(5), Net Debt/EBITDA(7),
+      Share Count Growth(4), Gross Margin(5), Expiration Date(4)
+
+    PILLAR 2 — UPSIDE POTENTIAL (65 pts):
+      Revenue Growth(16), Growth-to-Valuation(12), EPS Growth(8),
+      Market Cap(7), Business Model/GF Moat(10), CEO Ownership(4),
+      Net Insider Buying(1), Institutional Ownership(4), Short Float(3)
+
+    Returns (obtained_points, total_points, is_rejected).
+    """
     obtained = 0
     total = 0
     is_rejected = False
     val_num = safe_float(value)
     name = str(metric_name).lower()
     val_str = str(value).lower().strip()
+
+    # ── Deprecated metrics — contribute 0 pts, never reject ──────────────────
+    if ("burn" in name or "capital structure" in name
+            or "operating leverage" in name or "(dol)" in name
+            or "total insider ownership" in name):
+        return (0, 0, False)
+
+    # IV Rank — display only
+    if "iv rank" in name:
+        return (0, 0, False)
+
+    # ── PILLAR 1: SUSTAINABILITY ──────────────────────────────────────────────
 
     if "runway" in name:
         total = 10
@@ -154,66 +177,101 @@ def calculate_scoring(metric_name, value):
             obtained = 10
         elif val_num >= 24:
             obtained = 10
+        elif val_num >= 18:
+            obtained = 8
         elif val_num >= 12:
-            obtained = 7
+            obtained = 6
         elif val_num >= 6:
             obtained = 3
+        elif val_num >= 3:
+            obtained = 1
         elif val_num > 0 and "month" not in val_str:
-            obtained = 10
+            obtained = 10   # raw value without "months" — treat as years
         else:
-            is_rejected = True
+            is_rejected = True   # < 3 months cash — company likely won't survive
+
+    elif "assets" in name and "liabilities" in name:
+        total = 5
+        if val_str in _NA:
+            obtained = 3
+        elif val_num >= 2.5:
+            obtained = 5
+        elif val_num >= 1.5:
+            obtained = 4
+        elif val_num >= 1.0:
+            obtained = 2
+        else:
+            obtained = 1
 
     elif "net debt / ebitda" in name:
-        total = 3
+        total = 7
         net_debt = safe_float(getattr(_thread_local, "net_debt_val", None))
         ebitda   = safe_float(getattr(_thread_local, "ebitda_val",   None))
         if net_debt < 0:
-            obtained = 3
+            obtained = 7   # net cash position — no debt risk
         elif ebitda <= 0:
-            obtained = 0          # pre-profitable with net debt — no rejection
-        elif val_num == 0:
-            obtained = 3
+            # Pre-profitable — grade on reported ratio or raw debt level
+            if val_num == 0 or val_str in _NA:
+                obtained = 3
+            elif val_num <= 5:
+                obtained = 2
+            elif val_num <= 8:
+                obtained = 1
+            # > 8: 0 pts, no reject
+        elif val_num == 0 or val_str in _NA:
+            obtained = 7
         elif val_num <= 1.5:
-            obtained = 2
-        elif val_num <= 3.0:
+            obtained = 6
+        elif val_num <= 3:
+            obtained = 5
+        elif val_num <= 5:
+            obtained = 3
+        elif val_num <= 8:
             obtained = 1
-        else:
-            is_rejected = True
-
-    elif "assets" in name and "liabilities" in name:
-        total = 1
-        obtained = 0 if val_str in _NA or val_num < 1.0 else 1
-
-    elif "burn" in name:
-        total = 2
-        if val_str in _NA:
-            obtained = 1
-        elif val_num <= 0 or val_num < 10:
-            obtained = 2
-        elif val_num <= 20:
-            obtained = 1
-        # else 0 — no auto-reject; runway is the real survival gate
+        # > 8: 0 pts, no reject
 
     elif "share count" in name:
-        total = 5
+        total = 4
         if val_str in _NA:
             obtained = 1
         elif val_num <= 0:
-            obtained = 5
-        elif val_num < 5:
             obtained = 4
-        elif val_num < 10:
+        elif val_num <= 5:
+            obtained = 3
+        elif val_num <= 15:
             obtained = 2
         elif val_num <= 30:
+            obtained = 1
+        elif val_num <= 50:
             obtained = 0
         else:
-            is_rejected = True   # >30% — extreme dilution destroys per-share LEAPS returns
+            is_rejected = True   # > 50% — extreme dilution destroys per-share LEAPS returns
+
+    elif "gross margin" in name:
+        total = 5
+        if val_str in _NA:
+            obtained = 2
+        else:
+            try:
+                pct = float(val_str.replace("%", ""))
+                if pct >= 60:
+                    obtained = 5
+                elif pct >= 40:
+                    obtained = 4
+                elif pct >= 20:
+                    obtained = 2
+                elif pct >= 0:
+                    obtained = 1
+                # negative: 0 pts
+            except Exception:
+                obtained = 2
 
     elif "expiration" in name:
-        total = 0
+        total = 4
         obtained = ""
         if val_str in _NA:
-            is_rejected = True
+            obtained = 0   # No expiration specified — skip, don't reject.
+            # Only reject if a real date was provided but is too near-term.
         else:
             try:
                 import pandas as pd
@@ -222,178 +280,167 @@ def calculate_scoring(metric_name, value):
                 )
                 if diff_months < 18:
                     is_rejected = True
-                else:
-                    obtained = "Pass"
+                elif diff_months >= 36:
+                    obtained = 4
+                elif diff_months >= 24:
+                    obtained = 3
+                else:   # 18-23 months
+                    obtained = 1
             except Exception:
-                is_rejected = True
+                obtained = 0   # Can't parse — skip, don't reject
 
-    elif "capital structure" in name:
-        total = 1
-        if "no convert" in val_str or val_str == "0":
-            obtained = 1
-        elif "minor" in val_str:
-            obtained = 1
-        elif "heavy" in val_str or "atm" in val_str:
-            is_rejected = True
-
-    elif "market cap" in name:
-        total = 4
-        billions = val_num
-        if "t" in val_str:
-            billions = val_num * 1000
-        elif "m" in val_str:
-            billions = val_num / 1000
-        if billions < 1:
-            obtained = 4
-        elif billions < 3:
-            obtained = 3
-        elif billions < 8:
-            obtained = 2
-        else:
-            is_rejected = True
-
-    elif "eps growth" in name:
-        total = 3
-        if val_str not in _NA:
-            if val_num >= 30:
-                obtained = 3
-            elif val_num >= 20:
-                obtained = 2
-            elif val_num >= 10:
-                obtained = 1
-
-    elif "operating leverage" in name or "(dol)" in name:
-        total = 3
-        if val_num >= 3:
-            obtained = 3
-        elif val_num >= 2:
-            obtained = 2
-        elif val_num >= 1.5:
-            obtained = 1
-
-    elif "iv rank" in name:
-        total = 0   # shown for information only; not scored
-
-    elif "short float" in name:
-        total = 3
-        if val_str not in _NA:
-            if 10 <= val_num <= 30:
-                obtained = 3
-            elif val_num >= 5:
-                obtained = 2
-            elif val_num > 30:
-                obtained = 1
-
-    elif "institutional ownership" in name:
-        total = 3
-        if val_str not in _NA:
-            if val_num < 20:
-                obtained = 3
-            elif val_num < 40:
-                obtained = 2
-            elif val_num < 60:
-                obtained = 1
-
-    elif "total insider ownership" in name:
-        total = 5
-        if val_str in _NA:
-            obtained = 1
-        elif 5 <= val_num <= 30:
-            obtained = 5
-        elif val_num >= 2:
-            obtained = 3
-        elif val_num >= 1:
-            obtained = 2
-
-    elif "ceo ownership" in name:
-        total = 3
-        if "not disclosed" in val_str or val_str in _NA:
-            obtained = 1
-        elif val_num >= 5:
-            obtained = 3
-        elif val_num >= 2:
-            obtained = 2
-        elif val_num >= 1:
-            obtained = 1
-
-    elif "buying vs selling" in name:
-        total = 3
-        if val_str in _NA:
-            obtained = 1
-        elif val_num > 1:
-            obtained = 3
-        elif val_num > 0:
-            obtained = 2
-        elif val_num == 0:
-            obtained = 1
-
-    elif "moat score" in name:
-        total = 10
-        if val_num >= 4:
-            obtained = 10
-        elif val_num >= 3:
-            obtained = 6
-        elif val_num >= 2:
-            obtained = 3
-
-    elif "business model" in name:
-        total = 15
-        if "mission-critical" in val_str or "infrastructure" in val_str:
-            obtained = 15
-        elif "saas" in val_str or "platform" in val_str or "high switching" in val_str:
-            obtained = 10
-        elif "high-growth" in val_str or "disruptive" in val_str or "emerging" in val_str:
-            obtained = 6
-        elif "commodity" in val_str:
-            obtained = 5
+    # ── PILLAR 2: UPSIDE POTENTIAL ────────────────────────────────────────────
 
     elif "revenue growth" in name:
-        total = 13
+        total = 16
         if val_str not in _NA:
             try:
                 pct = float(val_str.replace("%", ""))
                 if pct >= 50:
-                    obtained = 13
+                    obtained = 16
                 elif pct >= 30:
-                    obtained = 10
+                    obtained = 12
                 elif pct >= 20:
-                    obtained = 7
+                    obtained = 8
                 elif pct >= 10:
                     obtained = 4
-            except Exception:
-                pass
-
-    elif "gross margin" in name:
-        total = 6
-        if val_str not in _NA:
-            try:
-                pct = float(val_str.replace("%", ""))
-                if pct >= 50:
-                    obtained = 6
-                elif pct >= 30:
-                    obtained = 4
-                elif pct >= 15:
-                    obtained = 2
-                elif pct >= 0:
+                elif pct > 0:
                     obtained = 1
+                # negative or 0: 0 pts
             except Exception:
                 pass
 
     elif "growth-to-valuation" in name:
-        total = 7
+        total = 12
         if val_str not in _NA:
             try:
                 gtv = float(val_str)
                 if gtv >= 15:
-                    obtained = 7
+                    obtained = 12
                 elif gtv >= 8:
-                    obtained = 5
-                elif gtv >= 4:
+                    obtained = 9
+                elif gtv >= 5:
+                    obtained = 6
+                elif gtv >= 3:
                     obtained = 3
-                elif gtv >= 2:
+                elif gtv >= 1:
                     obtained = 1
             except Exception:
                 pass
+
+    elif "eps growth" in name:
+        total = 8
+        if val_str in _NA:
+            obtained = 3   # neutral N/A — don't penalise missing data
+        else:
+            try:
+                pct = float(val_str.replace("%", ""))
+                if pct >= 50:
+                    obtained = 8
+                elif pct >= 30:
+                    obtained = 6
+                elif pct >= 15:
+                    obtained = 4
+                elif pct >= 5:
+                    obtained = 2
+                elif pct > 0:
+                    obtained = 1
+                # negative: 0 pts
+            except Exception:
+                obtained = 3
+
+    elif "market cap" in name:
+        total = 7
+        billions = val_num
+        if "t" in val_str:
+            billions = val_num * 1000
+        elif "m" in val_str and "b" not in val_str:
+            billions = val_num / 1000
+        if billions <= 1:
+            obtained = 7   # micro/small cap — maximum asymmetry
+        elif billions <= 3:
+            obtained = 6
+        elif billions <= 10:
+            obtained = 4
+        elif billions <= 30:
+            obtained = 2
+        elif billions <= 100:
+            obtained = 1
+        # > $100B: 0 pts, no reject — large cap LEAPS still valid if thesis is strong
+
+    elif "moat score" in name:
+        # Feeds into Business Model scoring via thread-local cache; no standalone pts
+        try:
+            _thread_local.gf_score = float(val_num)
+        except Exception:
+            _thread_local.gf_score = 0.0
+        return (0, 0, False)
+
+    elif "business model" in name:
+        total = 10
+        gf = getattr(_thread_local, "gf_score", 0.0)
+        text = val_str
+        monopoly_kw = ["mission-critical", "infrastructure", "monopoly", "dominant", "network effect"]
+        saas_kw     = ["saas", "platform", "subscription", "marketplace", "high switching"]
+        growth_kw   = ["high-growth", "disruptive", "emerging", "hypergrowth"]
+        commodity_kw = ["commodity", "cyclical", "oil", "mining", "brick", "retail"]
+        if gf >= 3.0 or any(k in text for k in monopoly_kw):
+            obtained = 10
+        elif gf >= 2.0 or any(k in text for k in saas_kw):
+            obtained = 7
+        elif gf >= 1.0 or any(k in text for k in growth_kw):
+            obtained = 4
+        elif any(k in text for k in commodity_kw):
+            obtained = 1
+        else:
+            obtained = 3   # N/A / unknown fallback
+
+    elif "ceo ownership" in name:
+        total = 4
+        if "not disclosed" in val_str or val_str in _NA:
+            obtained = 1
+        elif val_num >= 5:
+            obtained = 4
+        elif val_num >= 2:
+            obtained = 3
+        elif val_num >= 1:
+            obtained = 2
+        else:
+            obtained = 1
+
+    elif "buying vs selling" in name or "insider buying" in name:
+        total = 1
+        if val_str in _NA:
+            obtained = 0
+        elif val_num > 0:
+            obtained = 1   # any net buying is a positive signal
+        # net selling or 0: 0 pts
+
+    elif "institutional ownership" in name:
+        total = 4
+        if val_str in _NA:
+            obtained = 2
+        elif 30 <= val_num <= 70:
+            obtained = 4   # sweet spot: smart money in, not over-crowded
+        elif 10 <= val_num < 30:
+            obtained = 3   # some institutional validation
+        elif val_num > 70:
+            obtained = 2   # over-owned — limited upside from further inst. buying
+        else:
+            obtained = 1   # < 10%: largely undiscovered or avoided
+
+    elif "short float" in name:
+        total = 3
+        if val_str not in _NA:
+            if 10 <= val_num <= 25:
+                obtained = 3   # moderate short interest = potential squeeze catalyst
+            elif 25 < val_num <= 40:
+                obtained = 2
+            elif 5 <= val_num < 10:
+                obtained = 2
+            elif val_num > 40:
+                obtained = 1   # excessive short pressure — elevated risk
+            # < 5%: 0 pts (no short squeeze potential)
 
     return obtained, total, is_rejected
 
@@ -452,10 +499,7 @@ def parse_llm_response(text):
 
 async def _run_parallel_analysis(ticker: str):
     """Run all 7 analysis tasks in parallel — same as _run_parallel_analysis in LEAPS Evaluator."""
-    key = (
-        st.secrets.get("ALPHA_VANTAGE_API_KEY_1")
-        or st.secrets.get("ALPHA_VANTAGE_API_KEY_2", "")
-    )
+    key = cfg("ALPHA_VANTAGE_API_KEY_1") or cfg("ALPHA_VANTAGE_API_KEY_2")
     return await asyncio.gather(
         asyncio.to_thread(run_comprehensive_analysis, ticker),
         asyncio.to_thread(scrape_finviz, ticker),
@@ -489,6 +533,11 @@ def _build_report(ticker: str, results):
     Returns (score, verdict, table_rows, llm, sws) or raises on critical failure.
     """
     analysis, finviz_data, moat_score, raw_llm, sws_data, iv_rank_result, eps_val = results
+
+    # Reset thread-local scoring cache for this ticker
+    _thread_local.gf_score    = 0.0
+    _thread_local.net_debt_val = None
+    _thread_local.ebitda_val   = None
 
     if isinstance(raw_llm, Exception):
         raw_llm = ""
@@ -564,10 +613,10 @@ def _build_report(ticker: str, results):
     )
     is_rejected = any(r["Obtained points"] == "rejected" for r in table_rows)
     verdict = (
-        "Rejected"          if is_rejected else
-        "Elite LEAPS Candidate" if score >= 80 else
-        "Qualified"         if score >= 70 else
-        "Watchlist"         if score >= 60 else
+        "Rejected"              if is_rejected else
+        "Elite LEAPS Candidate" if score >= 75 else
+        "Qualified"             if score >= 60 else
+        "Watchlist"             if score >= 45 else
         "Rejected"
     )
 

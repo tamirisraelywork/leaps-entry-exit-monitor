@@ -5,27 +5,34 @@ Manages two tables: positions and alerts.
 
 import json
 import uuid
-import streamlit as st
 from datetime import datetime, date
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+from shared.config import cfg, cfg_dict
+
 DATASET = "leaps_exit_agent"
 
+# Module-level singleton — works in both Streamlit and standalone service contexts.
+_client: bigquery.Client | None = None
 
-@st.cache_resource
+
 def get_client() -> bigquery.Client:
-    raw = st.secrets["SERVICE_ACCOUNT_JSON"]
-    sa_info = json.loads(raw) if isinstance(raw, str) else dict(raw)
-    # Fix private key newlines — required when the secret is stored as a TOML table.
-    # Streamlit Cloud may preserve literal \\n instead of real \n in the RSA key bytes.
-    if "private_key" in sa_info:
-        sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
-    credentials = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/bigquery"],
-    )
-    return bigquery.Client(credentials=credentials, project=sa_info["project_id"])
+    global _client
+    if _client is None:
+        sa_info = cfg_dict("SERVICE_ACCOUNT_JSON")
+        if not sa_info:
+            raw = cfg("SERVICE_ACCOUNT_JSON")
+            sa_info = json.loads(raw) if raw else {}
+        # Fix private key newlines
+        if "private_key" in sa_info:
+            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+        credentials = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        _client = bigquery.Client(credentials=credentials, project=sa_info["project_id"])
+    return _client
 
 
 def _project() -> str:
@@ -78,7 +85,26 @@ def ensure_tables():
         bigquery.SchemaField("email_sent", "BOOL"),
     ]
 
-    for tbl_id, schema in [("positions", positions_schema), ("alerts", alerts_schema)]:
+    earnings_calls_schema = [
+        bigquery.SchemaField("id",               "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("ticker",            "STRING"),
+        bigquery.SchemaField("quarter",           "STRING"),
+        bigquery.SchemaField("tone_score",        "FLOAT64"),
+        bigquery.SchemaField("tone_label",        "STRING"),
+        bigquery.SchemaField("forward_guidance",  "STRING"),
+        bigquery.SchemaField("analyst_tone",      "STRING"),
+        bigquery.SchemaField("thesis_impact",     "STRING"),
+        bigquery.SchemaField("summary",           "STRING"),
+        bigquery.SchemaField("key_bullish",       "STRING"),   # JSON array
+        bigquery.SchemaField("key_bearish",       "STRING"),   # JSON array
+        bigquery.SchemaField("analyzed_at",       "DATE"),
+    ]
+
+    for tbl_id, schema in [
+        ("positions",      positions_schema),
+        ("alerts",         alerts_schema),
+        ("earnings_calls", earnings_calls_schema),
+    ]:
         tbl_ref = dataset_ref.table(tbl_id)
         try:
             client.get_table(tbl_ref)
@@ -87,10 +113,11 @@ def ensure_tables():
 
     # ── Column migrations (add new columns to existing tables) ──────────────
     # BigQuery ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent — safe to
-    # run on every startup.  Only the positions table needs new columns here.
+    # run on every startup.
     _migrate_cols = [
-        ("quantity_trimmed",   "INT64"),
+        ("quantity_trimmed",    "INT64"),
         ("proceeds_from_trims", "FLOAT64"),
+        ("earnings_date",       "DATE"),      # next expected earnings date [NEW]
     ]
     pos_tbl_ref = f"`{client.project}.{DATASET}.positions`"
     for col_name, col_type in _migrate_cols:
@@ -306,10 +333,10 @@ def get_leaps_monitor_score(ticker: str) -> int | None:
         client = get_client()
         # DATASET_ID matches the LEAPS Monitor's own secret naming convention
         raw_dataset = (
-            st.secrets.get("DATASET_ID")
-            or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+            cfg("DATASET_ID")
+            or cfg("LEAPS_MONITOR_DATASET", "leaps_monitor")
         )
-        table = st.secrets.get("LEAPS_MONITOR_TABLE", "master_table")
+        table = cfg("LEAPS_MONITOR_TABLE", "master_table")
 
         # If DATASET_ID already includes a project prefix (e.g. "proj.dataset"),
         # use it as-is; otherwise prepend the current project.
@@ -341,10 +368,10 @@ def get_leaps_monitor_score_with_age(ticker: str) -> tuple[int | None, int | Non
     try:
         client = get_client()
         raw_dataset = (
-            st.secrets.get("DATASET_ID")
-            or st.secrets.get("LEAPS_MONITOR_DATASET", "leaps_monitor")
+            cfg("DATASET_ID")
+            or cfg("LEAPS_MONITOR_DATASET", "leaps_monitor")
         )
-        table = st.secrets.get("LEAPS_MONITOR_TABLE", "master_table")
+        table = cfg("LEAPS_MONITOR_TABLE", "master_table")
         if "." in str(raw_dataset):
             full_table = f"`{raw_dataset}.{table}`"
         else:
@@ -372,3 +399,72 @@ def get_leaps_monitor_score_with_age(ticker: str) -> tuple[int | None, int | Non
     except Exception:
         pass
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Earnings calls (new)
+# ---------------------------------------------------------------------------
+
+def save_earnings_call(ticker: str, data: dict):
+    """Persist earnings call analysis row to the earnings_calls table."""
+    import json as _json
+    client = get_client()
+    row = {
+        "id":              str(uuid.uuid4()),
+        "ticker":          ticker.upper(),
+        "quarter":         data.get("quarter", ""),
+        "tone_score":      float(data.get("tone_score", 0)),
+        "tone_label":      data.get("overall_tone", "NEUTRAL"),
+        "forward_guidance": data.get("forward_guidance", "NOT_PROVIDED"),
+        "analyst_tone":    data.get("analyst_tone", ""),
+        "thesis_impact":   data.get("thesis_impact", "UNCHANGED"),
+        "summary":         data.get("summary", ""),
+        "key_bullish":     _json.dumps(data.get("key_bullish_signals", [])[:5]),
+        "key_bearish":     _json.dumps(data.get("key_bearish_signals", [])[:5]),
+        "analyzed_at":     datetime.utcnow().date().isoformat(),
+    }
+    client.insert_rows_json(
+        f"{client.project}.{DATASET}.earnings_calls", [row]
+    )
+
+
+def get_latest_earnings_call(ticker: str) -> dict | None:
+    """Return the most recent earnings call row for a ticker, or None."""
+    try:
+        client = get_client()
+        q = f"""
+            SELECT * FROM `{client.project}.{DATASET}.earnings_calls`
+            WHERE UPPER(ticker) = UPPER(@ticker)
+            ORDER BY analyzed_at DESC
+            LIMIT 1
+        """
+        rows = list(client.query(
+            q,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+            ),
+        ).result())
+        return dict(rows[0]) if rows else None
+    except Exception:
+        return None
+
+
+def get_earnings_calls(ticker: str, limit: int = 4) -> list[dict]:
+    """Return recent earnings call rows for tone delta analysis."""
+    try:
+        client = get_client()
+        q = f"""
+            SELECT * FROM `{client.project}.{DATASET}.earnings_calls`
+            WHERE UPPER(ticker) = UPPER(@ticker)
+            ORDER BY analyzed_at DESC
+            LIMIT {limit}
+        """
+        rows = list(client.query(
+            q,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+            ),
+        ).result())
+        return [dict(r) for r in rows]
+    except Exception:
+        return []

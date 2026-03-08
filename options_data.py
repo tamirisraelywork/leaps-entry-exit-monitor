@@ -11,8 +11,9 @@ This means the app works fully without a paid Polygon subscription.
 import math
 import time
 import requests
-import streamlit as st
 from datetime import date, datetime, timedelta
+
+from shared.config import cfg
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +21,7 @@ from datetime import date, datetime, timedelta
 # ---------------------------------------------------------------------------
 
 def _api_key() -> str:
-    return st.secrets.get("POLYGON_API_KEY_1") or st.secrets.get("POLYGON_API_KEY_2", "")
+    return cfg("POLYGON_API_KEY_1") or cfg("POLYGON_API_KEY_2")
 
 
 def _norm_cdf(x: float) -> float:
@@ -266,7 +267,6 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
 # Public interface
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=600, show_spinner=False)
 def get_option_snapshot(ticker: str, contract: str) -> dict:
     """
     Fetch live option data: bid/ask/mid, Greeks (delta/gamma/theta/vega), DTE, IV.

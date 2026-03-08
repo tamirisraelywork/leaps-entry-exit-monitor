@@ -8,11 +8,15 @@ Required secrets:
   ALERT_RECIPIENT_EMAIL — address to send alerts TO (can be same as sender)
 """
 
+import logging
 import smtplib
-import streamlit as st
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
+
+from shared.config import cfg
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,8 +33,8 @@ _SEVERITY_EMOJI = {
 
 def _make_message(subject: str, body: str) -> MIMEMultipart:
     """Construct a MIME email message."""
-    sender    = st.secrets["GMAIL_SENDER"]
-    recipient = st.secrets.get("ALERT_RECIPIENT_EMAIL", sender)
+    sender    = cfg("GMAIL_SENDER")
+    recipient = cfg("ALERT_RECIPIENT_EMAIL") or sender
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -48,40 +52,53 @@ def _make_message(subject: str, body: str) -> MIMEMultipart:
     return msg
 
 
-def send_alert(subject: str, body: str) -> bool:
+def send_alert(subject: str, body: str) -> tuple[bool, str]:
     """
     Send a single alert email via Gmail SMTP.
 
-    Returns True on success, False on failure.
-    Failures are logged to Streamlit but never raise exceptions
-    so a failed email never crashes the monitoring loop.
+    Returns (success, error_message).
+    Never raises — failures are logged so they never crash the monitoring loop.
     """
-    try:
-        sender   = st.secrets["GMAIL_SENDER"]
-        password = st.secrets["GMAIL_APP_PASSWORD"]
-        recipient= st.secrets.get("ALERT_RECIPIENT_EMAIL", sender)
+    # Support both GMAIL_SENDER (monitor) and ALERT_EMAIL_FROM (evaluator) key names
+    sender   = cfg("GMAIL_SENDER") or cfg("ALERT_EMAIL_FROM")
+    password = cfg("GMAIL_APP_PASSWORD") or cfg("ALERT_EMAIL_PASS")
+    recipient = cfg("ALERT_RECIPIENT_EMAIL") or sender
 
-        msg = _make_message(subject, body)
+    if not sender or not password:
+        msg = (
+            "Email not configured. Add GMAIL_SENDER and GMAIL_APP_PASSWORD to secrets "
+            "(Streamlit Cloud → App settings → Secrets)."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    try:
+        msg_obj = _make_message(subject, body)
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
             server.login(sender, password)
-            server.sendmail(sender, recipient, msg.as_string())
+            server.sendmail(sender, recipient, msg_obj.as_string())
 
-        return True
+        logger.info(f"Alert email sent: {subject}")
+        return True, ""
 
     except smtplib.SMTPAuthenticationError:
-        st.error(
-            "Email authentication failed. Check GMAIL_SENDER and GMAIL_APP_PASSWORD in secrets. "
-            "Make sure you are using a Gmail App Password (not your regular Google password)."
+        err = (
+            "Gmail authentication failed. Make sure you are using a 16-character "
+            "App Password (not your regular Google password). "
+            "Generate one at myaccount.google.com → Security → App Passwords."
         )
-        return False
+        logger.error(err)
+        return False, err
     except Exception as e:
-        st.warning(f"Email delivery failed: {e}")
-        return False
+        err = str(e)
+        logger.error(f"Email delivery failed: {err}")
+        return False, err
 
 
-def send_test_email() -> bool:
-    """Send a test email to verify Gmail SMTP is configured correctly."""
+def send_test_email() -> tuple[bool, str]:
+    """Send a test email to verify Gmail SMTP is configured correctly.
+    Returns (success, error_message)."""
     subject = "✅ LEAPS Position Manager — Test Email"
     body = (
         "This is a test email from your LEAPS Position Manager.\n\n"
@@ -89,10 +106,11 @@ def send_test_email() -> bool:
         "You will receive alerts at this address when your positions\n"
         "trigger any of the 5-pillar exit/roll/entry signals.\n"
     )
-    return send_alert(subject, body)
+    ok, err = send_alert(subject, body)
+    return ok, err
 
 
-def send_daily_summary(positions: list[dict], market_snapshots: dict) -> bool:
+def send_daily_summary(positions: list[dict], market_snapshots: dict) -> tuple[bool, str]:
     """
     Build and send the daily portfolio summary email.
 

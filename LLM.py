@@ -1,17 +1,14 @@
 import requests
 import time
-import streamlit as st
+
+from shared.config import cfg
 
 
 def get_company_name(ticker):
     """
     Fetches the official company name from Polygon.io using the ticker.
     """
-    # Try both casings used across the two apps
-    polygon_api_key = (
-        st.secrets.get("polygon_api_key_1")
-        or st.secrets.get("POLYGON_API_KEY_1", "")
-    )
+    polygon_api_key = cfg("POLYGON_API_KEY_1") or cfg("polygon_api_key_1")
     url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={polygon_api_key}"
 
     try:
@@ -36,7 +33,7 @@ def analyze_ticker(ticker):
     """
 
     # 1. Configuration
-    api_key = st.secrets["GEMINI_API_KEY"]
+    api_key = cfg("GEMINI_API_KEY")
 
     # 2. Get the name of company using ticker through api of polygon.io
     company_name = get_company_name(ticker)

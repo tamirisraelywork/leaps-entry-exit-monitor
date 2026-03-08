@@ -3,10 +3,11 @@ import json
 import time
 import re
 import logging
-import streamlit as st
 
-POLYGON_API_KEY = st.secrets["POLYGON_API_KEY_2"]
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+from shared.config import cfg
+
+POLYGON_API_KEY = cfg("POLYGON_API_KEY_2")
+GEMINI_API_KEY = cfg("GEMINI_API_KEY")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Scraper")

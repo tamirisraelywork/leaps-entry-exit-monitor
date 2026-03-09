@@ -1409,8 +1409,13 @@ elif page == "📊 Dashboard":
                     except Exception:
                         pass
                     iv_pct_dash = (snap.get("implied_volatility") or 0) * 100 or None
+                    _mid_is_live = snap.get("_mid_is_live", False)
                     mkt = {
-                        "mid":          snap.get("mid"),
+                        # mid_display: always what we show — live bid/ask or stale lastPrice
+                        # mid (for engine): ONLY live bid/ask. Stale price → None.
+                        # This prevents stop-loss/profit alerts firing on months-old lastPrice.
+                        "mid":          snap.get("mid") if _mid_is_live else None,
+                        "mid_display":  snap.get("mid"),
                         "bid":          snap.get("bid"),
                         "ask":          snap.get("ask"),
                         "delta":        snap.get("delta"),
@@ -1418,12 +1423,27 @@ elif page == "📊 Dashboard":
                         "iv_rank":      _get_iv_rank_cached(ticker, iv_pct_dash),
                         "thesis_score": None,
                         "_mid_source":  snap.get("_mid_source", "market"),
+                        "_mid_is_live": _mid_is_live,
                     }
 
-            mid      = mkt.get("mid")
+            # ── Data quality assessment ───────────────────────────────────────
+            # Track what's missing so we can block or warn on affected pillars.
+            _mid_is_live   = mkt.get("_mid_is_live", False)
+            _mid_display   = mkt.get("mid_display")   # for display only
+            _mid_source    = mkt.get("_mid_source", "market")
+            data_gaps = []
+            if not contract:
+                data_gaps.append("❌ No contract symbol — cannot fetch option price")
+            elif polygon_error or not _mid_display:
+                data_gaps.append("❌ No option price available (fetch failed)")
+            elif not _mid_is_live:
+                data_gaps.append("⚠️ No live bid/ask — showing last traded price (stale). "
+                                 "P&L and stop-loss signals are disabled until live price is available.")
+
+            mid      = mkt.get("mid")          # None if not live — engine skips P&L pillar
             delta    = mkt.get("delta")
             dte_days = mkt.get("dte")
-            pnl      = _pnl_pct(ep, mid)
+            pnl      = _pnl_pct(ep, mid)      # None if mid is None (stale price)
 
             score, score_age = db.get_leaps_monitor_score_with_age(ticker)
 
@@ -1433,8 +1453,27 @@ elif page == "📊 Dashboard":
                 if _s is not None:
                     score, score_age = _s, 0
 
-            mkt["thesis_score"] = score
+            # Thesis score: use for evaluate() only if reasonably fresh (≤90 days).
+            # An exit recommendation based on a 4-month-old score is unreliable.
+            thesis_for_engine = score
+            if score is not None and score_age is not None and score_age > 90:
+                thesis_for_engine = None
+                data_gaps.append(f"⚠️ Thesis score is {score_age} days old — thesis exit signal disabled. "
+                                 "Re-score to re-enable.")
+
+            mkt["thesis_score"] = thesis_for_engine
             position_alerts = evaluate(pos, mkt)
+
+            # DTE is always reliable — hard stops must always show regardless of data gaps.
+            # For all other pillars: if we have data gaps that affect them, and the ONLY
+            # alerts are from pillars that can't fire reliably, don't show a HOLD label —
+            # show INCOMPLETE instead so the user knows they need to get data first.
+            _dte_only_alerts = all(
+                a.type in ("DTE_HARD_STOP", "DTE_URGENT", "DTE_REVIEW")
+                for a in position_alerts
+            )
+            _has_non_dte_gap  = any("P&L" in g or "stop-loss" in g or "price" in g.lower() or "Thesis" in g
+                                    for g in data_gaps)
 
             if position_alerts:
                 worst_alert   = max(position_alerts, key=_alert_priority)
@@ -1445,7 +1484,14 @@ elif page == "📊 Dashboard":
                 severity      = "GREEN"
                 posture_label = "HOLD"
 
+            # If no alerts fired but there are data gaps that could affect recommendations,
+            # replace HOLD with INCOMPLETE so the user knows to get data first.
+            if posture_label == "HOLD" and data_gaps and _has_non_dte_gap:
+                severity      = "GREY"
+                posture_label = "INCOMPLETE DATA"
+
             # Auto-email EXIT/ROLL signals (once per session per alert key)
+            # Only email if data was complete enough for the alert to be reliable.
             _ae = st.session_state.get("alert_email", "")
             if _ae and st.session_state.get("alert_enabled", False):
                 _emailed = st.session_state.setdefault("emailed_alerts", set())
@@ -1464,6 +1510,8 @@ elif page == "📊 Dashboard":
                             if _ok:
                                 _emailed.add(_ekey)
 
+            _SEVERITY_COLOR["GREY"] = "#6b7280"
+            _POSTURE_EMOJI["GREY"]  = "⚠️"
             color = _SEVERITY_COLOR.get(severity, "#21C55D")
             emoji = _POSTURE_EMOJI.get(severity, "🟢")
 
@@ -1471,7 +1519,7 @@ elif page == "📊 Dashboard":
             proceeds      = float(pos.get("proceeds_from_trims") or 0.0)
             qty_remaining = int(qty or 0) - qty_trimmed
 
-            # P&L breakdown
+            # P&L breakdown — unrealized only when live price is available
             _orig_cost        = (ep or 0) * int(qty or 0) * 100
             _cost_of_trimmed  = (ep or 0) * qty_trimmed * 100
             _realized_pnl     = proceeds - _cost_of_trimmed
@@ -1479,6 +1527,7 @@ elif page == "📊 Dashboard":
             _total_pnl        = (_realized_pnl + _unrealized_pnl) if _unrealized_pnl is not None else _realized_pnl
             _cost_recovery    = (proceeds / _orig_cost * 100) if _orig_cost > 0 else 0.0
             _house_money      = _cost_recovery >= 100.0
+            # mid_display already set above — use it for cost-recovery display if live unavailable
 
             with st.container(border=True):
                 h1, h2 = st.columns([5, 1])
@@ -1510,26 +1559,49 @@ elif page == "📊 Dashboard":
                         unsafe_allow_html=True,
                     )
 
+                # Data gaps warning — shown immediately under posture badge
+                if data_gaps:
+                    for _gap in data_gaps:
+                        _gap_color = "#dc2626" if _gap.startswith("❌") else "#d97706"
+                        st.markdown(
+                            f"<div style='background:{_gap_color}18;border-left:3px solid {_gap_color};"
+                            f"padding:6px 10px;border-radius:4px;font-size:0.82em;color:{_gap_color};"
+                            f"margin-bottom:4px'>{_gap}</div>",
+                            unsafe_allow_html=True,
+                        )
+
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                _mid_source = mkt.get("_mid_source", "market")
-                _mid_label  = "Current Mid" if _mid_source == "market" else "Mid (theoretical)"
+                # Use mid_display for the price metric (shows stale lastPrice with label)
+                # Use mid (engine mid, live-only) for P&L
+                _mid_source_val = mkt.get("_mid_source", "market")
+                if not _mid_is_live and _mid_display:
+                    _mid_label = "Last Trade (stale)"
+                    _mid_help  = ("No live bid/ask. This is the last traded price — it may be "
+                                  "weeks or months old. P&L and stop-loss signals are disabled "
+                                  "until a live bid/ask is available. Verify in your broker.")
+                elif _mid_source_val != "market":
+                    _mid_label = "Mid (no live mkt)"
+                    _mid_help  = "No live bid/ask — showing last available price."
+                else:
+                    _mid_label = "Current Mid"
+                    _mid_help  = None
                 m1.metric("Avg. Price",  f"${ep:.2f}"  if ep  else "N/A")
-                m2.metric(_mid_label,    f"${mid:.2f}" if mid else "N/A",
-                          help=None if _mid_source == "market" else
-                          "No live bid/ask — Black-Scholes fair value using current stock price & IV. "
-                          "Verify against your broker.")
+                m2.metric(_mid_label,    f"${_mid_display:.2f}" if _mid_display else "N/A",
+                          help=_mid_help)
                 m3.metric("Unrlzd P&L",
                           f"{pnl:+.1f}%" if pnl is not None else "N/A",
                           delta_color="normal" if pnl is None else ("normal" if pnl >= 0 else "inverse"),
-                          help="Unrealized P&L % on remaining contracts vs avg entry price")
+                          help="Unrealized P&L % vs avg entry price. Only shown when live price is available.")
                 m4.metric("Delta",    f"{delta:.2f}" if delta is not None else "N/A")
                 m5.metric("DTE",      f"{dte_days}d" if dte_days is not None else "N/A")
                 if score is not None:
                     age_label = f" ({score_age}d ago)" if score_age is not None else ""
-                    stale     = score_age is not None and score_age > 30
-                    m6.metric("Thesis Score", f"{score}/100{age_label}",
-                              delta="⚠️ stale" if stale else None,
-                              delta_color="inverse" if stale else "normal")
+                    stale_30  = score_age is not None and score_age > 30
+                    stale_90  = score_age is not None and score_age > 90
+                    m6.metric("Thesis Score", f"{score}/109{age_label}",
+                              delta="⚠️ signals disabled — re-score" if stale_90 else
+                                    ("⚠️ stale" if stale_30 else None),
+                              delta_color="inverse" if stale_30 else "normal")
                 else:
                     m6.metric("Thesis Score", "N/A")
                 with m6:

@@ -232,7 +232,8 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             pass
 
         # For illiquid options with no live bid/ask, fall back to last traded price.
-        # Never use theoretical BS price — it can differ significantly from reality.
+        # Mark it as stale — callers must NOT use this for P&L or stop-loss decisions.
+        mid_is_live = (bid > 0 and ask > 0)
         if mid is None:
             if last > 0:
                 mid = last
@@ -253,6 +254,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             "open_interest":      int(row.get("openInterest") or 0) or None,
             "_source":            "yfinance+BS",
             "_mid_source":        mid_source,
+            "_mid_is_live":       mid_is_live,
         }
 
     except Exception as e:
@@ -288,6 +290,7 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
         ask = quote.get("ask") or 0.0
         bid = quote.get("bid") or 0.0
         mid = round((ask + bid) / 2, 2) if (ask and bid) else None
+        mid_is_live = bool(ask and bid)
 
         exp_str = details.get("expiration_date", "")
         try:
@@ -311,6 +314,7 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
             "strike":             details.get("strike_price"),
             "open_interest":      data.get("open_interest"),
             "_source":            "polygon",
+            "_mid_is_live":       mid_is_live,
         }
     except Exception as e:
         return {"_error": f"Polygon: {e}"}

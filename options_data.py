@@ -23,6 +23,25 @@ _cache: dict = {}
 _cache_lock = threading.Lock()
 _CACHE_TTL = 600   # 10 minutes
 
+# ---------------------------------------------------------------------------
+# Global yfinance rate limiter — serializes ALL yfinance network calls
+# so 16 simultaneous dashboard loads don't burst Yahoo Finance.
+# Ensures ≥1.5 s between consecutive yfinance requests across all threads.
+# ---------------------------------------------------------------------------
+_yf_gate = threading.Lock()
+_yf_last_call_ts: float = 0.0
+_YF_CALL_GAP = 1.5   # seconds between yfinance network calls
+
+
+def _yf_throttle():
+    """Acquire the rate gate and wait if needed before making a yfinance call."""
+    global _yf_last_call_ts
+    with _yf_gate:
+        gap = _YF_CALL_GAP - (time.time() - _yf_last_call_ts)
+        if gap > 0:
+            time.sleep(gap)
+        _yf_last_call_ts = time.time()
+
 
 def _cache_get(key: str):
     with _cache_lock:
@@ -148,21 +167,22 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         import yfinance as yf
         t = yf.Ticker(ticker)
 
-        # Fetch available expiries — retry on rate-limit (429)
-        available = None
-        last_err  = ""
-        for _wait in (0, 3, 8):
-            if _wait:
-                time.sleep(_wait)
-            try:
-                available = t.options
-                break
-            except Exception as e:
-                last_err = str(e)
-                if not any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
-                    return {"_error": f"yfinance could not fetch option chain: {e}"}
-        if available is None:
-            return {"_error": f"yfinance rate-limited after retries: {last_err}"}
+        # Fetch available expiries — global rate gate prevents burst across threads
+        _yf_throttle()
+        try:
+            available = t.options
+        except Exception as e:
+            last_err = str(e)
+            if any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
+                # One retry after a longer wait
+                time.sleep(10)
+                try:
+                    _yf_throttle()
+                    available = t.options
+                except Exception as e2:
+                    return {"_error": f"yfinance rate-limited after retries: {e2}"}
+            else:
+                return {"_error": f"yfinance could not fetch option chain: {e}"}
         if not available:
             return {"_error": "yfinance returned no expiry dates for this ticker"}
 
@@ -171,22 +191,22 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             target_str = min(available, key=lambda d: abs((date.fromisoformat(d) - expiry).days))
         actual_expiry = date.fromisoformat(target_str)
 
-        time.sleep(0.3)  # brief pause between list fetch and chain fetch
-
-        # Fetch option chain — also retry on rate-limit
-        chain = None
-        for _wait in (0, 3, 8):
-            if _wait:
-                time.sleep(_wait)
-            try:
-                chain = t.option_chain(target_str)
-                break
-            except Exception as e:
-                last_err = str(e)
-                if not any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
-                    return {"_error": f"yfinance option_chain failed: {e}"}
-        if chain is None:
-            return {"_error": f"yfinance rate-limited after retries: {last_err}"}
+        # Fetch option chain — throttle before this call too
+        _yf_throttle()
+        try:
+            chain = t.option_chain(target_str)
+        except Exception as e:
+            last_err = str(e)
+            if any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
+                time.sleep(10)
+                try:
+                    _yf_throttle()
+                    chain = t.option_chain(target_str)
+                except Exception as e2:
+                    return {"_error": f"yfinance rate-limited after retries: {e2}"}
+            else:
+                return {"_error": f"yfinance option_chain failed: {e}"}
+        last_err = ""
 
         df = chain.calls if option_type.upper() == "C" else chain.puts
         exact = df[df["strike"] == float(strike)]
@@ -209,6 +229,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         greeks = {}
         mid_source = "market"
         try:
+            _yf_throttle()
             fi = t.fast_info
             S  = fi.last_price or fi.previous_close
             if S and iv and iv > 0.01:
@@ -340,8 +361,7 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     else:
         polygon_err = "no API key"
 
-    # --- Fall back to yfinance (small delay to avoid simultaneous burst) ---
-    time.sleep(0.5)
+    # --- Fall back to yfinance (global rate gate in _snapshot_via_yfinance) ---
     parsed = _parse_occ(contract, ticker)
     if not parsed:
         return {"_error": f"Could not parse contract symbol '{contract}'"}

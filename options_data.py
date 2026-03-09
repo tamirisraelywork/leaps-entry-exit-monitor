@@ -97,12 +97,6 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
         )
         theta = theta_raw / 365.0                         # per calendar day
 
-        # Theoretical option price (Black-Scholes)
-        if is_call:
-            price = S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
-        else:
-            price = K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
-
         # Sanity-check delta
         if not (0.001 <= abs(delta) <= 0.999):
             delta = None
@@ -112,7 +106,6 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
             "gamma": round(gamma, 6),
             "theta": round(theta, 4),
             "vega":  round(vega,  4),
-            "bs_price": round(max(price, 0.01), 2),  # theoretical fair value
         }
     except Exception:
         return {}
@@ -225,7 +218,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         raw_iv = float(row.get("impliedVolatility") or 0)
         iv = min(raw_iv, 2.0) if raw_iv > 0 else None
 
-        # Full Black-Scholes Greeks + theoretical price (delta, gamma, theta, vega, bs_price)
+        # Black-Scholes Greeks (delta, gamma, theta, vega) — computed from IV + stock price
         greeks = {}
         mid_source = "market"
         try:
@@ -238,14 +231,10 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         except Exception:
             pass
 
-        # For illiquid options with no live bid/ask, use BS theoretical price
-        # instead of stale lastPrice (which is often the user's own entry trade)
+        # For illiquid options with no live bid/ask, fall back to last traded price.
+        # Never use theoretical BS price — it can differ significantly from reality.
         if mid is None:
-            bs_price = greeks.get("bs_price")
-            if bs_price:
-                mid = bs_price
-                mid_source = "theoretical (no live market)"
-            elif last > 0:
+            if last > 0:
                 mid = last
                 mid_source = "last trade (stale)"
 

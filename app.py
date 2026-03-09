@@ -2173,34 +2173,6 @@ elif page == "🔔 Alert History":
 elif page == "⚙️ Settings":
     st.title("Settings")
 
-    # Auto-trigger fast rescore once per session when settings page first loads
-    if not st.session_state.get("_auto_rescore_done"):
-        st.session_state["_auto_rescore_done"] = True
-        _auto_master = get_eval_master_data()
-        if not _auto_master.empty:
-            _auto_tickers = _auto_master["Ticker"].tolist()
-            _auto_results = []
-            _prog = st.progress(0.0, text="Auto-rescoring all analyses with updated rules…")
-            for _i, _tk in enumerate(_auto_tickers):
-                _os, _ns, _ov, _nv = rescore_ticker_in_bq(_tk)
-                _auto_results.append({
-                    "Ticker": _tk, "Old Score": _os, "New Score": _ns,
-                    "Score Δ": _ns - _os, "Old Verdict": _ov, "New Verdict": _nv,
-                    "Changed": "✅" if (_os != _ns or _ov != _nv) else "—",
-                })
-                _prog.progress((_i + 1) / len(_auto_tickers))
-            st.session_state.rescore_results = _auto_results
-            st.cache_data.clear()
-            _prog.empty()
-            _changed_count  = sum(1 for r in _auto_results if r["Changed"] == "✅")
-            _error_count    = sum(1 for r in _auto_results if "⚠️ Error" in str(r.get("Old Verdict", "")))
-            if _changed_count:
-                st.success(f"Auto-rescored {len(_auto_tickers)} tickers — {_changed_count} updated with new scoring rules.")
-            else:
-                st.info(f"Auto-rescored {len(_auto_tickers)} tickers — all scores are already up to date.")
-            if _error_count:
-                st.warning(f"{_error_count} ticker(s) had errors — see results table below for details.")
-
     # ── Thesis Rescore ────────────────────────────────────────────────────────
     st.subheader("🔄 Rescore All Analyses")
     st.caption(

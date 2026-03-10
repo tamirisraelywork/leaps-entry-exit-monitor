@@ -1,21 +1,20 @@
 """
-Options data — Polygon.io primary, yfinance fallback.
+Options data — marketdata.app primary, yfinance fallback.
 
-get_option_snapshot() tries Polygon first. If Polygon fails (free tier,
-no access, etc.) it automatically falls back to yfinance option chains
-with Black-Scholes delta computed from IV + stock price.
+get_option_snapshot() tries marketdata.app first (requires MARKETDATA_TOKEN
+in secrets). Falls back to yfinance + Black-Scholes greeks automatically.
 
-This means the app works fully without a paid Polygon subscription.
+Add to .streamlit/secrets.toml:
+  MARKETDATA_TOKEN = "your_token_here"
 """
 
 import math
 import time
 import threading
-import requests
 from datetime import date, datetime, timedelta
 
 from shared.config import cfg
-import tradier_data
+import marketdata_app
 
 # ---------------------------------------------------------------------------
 # Module-level TTL cache — avoids re-hitting yfinance on every page reload
@@ -60,10 +59,6 @@ def _cache_set(key: str, value):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _api_key() -> str:
-    return cfg("POLYGON_API_KEY_1") or cfg("POLYGON_API_KEY_2")
-
 
 def _norm_cdf(x: float) -> float:
     """Standard normal CDF via math.erf — no scipy needed."""
@@ -263,65 +258,6 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
 
 
 # ---------------------------------------------------------------------------
-# Polygon option snapshot
-# ---------------------------------------------------------------------------
-
-def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
-    """Attempt to fetch snapshot from Polygon. Returns _error key on failure."""
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}/{contract}"
-    try:
-        resp = requests.get(url, params={"apiKey": key}, timeout=15)
-        if resp.status_code == 403:
-            return {"_error": "Polygon: options access requires upgrade"}
-        if resp.status_code == 404:
-            return {"_error": f"Polygon: contract not found ({contract})"}
-        if resp.status_code != 200:
-            return {"_error": f"Polygon: HTTP {resp.status_code}"}
-
-        body = resp.json()
-        data = body.get("results", {})
-        if not data:
-            status = body.get("status", "")
-            return {"_error": f"Polygon: empty results (status={status})"}
-
-        greeks  = data.get("greeks") or {}
-        quote   = data.get("last_quote") or {}
-        details = data.get("details") or {}
-
-        ask = quote.get("ask") or 0.0
-        bid = quote.get("bid") or 0.0
-        mid = round((ask + bid) / 2, 2) if (ask and bid) else None
-        mid_is_live = bool(ask and bid)
-
-        exp_str = details.get("expiration_date", "")
-        try:
-            expiry = date.fromisoformat(exp_str)
-            dte = max(0, (expiry - date.today()).days)
-        except Exception:
-            expiry = None
-            dte = None
-
-        return {
-            "delta":              greeks.get("delta"),
-            "gamma":              greeks.get("gamma"),
-            "theta":              greeks.get("theta"),
-            "vega":               greeks.get("vega"),
-            "implied_volatility": data.get("implied_volatility"),
-            "bid":                bid,
-            "ask":                ask,
-            "mid":                mid,
-            "expiration_date":    expiry,
-            "dte":                dte,
-            "strike":             details.get("strike_price"),
-            "open_interest":      data.get("open_interest"),
-            "_source":            "polygon",
-            "_mid_is_live":       mid_is_live,
-        }
-    except Exception as e:
-        return {"_error": f"Polygon: {e}"}
-
-
-# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
@@ -387,14 +323,12 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     """
     Fetch live option data: bid/ask/mid, Greeks (delta/gamma/theta/vega), DTE, IV.
 
-    Source priority (tries each in order, stops at first success):
-      1. Tradier   — real-time NBBO for ALL listed options (free with Tradier account)
-                     Requires TRADIER_TOKEN secret. Most reliable for illiquid LEAPS.
-      2. Polygon   — real-time snapshots (requires paid plan ≥$29/mo)
-      3. yfinance  — free but unreliable for illiquid options (may show stale lastPrice)
+    Source priority:
+      1. marketdata.app — requires MARKETDATA_TOKEN in secrets.toml
+      2. yfinance       — free fallback; unreliable for illiquid options
 
-    If delta is missing (no IV for illiquid options), falls back to computing
-    delta from the underlying stock's 30-day historical volatility.
+    If delta is missing (illiquid option, no IV), computes delta from the
+    stock's 30-day historical volatility as a proxy.
 
     Results cached 10 minutes. Errors cached 1 minute.
     """
@@ -406,27 +340,15 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     parsed = _parse_occ(contract, ticker)
     errors = {}
 
-    # --- 1. Try Tradier (real-time NBBO, best for illiquid options) ---
-    tradier_result = tradier_data.get_option_quote(ticker, contract)
-    if "_error" not in tradier_result:
-        tradier_result = _fill_missing_delta(tradier_result, ticker, parsed)
-        _cache_set(cache_key, tradier_result)
-        return tradier_result
-    errors["tradier"] = tradier_result["_error"]
+    # --- 1. Try marketdata.app ---
+    md_result = marketdata_app.get_option_quote(ticker, contract)
+    if "_error" not in md_result:
+        md_result = _fill_missing_delta(md_result, ticker, parsed)
+        _cache_set(cache_key, md_result)
+        return md_result
+    errors["marketdata.app"] = md_result["_error"]
 
-    # --- 2. Try Polygon (real-time, requires paid plan) ---
-    poly_key = _api_key()
-    if poly_key:
-        poly_result = _snapshot_via_polygon(ticker, contract, poly_key)
-        if "_error" not in poly_result:
-            poly_result = _fill_missing_delta(poly_result, ticker, parsed)
-            _cache_set(cache_key, poly_result)
-            return poly_result
-        errors["polygon"] = poly_result["_error"]
-    else:
-        errors["polygon"] = "no API key"
-
-    # --- 3. Fall back to yfinance ---
+    # --- 2. Fall back to yfinance ---
     if not parsed:
         err_result = {"_error": f"Could not parse contract symbol '{contract}'"}
         with _cache_lock:
@@ -446,7 +368,7 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
         return yf_result
     errors["yfinance"] = yf_result.get("_error", "unknown")
 
-    # All sources failed — cache briefly, surface clear error
+    # Both failed — cache briefly so we don't hammer the APIs
     err_msg = " | ".join(f"{k}: {v}" for k, v in errors.items())
     err_result = {"_error": f"All sources failed — {err_msg}"}
     with _cache_lock:
@@ -459,55 +381,9 @@ def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
     Fetch all LEAPS call contracts for a ticker with at least min_dte days
     to expiration, including their greeks.
 
-    Tries Polygon bulk endpoint first; falls back to yfinance option chain.
+    Falls back to yfinance option chain.
     """
-    # --- Try Polygon ---
-    key = _api_key()
-    if key:
-        min_date = (date.today() + timedelta(days=min_dte)).isoformat()
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}"
-        params = {
-            "contract_type":        "call",
-            "expiration_date.gte":  min_date,
-            "limit":                250,
-            "apiKey":               key,
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=20)
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                if results:
-                    chain = []
-                    for item in results:
-                        details = item.get("details") or {}
-                        greeks  = item.get("greeks") or {}
-                        quote   = item.get("last_quote") or {}
-                        exp_str = details.get("expiration_date", "")
-                        try:
-                            expiry = date.fromisoformat(exp_str)
-                            dte = (expiry - date.today()).days
-                        except Exception:
-                            continue
-                        ask = quote.get("ask") or 0.0
-                        bid = quote.get("bid") or 0.0
-                        mid = round((ask + bid) / 2, 2) if (ask and bid) else None
-                        chain.append({
-                            "contract":           details.get("ticker", ""),
-                            "strike":             details.get("strike_price"),
-                            "expiration_date":    expiry,
-                            "dte":                dte,
-                            "delta":              greeks.get("delta"),
-                            "implied_volatility": item.get("implied_volatility"),
-                            "bid":                bid,
-                            "ask":                ask,
-                            "mid":                mid,
-                            "open_interest":      item.get("open_interest"),
-                        })
-                    return chain
-        except Exception:
-            pass
-
-    # --- Fall back to yfinance ---
+    # --- yfinance ---
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
@@ -571,26 +447,7 @@ def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
 
 
 def get_stock_price(ticker: str) -> float | None:
-    """
-    Get latest stock price. Tries Polygon first, then yfinance.
-    """
-    key = _api_key()
-    if key:
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker.upper()}"
-        try:
-            resp = requests.get(url, params={"apiKey": key}, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json().get("ticker", {})
-                price = (
-                    (data.get("lastTrade") or {}).get("p")
-                    or (data.get("day") or {}).get("c")
-                    or (data.get("prevDay") or {}).get("c")
-                )
-                if price:
-                    return float(price)
-        except Exception:
-            pass
-
+    """Get latest stock price via yfinance."""
     try:
         import yfinance as yf
         fi = yf.Ticker(ticker).fast_info

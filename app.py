@@ -1316,17 +1316,13 @@ elif page == "📋 Past Analyses":
 elif page == "📊 Dashboard":
     st.title("Portfolio Dashboard")
 
-    # Warn if no real-time option data source is configured
+    # Warn if marketdata.app token is missing
     from shared.config import cfg as _cfg
-    _has_tradier = bool(_cfg("TRADIER_TOKEN"))
-    _has_polygon = bool(_cfg("POLYGON_API_KEY_1") or _cfg("POLYGON_API_KEY_2"))
-    if not _has_tradier:
+    if not _cfg("MARKETDATA_TOKEN"):
         st.warning(
-            "**⚠️ No real-time option data source configured.**  "
-            "Live bid/ask prices require **Tradier** (free) or a paid Polygon plan.  \n"
-            "**To fix:** Sign up at [developer.tradier.com](https://developer.tradier.com) "
-            "(free), get your API token, then add `TRADIER_TOKEN = \"your_token\"` "
-            "to your `.streamlit/secrets.toml`. Until then, prices may be stale.",
+            "**⚠️ MARKETDATA_TOKEN not configured.** "
+            "Add it to `.streamlit/secrets.toml` to enable option price feeds. "
+            "Falling back to yfinance (may be stale for illiquid options).",
             icon="⚠️",
         )
 

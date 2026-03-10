@@ -1316,13 +1316,25 @@ elif page == "📋 Past Analyses":
 elif page == "📊 Dashboard":
     st.title("Portfolio Dashboard")
 
-    # Warn if marketdata.app token is missing
-    from shared.config import cfg as _cfg
-    if not _cfg("MARKETDATA_TOKEN"):
+    # Check marketdata.app token — read directly from st.secrets, no abstraction layer
+    try:
+        _md_token = st.secrets["MARKETDATA_TOKEN"]
+        _md_token_ok = bool(_md_token and str(_md_token).strip())
+    except Exception:
+        _md_token = None
+        _md_token_ok = False
+
+    if not _md_token_ok:
+        _secret_keys = []
+        try:
+            _secret_keys = list(st.secrets.keys())
+        except Exception:
+            pass
         st.warning(
-            "**⚠️ MARKETDATA_TOKEN not configured.** "
-            "Add it to `.streamlit/secrets.toml` to enable option price feeds. "
-            "Falling back to yfinance (may be stale for illiquid options).",
+            f"**⚠️ MARKETDATA_TOKEN not found in secrets.**  \n"
+            f"Keys currently in secrets.toml: `{_secret_keys}`  \n"
+            f"Add `MARKETDATA_TOKEN = \"your_token\"` at the **top level** "
+            f"(not under any `[section]`) of `.streamlit/secrets.toml`, then restart.",
             icon="⚠️",
         )
 

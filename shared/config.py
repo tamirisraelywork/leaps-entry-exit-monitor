@@ -6,7 +6,7 @@ When running as a standalone Python service (monitor_engine), reads from os.envi
 
 Usage:
     from shared.config import cfg
-    api_key = cfg("POLYGON_API_KEY_1")
+    api_key = cfg("MARKETDATA_TOKEN")
     service_json = cfg("SERVICE_ACCOUNT_JSON")
 """
 
@@ -16,44 +16,30 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_st = None
-_st_tried = False
-
-
-def _get_streamlit():
-    global _st, _st_tried
-    if _st_tried:
-        return _st
-    _st_tried = True
-    try:
-        import streamlit as st
-        # Verify st.secrets is accessible (raises if not in a Streamlit context)
-        _ = st.secrets
-        _st = st
-    except Exception:
-        _st = None
-    return _st
-
 
 def cfg(key: str, default: str = "") -> str:
     """
     Read a secret/config value.
 
     Priority order:
-      1. st.secrets[key]     — when running inside Streamlit
-      2. os.environ[key]     — when running as a standalone service
-      3. default             — fallback
+      1. st.secrets[key]  — when running inside Streamlit (tried on every call,
+                            never cached, so background threads can't poison it)
+      2. os.environ[key]  — when running as a standalone service
+      3. default          — fallback
     """
-    st = _get_streamlit()
-    if st is not None:
-        try:
-            val = st.secrets[key]
-            # st.secrets values may be AttrDict (nested toml); convert to str if so
-            if hasattr(val, "to_dict"):
-                return dict(val)  # type: ignore[return-value]
-            return str(val) if not isinstance(val, dict) else val  # type: ignore[return-value]
-        except (KeyError, Exception):
-            pass
+    # Always try st.secrets fresh — do NOT cache the result.
+    # Caching caused background threads (APScheduler) to poison the singleton:
+    # if a thread called cfg() before Streamlit was ready, _st=None got locked
+    # in and st.secrets was never used again, even inside the UI.
+    try:
+        import streamlit as st
+        val = st.secrets[key]
+        if hasattr(val, "to_dict"):
+            return dict(val)  # type: ignore[return-value]
+        return str(val) if not isinstance(val, dict) else val  # type: ignore[return-value]
+    except Exception:
+        pass
+
     return os.environ.get(key, default)
 
 
@@ -62,20 +48,18 @@ def cfg_dict(key: str) -> dict:
     Read a secret that is a TOML table / JSON dict (e.g. SERVICE_ACCOUNT_JSON).
     Returns a plain dict.
     """
-    st = _get_streamlit()
-    if st is not None:
-        try:
-            val = st.secrets[key]
-            if hasattr(val, "to_dict"):
-                return dict(val)
-            if isinstance(val, dict):
-                return val
-            # Might be a JSON string
-            import json
-            return json.loads(str(val))
-        except Exception:
-            pass
-    # Fall back to env var (expect JSON string)
+    try:
+        import streamlit as st
+        val = st.secrets[key]
+        if hasattr(val, "to_dict"):
+            return dict(val)
+        if isinstance(val, dict):
+            return val
+        import json
+        return json.loads(str(val))
+    except Exception:
+        pass
+
     raw = os.environ.get(key, "")
     if raw:
         import json

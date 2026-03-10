@@ -15,6 +15,7 @@ import requests
 from datetime import date, datetime, timedelta
 
 from shared.config import cfg
+import tradier_data
 
 # ---------------------------------------------------------------------------
 # Module-level TTL cache — avoids re-hitting yfinance on every page reload
@@ -97,8 +98,8 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
         )
         theta = theta_raw / 365.0                         # per calendar day
 
-        # Sanity-check delta
-        if not (0.001 <= abs(delta) <= 0.999):
+        # Sanity-check delta — 0.0001 lower bound to preserve deeply OTM LEAPS deltas
+        if not (0.0001 <= abs(delta) <= 0.9999):
             delta = None
 
         return {
@@ -324,40 +325,113 @@ def _snapshot_via_polygon(ticker: str, contract: str, key: str) -> dict:
 # Public interface
 # ---------------------------------------------------------------------------
 
+def _historical_vol(ticker: str, days: int = 30) -> float | None:
+    """
+    Compute annualized historical volatility from the last N trading days.
+    Used as an IV proxy for delta calculation when option IV is unavailable.
+    """
+    try:
+        import yfinance as yf
+        import math as _math
+        _yf_throttle()
+        hist = yf.Ticker(ticker).history(period=f"{days + 10}d")
+        if len(hist) < 5:
+            return None
+        closes = hist["Close"].dropna()
+        returns = [_math.log(closes.iloc[i] / closes.iloc[i - 1])
+                   for i in range(1, min(days + 1, len(closes)))]
+        if len(returns) < 5:
+            return None
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+        return (_math.sqrt(variance) * _math.sqrt(252))
+    except Exception:
+        return None
+
+
+def _fill_missing_delta(result: dict, ticker: str, parsed: dict | None) -> dict:
+    """
+    If delta is missing (illiquid option, no IV), compute it using the stock's
+    historical volatility as an IV proxy. Marks result as 'estimated'.
+    """
+    if result.get("delta") is not None:
+        return result
+    if not parsed:
+        return result
+    try:
+        import yfinance as yf
+        _yf_throttle()
+        S = yf.Ticker(ticker).fast_info.last_price
+        if not S:
+            return result
+        expiry = parsed["expiry"]
+        strike = parsed["strike"]
+        opt_type = parsed["option_type"]
+        T = max((expiry - date.today()).days, 1) / 365.0
+        hv = _historical_vol(ticker)
+        if not hv:
+            return result
+        greeks = _bs_greeks(float(S), float(strike), T, 0.045, hv, opt_type)
+        if greeks.get("delta") is not None:
+            result["delta"] = greeks["delta"]
+            result["gamma"] = greeks.get("gamma")
+            result["theta"] = greeks.get("theta")
+            result["vega"]  = greeks.get("vega")
+            result["_delta_source"] = "historical_vol_proxy"
+    except Exception:
+        pass
+    return result
+
+
 def get_option_snapshot(ticker: str, contract: str) -> dict:
     """
     Fetch live option data: bid/ask/mid, Greeks (delta/gamma/theta/vega), DTE, IV.
 
-    Tries Polygon first (if API key present). Falls back to yfinance + Black-Scholes
-    automatically — full Greeks available with no paid subscription.
+    Source priority (tries each in order, stops at first success):
+      1. Tradier   — real-time NBBO for ALL listed options (free with Tradier account)
+                     Requires TRADIER_TOKEN secret. Most reliable for illiquid LEAPS.
+      2. Polygon   — real-time snapshots (requires paid plan ≥$29/mo)
+      3. yfinance  — free but unreliable for illiquid options (may show stale lastPrice)
 
-    Results cached for 10 minutes to avoid rate-limiting when the dashboard
-    loads multiple positions in quick succession.
+    If delta is missing (no IV for illiquid options), falls back to computing
+    delta from the underlying stock's 30-day historical volatility.
 
-    Returns a dict. Check '_error' key for failures; '_source' key
-    indicates where data came from ('polygon' or 'yfinance+BS').
+    Results cached 10 minutes. Errors cached 1 minute.
     """
     cache_key = f"{ticker}::{contract}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    key = _api_key()
-
-    # --- Try Polygon ---
-    if key:
-        result = _snapshot_via_polygon(ticker, contract, key)
-        if "_error" not in result:
-            _cache_set(cache_key, result)
-            return result
-        polygon_err = result["_error"]
-    else:
-        polygon_err = "no API key"
-
-    # --- Fall back to yfinance (global rate gate in _snapshot_via_yfinance) ---
     parsed = _parse_occ(contract, ticker)
+    errors = {}
+
+    # --- 1. Try Tradier (real-time NBBO, best for illiquid options) ---
+    tradier_result = tradier_data.get_option_quote(ticker, contract)
+    if "_error" not in tradier_result:
+        tradier_result = _fill_missing_delta(tradier_result, ticker, parsed)
+        _cache_set(cache_key, tradier_result)
+        return tradier_result
+    errors["tradier"] = tradier_result["_error"]
+
+    # --- 2. Try Polygon (real-time, requires paid plan) ---
+    poly_key = _api_key()
+    if poly_key:
+        poly_result = _snapshot_via_polygon(ticker, contract, poly_key)
+        if "_error" not in poly_result:
+            poly_result = _fill_missing_delta(poly_result, ticker, parsed)
+            _cache_set(cache_key, poly_result)
+            return poly_result
+        errors["polygon"] = poly_result["_error"]
+    else:
+        errors["polygon"] = "no API key"
+
+    # --- 3. Fall back to yfinance ---
     if not parsed:
-        return {"_error": f"Could not parse contract symbol '{contract}'"}
+        err_result = {"_error": f"Could not parse contract symbol '{contract}'"}
+        with _cache_lock:
+            _cache[cache_key] = (time.time() - _CACHE_TTL + 60, err_result)
+        return err_result
 
     yf_result = _snapshot_via_yfinance(
         ticker,
@@ -367,15 +441,16 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
     )
 
     if "_error" not in yf_result:
+        yf_result = _fill_missing_delta(yf_result, ticker, parsed)
         _cache_set(cache_key, yf_result)
         return yf_result
+    errors["yfinance"] = yf_result.get("_error", "unknown")
 
-    # Both failed — cache the error briefly (1 min) so we don't keep hammering
-    err_result = {
-        "_error": f"All sources failed — Polygon: {polygon_err} | yfinance: {yf_result.get('_error', 'unknown')}"
-    }
+    # All sources failed — cache briefly, surface clear error
+    err_msg = " | ".join(f"{k}: {v}" for k, v in errors.items())
+    err_result = {"_error": f"All sources failed — {err_msg}"}
     with _cache_lock:
-        _cache[cache_key] = (time.time() - _CACHE_TTL + 60, err_result)  # expire in 1 min
+        _cache[cache_key] = (time.time() - _CACHE_TTL + 60, err_result)
     return err_result
 
 

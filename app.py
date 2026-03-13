@@ -1095,14 +1095,19 @@ elif page == "📋 Past Analyses":
             }
 
             # ── Bulk action bar — reads checkbox state from previous render ──────
-            _eligible_tickers = [
-                row["Ticker"] for _, row in df.iterrows()
+            # Key uses row_num to avoid duplicates when same ticker appears twice.
+            _eligible_rows = [
+                (rn, row["Ticker"])
+                for rn, row in df.iterrows()
                 if _pos_status.get(row["Ticker"].upper()) not in ("ACTIVE", "WATCHLIST")
             ]
-            _selected_now = [
-                t for t in _eligible_tickers
-                if st.session_state.get(f"chk_{t}", False)
-            ]
+            # De-duplicate: if same ticker selected from multiple rows, count once
+            _selected_tickers_set = {}
+            for _rn, _t in _eligible_rows:
+                if st.session_state.get(f"chk_{_rn}_{_t}", False):
+                    _selected_tickers_set[_t.upper()] = _t  # latest wins; deduped by ticker
+            _selected_now = list(_selected_tickers_set.values())
+
             if _selected_now:
                 _ba1, _ba2, _ba3 = st.columns([3, 2.5, 1.2])
                 _ba1.markdown(f"**{len(_selected_now)} selected**")
@@ -1130,13 +1135,14 @@ elif page == "📋 Past Analyses":
                             "mode":               "WATCHLIST",
                             "notes":              "Added from Past Analyses (bulk).",
                         })
-                        st.session_state.pop(f"chk_{_bt}", None)
                         _added += 1
+                    for _rn, _t in _eligible_rows:
+                        st.session_state.pop(f"chk_{_rn}_{_t}", None)
                     st.toast(f"✅ Added {_added} tickers to watchlist!")
                     st.rerun()
                 if _ba3.button("✗ Clear", key="bulk_wl_clear"):
-                    for _bt in _eligible_tickers:
-                        st.session_state.pop(f"chk_{_bt}", None)
+                    for _rn, _t in _eligible_rows:
+                        st.session_state.pop(f"chk_{_rn}_{_t}", None)
                     st.rerun()
 
             hdr = st.columns([0.5, 2.8, 1.8, 1.2, 2.2, 1.4, 1.0, 0.8])
@@ -1154,7 +1160,7 @@ elif page == "📋 Past Analyses":
                 rc         = st.columns([0.5, 2.8, 1.8, 1.2, 2.2, 1.4, 1.0, 0.8])
                 _already_tracked = cur_status in ("ACTIVE", "WATCHLIST")
                 rc[0].checkbox(
-                    "", key=f"chk_{ticker}",
+                    "", key=f"chk_{row_num}_{ticker}",
                     disabled=_already_tracked,
                     help=None if not _already_tracked else f"{ticker} is already in {cur_status.lower()}",
                 )

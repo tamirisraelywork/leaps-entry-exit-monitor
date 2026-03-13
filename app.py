@@ -3029,19 +3029,48 @@ elif page == "⚙️ Settings":
     if _email_btn_c2.button("📊 Send Daily Summary Now", help="Send today's portfolio + watchlist summary email immediately (same as the 5 PM scheduled email)"):
         with st.spinner("Building summary and sending — this may take 30–60 seconds..."):
             try:
+                from datetime import date as _date_cls
                 _sum_positions = db.get_positions()
                 _sum_snapshots = {}
                 for _sp in _sum_positions:
                     if _sp.get("mode") == "ACTIVE":
                         try:
-                            _snap = options_data.get_option_snapshot(_sp.get("ticker",""), _sp.get("contract",""))
-                            _sum_snapshots[str(_sp["id"])] = {
-                                "mid":          _snap.get("mid"),
-                                "delta":        _snap.get("delta"),
-                                "dte":          _snap.get("dte"),
-                                "iv_rank":      None,
-                                "thesis_score": db.get_leaps_monitor_score(_sp.get("ticker","")),
-                            } if _snap and "_error" not in _snap else {}
+                            _tk  = _sp.get("ticker", "")
+                            _con = _sp.get("contract", "") or ""
+                            # Construct OCC from position fields if contract is missing
+                            if not _con:
+                                _sk  = _sp.get("strike")
+                                _ex  = _sp.get("expiration_date")
+                                if _sk and _ex:
+                                    try:
+                                        _ex_d = _ex if hasattr(_ex, "strftime") else _date_cls.fromisoformat(str(_ex))
+                                        _con  = options_data.to_occ(_tk, _ex_d, "C", float(_sk))
+                                    except Exception:
+                                        pass
+                            _snap = options_data.get_option_snapshot(_tk, _con) if _con else {}
+                            _dte  = _snap.get("dte") if _snap and "_error" not in _snap else None
+                            # DTE fallback from stored expiration_date
+                            if _dte is None:
+                                _ex = _sp.get("expiration_date")
+                                if _ex:
+                                    try:
+                                        _ex_d = _ex if hasattr(_ex, "toordinal") else _date_cls.fromisoformat(str(_ex))
+                                        _dte  = max(0, (_ex_d - _date_cls.today()).days)
+                                    except Exception:
+                                        pass
+                            if _snap and "_error" not in _snap:
+                                _sum_snapshots[str(_sp["id"])] = {
+                                    "mid":          _snap.get("mid"),
+                                    "delta":        _snap.get("delta"),
+                                    "dte":          _snap.get("dte") or _dte,
+                                    "iv_rank":      None,
+                                    "thesis_score": db.get_leaps_monitor_score(_tk),
+                                }
+                            else:
+                                _sum_snapshots[str(_sp["id"])] = {
+                                    "dte":          _dte,
+                                    "thesis_score": db.get_leaps_monitor_score(_tk),
+                                }
                         except Exception:
                             _sum_snapshots[str(_sp["id"])] = {}
 

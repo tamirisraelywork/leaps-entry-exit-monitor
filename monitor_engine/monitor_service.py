@@ -62,15 +62,41 @@ def _fetch_market_data(position: dict) -> dict:
     earnings_tone_delta, news_sentiment_score.
     Missing values are None (handled gracefully by exit_engine).
     """
+    from datetime import date as _date
     ticker   = position.get("ticker", "")
-    contract = position.get("contract", "")
+    contract = position.get("contract", "") or ""
+
+    # If contract field is empty, try to construct OCC symbol from stored fields
+    if not contract:
+        _strike = position.get("strike")
+        _exp    = position.get("expiration_date")
+        if _strike and _exp:
+            try:
+                _exp_d = _exp if hasattr(_exp, "strftime") else _date.fromisoformat(str(_exp))
+                contract = options_data.to_occ(ticker, _exp_d, "C", float(_strike))
+                logger.debug(f"Constructed OCC contract for {ticker}: {contract}")
+            except Exception as e:
+                logger.warning(f"Could not construct OCC for {ticker}: {e}")
 
     snapshot = {}
     if contract:
         try:
             snapshot = options_data.get_option_snapshot(ticker, contract) or {}
+            if "_error" in snapshot:
+                logger.warning(f"Option snapshot error for {ticker} ({contract}): {snapshot['_error']}")
+                snapshot = {}
         except Exception as e:
             logger.warning(f"Option snapshot failed for {ticker}: {e}")
+
+    # Always compute DTE from expiration_date if snapshot didn't provide it
+    if snapshot.get("dte") is None:
+        _exp = position.get("expiration_date")
+        if _exp:
+            try:
+                _exp_d = _exp if hasattr(_exp, "toordinal") else _date.fromisoformat(str(_exp))
+                snapshot["dte"] = max(0, (_exp_d - _date.today()).days)
+            except Exception:
+                pass
 
     # IV Rank (optional)
     iv_rank = None

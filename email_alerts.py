@@ -159,6 +159,17 @@ def send_daily_summary(
         score       = mkt.get("thesis_score")
         entry_price = pos.get("entry_price")
 
+        # DTE fallback — compute from stored expiration_date if snapshot missing
+        if dte is None:
+            _exp = pos.get("expiration_date")
+            if _exp:
+                try:
+                    from datetime import date as _d
+                    _exp_obj = _exp if hasattr(_exp, "toordinal") else _d.fromisoformat(str(_exp))
+                    dte = max(0, (_exp_obj - _d.today()).days)
+                except Exception:
+                    pass
+
         pnl_pct = None
         if entry_price and mid and entry_price > 0:
             pnl_pct = round((mid - entry_price) / entry_price * 100, 1)

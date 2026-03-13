@@ -1089,25 +1089,75 @@ elif page == "📋 Past Analyses":
         if df.empty:
             st.info("No analyses match the current filters.")
         else:
-            hdr = st.columns([0.6, 2.8, 1.8, 1.2, 2.2, 1.4, 1.4, 0.8])
-            for txt, c in zip(
-                ["**#**", "**Ticker**", "**Date**", "**Score**", "**Verdict**", "", "", ""],
-                hdr,
-            ):
-                c.write(txt)
-            st.divider()
-
             _STATUS_BADGE = {
                 "ACTIVE":    '<span style="background:#166534;color:#fff;padding:1px 6px;border-radius:4px;font-size:0.75em">📊 Portfolio</span>',
                 "WATCHLIST": '<span style="background:#1e3a5f;color:#fff;padding:1px 6px;border-radius:4px;font-size:0.75em">📌 Watchlist</span>',
             }
 
+            # ── Bulk action bar — reads checkbox state from previous render ──────
+            _eligible_tickers = [
+                row["Ticker"] for _, row in df.iterrows()
+                if _pos_status.get(row["Ticker"].upper()) not in ("ACTIVE", "WATCHLIST")
+            ]
+            _selected_now = [
+                t for t in _eligible_tickers
+                if st.session_state.get(f"chk_{t}", False)
+            ]
+            if _selected_now:
+                _ba1, _ba2, _ba3 = st.columns([3, 2.5, 1.2])
+                _ba1.markdown(f"**{len(_selected_now)} selected**")
+                if _ba2.button(
+                    f"📌 Add {len(_selected_now)} to Watchlist",
+                    type="primary", key="bulk_wl_add",
+                ):
+                    _added = 0
+                    for _bt in _selected_now:
+                        _bscore = db.get_leaps_monitor_score(_bt)
+                        db.save_position({
+                            "ticker":             _bt,
+                            "contract":           "",
+                            "option_type":        "CALL",
+                            "strike":             None,
+                            "expiration_date":    None,
+                            "entry_date":         None,
+                            "entry_price":        None,
+                            "quantity":           None,
+                            "entry_delta":        None,
+                            "entry_iv_rank":      None,
+                            "entry_thesis_score": _bscore,
+                            "position_type":      "WATCHLIST",
+                            "target_return":      "5-10x",
+                            "mode":               "WATCHLIST",
+                            "notes":              "Added from Past Analyses (bulk).",
+                        })
+                        st.session_state.pop(f"chk_{_bt}", None)
+                        _added += 1
+                    st.toast(f"✅ Added {_added} tickers to watchlist!")
+                    st.rerun()
+                if _ba3.button("✗ Clear", key="bulk_wl_clear"):
+                    for _bt in _eligible_tickers:
+                        st.session_state.pop(f"chk_{_bt}", None)
+                    st.rerun()
+
+            hdr = st.columns([0.5, 2.8, 1.8, 1.2, 2.2, 1.4, 1.0, 0.8])
+            for txt, c in zip(
+                ["", "**Ticker**", "**Date**", "**Score**", "**Verdict**", "", "", ""],
+                hdr,
+            ):
+                c.write(txt)
+            st.divider()
+
             for row_num, row in df.iterrows():
                 ticker     = row["Ticker"]
                 vc         = _verdict_color(row["Verdict"])
                 cur_status = _pos_status.get(ticker.upper(), "")
-                rc         = st.columns([0.6, 2.8, 1.8, 1.2, 2.2, 1.4, 1.4, 0.8])
-                rc[0].write(row_num + 1)
+                rc         = st.columns([0.5, 2.8, 1.8, 1.2, 2.2, 1.4, 1.0, 0.8])
+                _already_tracked = cur_status in ("ACTIVE", "WATCHLIST")
+                rc[0].checkbox(
+                    "", key=f"chk_{ticker}",
+                    disabled=_already_tracked,
+                    help=None if not _already_tracked else f"{ticker} is already in {cur_status.lower()}",
+                )
                 _badge = _STATUS_BADGE.get(cur_status, "")
                 rc[1].markdown(f"**{ticker}** {_badge}", unsafe_allow_html=True)
                 rc[2].write(str(row.get("date", "N/A")))

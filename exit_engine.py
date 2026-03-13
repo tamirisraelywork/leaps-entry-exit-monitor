@@ -1376,10 +1376,15 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
     stock_data: output of technical.get_price_and_range()
     iv_rank:    float (0-100) or None
     """
-    ticker       = position.get("ticker", "?")
-    weekly_rsi   = stock_data.get("weekly_rsi")
-    pct_from_low = stock_data.get("pct_from_low")
-    price        = stock_data.get("price")
+    ticker            = position.get("ticker", "?")
+    weekly_rsi        = stock_data.get("weekly_rsi")
+    pct_from_low      = stock_data.get("pct_from_low")
+    price             = stock_data.get("price")
+    above_ma50        = stock_data.get("above_ma50")
+    above_ma200       = stock_data.get("above_ma200")
+    ma50_above_ma200  = stock_data.get("ma50_above_ma200")
+    ma_50             = stock_data.get("ma_50")
+    ma_200            = stock_data.get("ma_200")
 
     score = 0
     reasons = []
@@ -1392,6 +1397,9 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
         elif weekly_rsi < 40:
             score += 20
             reasons.append(f"Weekly RSI = {weekly_rsi:.1f} (approaching oversold)")
+        elif weekly_rsi < 50:
+            score += 5
+            reasons.append(f"Weekly RSI = {weekly_rsi:.1f} (neutral — no RSI tailwind yet)")
 
     # IV Rank signal — the most important timing factor for option buyers
     if iv_rank is not None:
@@ -1412,10 +1420,47 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
     if pct_from_low is not None:
         if pct_from_low < 0.15:
             score += 30
-            reasons.append(f"Stock is near 52-week low ({pct_from_low*100:.0f}% from low)")
+            reasons.append(f"Stock near 52-week low ({pct_from_low*100:.0f}% from low) — maximum asymmetry")
         elif pct_from_low < 0.30:
             score += 15
-            reasons.append(f"Stock is in lower third of 52-week range ({pct_from_low*100:.0f}% from low)")
+            reasons.append(f"Stock in lower third of 52-week range ({pct_from_low*100:.0f}% from low)")
+        elif pct_from_low > 0.80:
+            score -= 10
+            reasons.append(f"Stock near 52-week high ({pct_from_low*100:.0f}% from low) — limited upside room")
+
+    # Trend structure signal (MA50 / MA200)
+    # For LEAPS, the ideal scenario is beaten-down stock starting to recover.
+    # We reward early recovery (price reclaims MA50) and penalise unconfirmed downtrends.
+    if above_ma50 is not None and above_ma200 is not None:
+        if above_ma200 and above_ma50 and ma50_above_ma200:
+            # Clean uptrend with pullback — highest conviction entry
+            score += 15
+            reasons.append(
+                f"Uptrend intact (price > MA50 ${ma_50:.2f} > MA200 ${ma_200:.2f}) — "
+                "buying into strength with trend behind you"
+            )
+        elif above_ma50 and not above_ma200:
+            # Price reclaimed MA50 but still below MA200 — early recovery signal
+            score += 10
+            reasons.append(
+                f"Early recovery: price crossed above MA50 (${ma_50:.2f}) "
+                f"but still below MA200 (${ma_200:.2f}) — watch for MA200 reclaim"
+            )
+        elif not above_ma50 and not above_ma200:
+            if weekly_rsi is not None and weekly_rsi < 35:
+                # Downtrend but deeply oversold — high-risk / high-reward entry
+                score += 5
+                reasons.append(
+                    f"Price below MA50 & MA200 — downtrend, but RSI oversold "
+                    "suggests capitulation may be near"
+                )
+            else:
+                # Pure downtrend, no oversold cushion — reduce score
+                score -= 10
+                reasons.append(
+                    f"Price below MA50 (${ma_50:.2f}) & MA200 (${ma_200:.2f}) "
+                    "— downtrend not yet exhausted; wait for recovery signal"
+                )
 
     if score < 40:
         # Still fire if IV is at floor — cheap options is a standalone signal
@@ -1485,5 +1530,6 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
                    + (f"  IV Rank {iv_rank:.0f}%" if iv_rank is not None else ""),
         body     = body,
         context  = {"entry_score": score, "weekly_rsi": weekly_rsi,
-                    "iv_rank": iv_rank, "pct_from_low": pct_from_low},
+                    "iv_rank": iv_rank, "pct_from_low": pct_from_low,
+                    "above_ma50": above_ma50, "above_ma200": above_ma200},
     )

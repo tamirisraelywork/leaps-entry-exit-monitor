@@ -34,26 +34,47 @@ def get_weekly_rsi(ticker: str, period: int = 14) -> float | None:
 
 def get_price_and_range(ticker: str) -> dict:
     """
-    Return current price, 52-week low, 52-week high, and how far (0-1)
-    the current price sits within the 52-week range.
-    0.0 = at the 52-week low, 1.0 = at the 52-week high.
+    Return current price, 52-week low/high, range position, and MA50/MA200
+    trend data — all used for entry signal scoring.
+
+    pct_from_low:  0.0 = at 52-week low, 1.0 = at 52-week high
+    above_ma50:    True if price > 50-day MA (short-term trend)
+    above_ma200:   True if price > 200-day MA (long-term trend)
+    ma50_above_ma200: True if MA50 > MA200 (golden-cross structure)
     """
     result = {
-        "price":          None,
-        "low_52w":        None,
-        "high_52w":       None,
-        "pct_from_low":   None,   # 0.0 = at low, 1.0 = at high
+        "price":            None,
+        "low_52w":          None,
+        "high_52w":         None,
+        "pct_from_low":     None,   # 0.0 = at low, 1.0 = at high
+        "ma_50":            None,
+        "ma_200":           None,
+        "above_ma50":       None,
+        "above_ma200":      None,
+        "ma50_above_ma200": None,
     }
     try:
-        info = yf.Ticker(ticker).info
+        info   = yf.Ticker(ticker).info
         price  = info.get("currentPrice") or info.get("regularMarketPrice")
         low52  = info.get("fiftyTwoWeekLow")
         high52 = info.get("fiftyTwoWeekHigh")
+        ma50   = info.get("fiftyDayAverage")
+        ma200  = info.get("twoHundredDayAverage")
+
         result["price"]   = float(price)  if price  else None
         result["low_52w"] = float(low52)  if low52  else None
         result["high_52w"]= float(high52) if high52 else None
+        result["ma_50"]   = float(ma50)   if ma50   else None
+        result["ma_200"]  = float(ma200)  if ma200  else None
+
         if price and low52 and high52 and (high52 - low52) > 0:
             result["pct_from_low"] = round((price - low52) / (high52 - low52), 3)
+        if price and ma50:
+            result["above_ma50"]  = float(price) > float(ma50)
+        if price and ma200:
+            result["above_ma200"] = float(price) > float(ma200)
+        if ma50 and ma200:
+            result["ma50_above_ma200"] = float(ma50) > float(ma200)
     except Exception:
         pass
     return result

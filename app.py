@@ -2919,7 +2919,7 @@ elif page == "⚙️ Settings":
         st.warning("Gmail not configured. Add **GMAIL_SENDER** and **GMAIL_APP_PASSWORD** to Streamlit Cloud secrets.")
 
     _email_btn_c1, _email_btn_c2 = st.columns(2)
-    if _email_btn_c1.button("✉️ Send Test Email"):
+    if _email_btn_c1.button("✉️ Send Test Email", key="send_test_email_monitor"):
         with st.spinner("Sending..."):
             ok, err = email_alerts.send_test_email()
         if ok:
@@ -3005,7 +3005,7 @@ elif page == "⚙️ Settings":
             index=trigger_opts.index(st.session_state.alert_trigger),
             disabled=not st.session_state.alert_enabled,
         )
-        if st.button("✉️ Send Test Email", disabled=not st.session_state.alert_enabled):
+        if st.button("✉️ Send Test Email", key="send_test_email_evaluator", disabled=not st.session_state.alert_enabled):
             ok, err = send_alert_email(
                 st.session_state.alert_email,
                 "LEAPS Command Center — Test Alert",

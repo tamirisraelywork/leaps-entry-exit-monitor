@@ -1089,9 +1089,9 @@ elif page == "📋 Past Analyses":
         if df.empty:
             st.info("No analyses match the current filters.")
         else:
-            hdr = st.columns([1, 3.5, 2.2, 1.5, 2, 1, 1])
+            hdr = st.columns([0.6, 2.8, 1.8, 1.2, 2.2, 1.4, 1.4, 0.8])
             for txt, c in zip(
-                ["**#**","**Ticker**","**Date**","**Score**","**Verdict**","",""],
+                ["**#**", "**Ticker**", "**Date**", "**Score**", "**Verdict**", "", "", ""],
                 hdr,
             ):
                 c.write(txt)
@@ -1103,11 +1103,12 @@ elif page == "📋 Past Analyses":
             }
 
             for row_num, row in df.iterrows():
-                ticker = row["Ticker"]
-                vc     = _verdict_color(row["Verdict"])
-                rc     = st.columns([1, 3.5, 2.2, 1.5, 2, 1, 1])
+                ticker     = row["Ticker"]
+                vc         = _verdict_color(row["Verdict"])
+                cur_status = _pos_status.get(ticker.upper(), "")
+                rc         = st.columns([0.6, 2.8, 1.8, 1.2, 2.2, 1.4, 1.4, 0.8])
                 rc[0].write(row_num + 1)
-                _badge = _STATUS_BADGE.get(_pos_status.get(ticker.upper(), ""), "")
+                _badge = _STATUS_BADGE.get(cur_status, "")
                 rc[1].markdown(f"**{ticker}** {_badge}", unsafe_allow_html=True)
                 rc[2].write(str(row.get("date", "N/A")))
                 rc[3].write(str(row["Score"]))
@@ -1115,11 +1116,54 @@ elif page == "📋 Past Analyses":
                     f'<span style="color:{vc};font-weight:700">{row["Verdict"]}</span>',
                     unsafe_allow_html=True,
                 )
-                if rc[5].button("👁️", key=f"view_{row_num}_{ticker}"):
+
+                # Watchlist / Portfolio toggle button — one click, no detail view needed
+                if cur_status == "WATCHLIST":
+                    if rc[5].button("📌 Watching", key=f"wl_{row_num}_{ticker}",
+                                    help="Click to remove from watchlist"):
+                        _p = next((p for p in _all_pos if p.get("ticker","").upper() == ticker.upper()), None)
+                        if _p:
+                            db.delete_position(str(_p["id"]))
+                            _pos_status.pop(ticker.upper(), None)
+                            st.toast(f"Removed {ticker} from watchlist.")
+                            st.rerun()
+                elif cur_status == "ACTIVE":
+                    rc[5].markdown(
+                        '<span style="color:#16a34a;font-size:0.85em">📊 Portfolio</span>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    if rc[5].button("📌 Watch", key=f"wl_{row_num}_{ticker}",
+                                    help="Add to watchlist — monitoring agent will track entry signals"):
+                        _score = db.get_leaps_monitor_score(ticker)
+                        db.save_position({
+                            "ticker":             ticker,
+                            "contract":           "",
+                            "option_type":        "CALL",
+                            "strike":             None,
+                            "expiration_date":    None,
+                            "entry_date":         None,
+                            "entry_price":        None,
+                            "quantity":           None,
+                            "entry_delta":        None,
+                            "entry_iv_rank":      None,
+                            "entry_thesis_score": _score,
+                            "position_type":      "WATCHLIST",
+                            "target_return":      "5-10x",
+                            "mode":               "WATCHLIST",
+                            "notes":              "Added from Past Analyses.",
+                        })
+                        st.toast(f"✅ {ticker} added to watchlist! Entry signals will be monitored.")
+                        st.rerun()
+
+                if rc[6].button("📊 Buy", key=f"buy_{row_num}_{ticker}",
+                                help="Log as already purchased → adds to active portfolio"):
                     st.session_state.past_selected = ticker
                     st.session_state.past_view     = "detail"
+                    st.session_state["detail_portfolio_form"] = ticker
                     st.rerun()
-                if rc[6].button("🗑️", key=f"del_{row_num}_{ticker}"):
+
+                if rc[7].button("🗑️", key=f"del_{row_num}_{ticker}"):
                     if delete_eval_ticker(ticker):
                         st.toast(f"Deleted {ticker}")
                         st.rerun()

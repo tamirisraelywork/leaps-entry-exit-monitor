@@ -1156,11 +1156,10 @@ elif page == "📋 Past Analyses":
                         st.toast(f"✅ {ticker} added to watchlist! Entry signals will be monitored.")
                         st.rerun()
 
-                if rc[6].button("📊 Buy", key=f"buy_{row_num}_{ticker}",
-                                help="Log as already purchased → adds to active portfolio"):
+                if rc[6].button("👁️", key=f"view_{row_num}_{ticker}",
+                                help="View full analysis"):
                     st.session_state.past_selected = ticker
                     st.session_state.past_view     = "detail"
-                    st.session_state["detail_portfolio_form"] = ticker
                     st.rerun()
 
                 if rc[7].button("🗑️", key=f"del_{row_num}_{ticker}"):

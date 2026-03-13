@@ -3029,7 +3029,32 @@ elif page == "⚙️ Settings":
     if _email_btn_c2.button("📊 Send Daily Summary Now", help="Send today's portfolio + watchlist summary email immediately (same as the 5 PM scheduled email)"):
         with st.spinner("Building summary and sending — this may take 30–60 seconds..."):
             try:
+                import time as _time
+                import re as _re
                 from datetime import date as _date_cls
+                from iv_rank import get_iv_rank_advanced as _ivr
+
+                def _get_ivr(ticker, implied_vol_pct=None):
+                    """Fetch IV rank, using known option IV as a fast hint."""
+                    try:
+                        res = _ivr(ticker, current_iv_pct=implied_vol_pct)
+                        if res and "Success" in res:
+                            m = _re.search(r"([\d.]+)", res.split("is:")[-1])
+                            return float(m.group(1)) if m else None
+                    except Exception:
+                        pass
+                    return None
+
+                def _dte_from_pos(pos):
+                    _ex = pos.get("expiration_date")
+                    if _ex:
+                        try:
+                            _ex_d = _ex if hasattr(_ex, "toordinal") else _date_cls.fromisoformat(str(_ex))
+                            return max(0, (_ex_d - _date_cls.today()).days)
+                        except Exception:
+                            pass
+                    return None
+
                 _sum_positions = db.get_positions()
                 _sum_snapshots = {}
                 for _sp in _sum_positions:
@@ -3039,38 +3064,35 @@ elif page == "⚙️ Settings":
                             _con = _sp.get("contract", "") or ""
                             # Construct OCC from position fields if contract is missing
                             if not _con:
-                                _sk  = _sp.get("strike")
-                                _ex  = _sp.get("expiration_date")
+                                _sk = _sp.get("strike")
+                                _ex = _sp.get("expiration_date")
                                 if _sk and _ex:
                                     try:
                                         _ex_d = _ex if hasattr(_ex, "strftime") else _date_cls.fromisoformat(str(_ex))
-                                        _con  = options_data.to_occ(_tk, _ex_d, "C", float(_sk))
+                                        _ot   = _sp.get("option_type", "C") or "C"
+                                        _con  = options_data.to_occ(_tk, _ex_d, _ot, float(_sk))
                                     except Exception:
                                         pass
                             _snap = options_data.get_option_snapshot(_tk, _con) if _con else {}
-                            _dte  = _snap.get("dte") if _snap and "_error" not in _snap else None
-                            # DTE fallback from stored expiration_date
-                            if _dte is None:
-                                _ex = _sp.get("expiration_date")
-                                if _ex:
-                                    try:
-                                        _ex_d = _ex if hasattr(_ex, "toordinal") else _date_cls.fromisoformat(str(_ex))
-                                        _dte  = max(0, (_ex_d - _date_cls.today()).days)
-                                    except Exception:
-                                        pass
-                            if _snap and "_error" not in _snap:
+                            _ok   = _snap and "_error" not in _snap
+                            _iv_hint = (_snap.get("implied_volatility") or 0) * 100 if _ok else None
+                            _ivrank  = _get_ivr(_tk, _iv_hint)
+                            _dte     = (_snap.get("dte") if _ok else None) or _dte_from_pos(_sp)
+                            if _ok:
                                 _sum_snapshots[str(_sp["id"])] = {
                                     "mid":          _snap.get("mid"),
                                     "delta":        _snap.get("delta"),
-                                    "dte":          _snap.get("dte") or _dte,
-                                    "iv_rank":      None,
+                                    "dte":          _dte,
+                                    "iv_rank":      _ivrank,
                                     "thesis_score": db.get_leaps_monitor_score(_tk),
                                 }
                             else:
                                 _sum_snapshots[str(_sp["id"])] = {
                                     "dte":          _dte,
+                                    "iv_rank":      _ivrank,
                                     "thesis_score": db.get_leaps_monitor_score(_tk),
                                 }
+                            _time.sleep(1.5)  # respect yfinance rate limit
                         except Exception:
                             _sum_snapshots[str(_sp["id"])] = {}
 
@@ -3080,15 +3102,17 @@ elif page == "⚙️ Settings":
                         continue
                     try:
                         from technical import get_price_and_range as _gpr, get_weekly_rsi as _grsi
-                        _sd = _gpr(_sp.get("ticker",""))
-                        _sd["weekly_rsi"] = _grsi(_sp.get("ticker",""))
-                        _ea = evaluate_entry(_sp, _sd, None)
-                        _rec = recommend_asymmetric(_sp.get("ticker",""))
+                        _tk = _sp.get("ticker", "")
+                        _sd = _gpr(_tk)
+                        _sd["weekly_rsi"] = _grsi(_tk)
+                        _ivrank = _get_ivr(_tk)
+                        _ea  = evaluate_entry(_sp, _sd, _ivrank)  # re-evaluate with real IV
+                        _rec = recommend_asymmetric(_tk)
                         _top = _rec.get("contracts", [None])[0] or {}
                         _sum_wl_signals[str(_sp["id"])] = {
                             "entry_alert":  _ea,
-                            "thesis_score": db.get_leaps_monitor_score(_sp.get("ticker","")),
-                            "iv_rank":      None,
+                            "thesis_score": db.get_leaps_monitor_score(_tk),
+                            "iv_rank":      _ivrank,
                             "price":        _sd.get("price"),
                             "rsi":          _sd.get("weekly_rsi"),
                             "rec_strike":   _top.get("strike"),
@@ -3097,6 +3121,7 @@ elif page == "⚙️ Settings":
                             "rec_delta":    _top.get("delta"),
                             "rec_otm_pct":  _top.get("otm_pct"),
                         }
+                        _time.sleep(1.5)  # respect yfinance rate limit
                     except Exception:
                         pass
 

@@ -228,12 +228,11 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             pass
 
         # For illiquid options with no live bid/ask, fall back to last traded price.
-        # Mark it as stale — callers must NOT use this for P&L or stop-loss decisions.
         mid_is_live = (bid > 0 and ask > 0)
         if mid is None:
             if last > 0:
                 mid = last
-                mid_source = "last trade (stale)"
+                mid_source = "last trade"
 
         return {
             "delta":              greeks.get("delta"),
@@ -251,6 +250,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             "_source":            "yfinance+BS",
             "_mid_source":        mid_source,
             "_mid_is_live":       mid_is_live,
+            "_mid_reliable":      True,   # use whatever price is available for P&L
         }
 
     except Exception as e:

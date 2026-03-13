@@ -139,15 +139,16 @@ def safe_float(val):
 def calculate_scoring(metric_name, value):
     """Two-pillar LEAPS scoring system (100 pts total).
 
-    PILLAR 1 — SUSTAINABILITY (35 pts):
-      Cash Runway(10), Assets/Liab(5), Net Debt/EBITDA(7),
-      Share Count Growth(4), Gross Margin(5), Expiration Date(4)
+    PILLAR 1 — SUSTAINABILITY (34 pts):
+      Cash Runway(10), Net Debt/EBITDA(7), Gross Margin(6),
+      Assets/Liab(4), Share Count Growth(4), Expiration Date(3)
 
-    PILLAR 2 — UPSIDE POTENTIAL (70 pts):
-      Revenue Growth(16), Growth-to-Valuation(12), EPS Growth(8),
-      Market Cap(7), Business Model/GF Moat(10), CEO Ownership(4),
-      Net Insider Buying(4), Institutional Ownership(5), Short Float(3),
-      Degree of Operating Leverage(5)
+    PILLAR 2 — UPSIDE POTENTIAL (66 pts):
+      Revenue Growth(14), Business Model/GF Moat(11), Growth-to-Valuation(10),
+      EPS Growth(7), Market Cap(6), DOL(5), Institutional Ownership(5),
+      CEO Ownership(3), Net Insider Buying(3), Short Float(2)
+
+    Verdict thresholds: Elite ≥75 | Qualified ≥60 | Watchlist ≥45 | <45 Rejected
 
     Returns (obtained_points, total_points, is_rejected).
     """
@@ -191,13 +192,13 @@ def calculate_scoring(metric_name, value):
             is_rejected = True   # < 3 months cash — company likely won't survive
 
     elif "assets" in name and "liabilities" in name:
-        total = 5
+        total = 4
         if val_str in _NA:
-            obtained = 3
+            obtained = 2
         elif val_num >= 2.5:
-            obtained = 5
-        elif val_num >= 1.5:
             obtained = 4
+        elif val_num >= 1.5:
+            obtained = 3
         elif val_num >= 1.0:
             obtained = 2
         else:
@@ -248,14 +249,14 @@ def calculate_scoring(metric_name, value):
             is_rejected = True   # > 50% — extreme dilution destroys per-share LEAPS returns
 
     elif "gross margin" in name:
-        total = 5
+        total = 6
         if val_str in _NA:
             obtained = 2
         else:
             try:
                 pct = float(val_str.replace("%", ""))
                 if pct >= 60:
-                    obtained = 5
+                    obtained = 6
                 elif pct >= 40:
                     obtained = 4
                 elif pct >= 20:
@@ -267,27 +268,28 @@ def calculate_scoring(metric_name, value):
                 obtained = 2
 
     elif "expiration" in name:
-        total = 4
-        obtained = ""
-        if val_str in _NA:
-            obtained = 0   # No expiration specified — skip, don't reject.
-            # Only reject if a real date was provided but is too near-term.
-        else:
+        # REJECTION RULE: any expiration < 18 months is a hard reject.
+        # A LEAPS position with < 18 months of time is too close to expiry
+        # to realise the thesis — theta decay accelerates, margin for error shrinks.
+        # N/A = contract not yet specified → skip (can't reject the unknown).
+        total = 3
+        obtained = 0
+        if val_str not in _NA:
             try:
                 import pandas as pd
                 diff_months = (
                     (pd.to_datetime(value).date() - datetime.date.today()).days // 30
                 )
                 if diff_months < 18:
-                    is_rejected = True
+                    is_rejected = True   # hard reject — not enough time for thesis to play out
                 elif diff_months >= 36:
-                    obtained = 4
+                    obtained = 3         # 3+ years: maximum time premium
                 elif diff_months >= 24:
-                    obtained = 3
-                else:   # 18-23 months
+                    obtained = 2         # 2–3 years: solid LEAPS window
+                else:                   # 18–23 months: minimum viable, 1 pt
                     obtained = 1
             except Exception:
-                obtained = 0   # Can't parse — skip, don't reject
+                obtained = 0   # Can't parse date — skip, don't reject
 
     # ── PILLAR 2: UPSIDE POTENTIAL ────────────────────────────────────────────
 
@@ -306,18 +308,18 @@ def calculate_scoring(metric_name, value):
         # ≤ 0 (declining or negative): 0 pts
 
     elif "revenue growth" in name:
-        total = 16
+        total = 14
         if val_str not in _NA:
             try:
                 pct = float(val_str.replace("%", ""))
                 if pct >= 50:
-                    obtained = 16
+                    obtained = 14
                 elif pct >= 30:
-                    obtained = 12
+                    obtained = 11
                 elif pct >= 20:
-                    obtained = 8
+                    obtained = 7
                 elif pct >= 10:
-                    obtained = 4
+                    obtained = 3
                 elif pct > 0:
                     obtained = 1
                 # negative or 0: 0 pts
@@ -325,16 +327,16 @@ def calculate_scoring(metric_name, value):
                 pass
 
     elif "growth-to-valuation" in name:
-        total = 12
+        total = 10
         if val_str not in _NA:
             try:
                 gtv = float(val_str)
                 if gtv >= 15:
-                    obtained = 12
+                    obtained = 10
                 elif gtv >= 8:
-                    obtained = 9
+                    obtained = 7
                 elif gtv >= 5:
-                    obtained = 6
+                    obtained = 5
                 elif gtv >= 3:
                     obtained = 3
                 elif gtv >= 1:
@@ -343,16 +345,16 @@ def calculate_scoring(metric_name, value):
                 pass
 
     elif "eps growth" in name:
-        total = 8
+        total = 7
         if val_str in _NA:
-            obtained = 3   # neutral N/A — don't penalise missing data
+            obtained = 2   # neutral N/A — don't penalise missing data
         else:
             try:
                 pct = float(val_str.replace("%", ""))
                 if pct >= 50:
-                    obtained = 8
+                    obtained = 7
                 elif pct >= 30:
-                    obtained = 6
+                    obtained = 5
                 elif pct >= 15:
                     obtained = 4
                 elif pct >= 5:
@@ -361,21 +363,21 @@ def calculate_scoring(metric_name, value):
                     obtained = 1
                 # negative: 0 pts
             except Exception:
-                obtained = 3
+                obtained = 2
 
     elif "market cap" in name:
-        total = 7
+        total = 6
         billions = val_num
         if "t" in val_str:
             billions = val_num * 1000
         elif "m" in val_str and "b" not in val_str:
             billions = val_num / 1000
         if billions <= 1:
-            obtained = 7   # micro/small cap — maximum asymmetry
+            obtained = 6   # micro/small cap — maximum asymmetry
         elif billions <= 3:
-            obtained = 6
+            obtained = 5
         elif billions <= 10:
-            obtained = 4
+            obtained = 3
         elif billions <= 30:
             obtained = 2
         elif billions <= 100:
@@ -391,7 +393,7 @@ def calculate_scoring(metric_name, value):
         return (0, 0, False)
 
     elif "business model" in name:
-        total = 10
+        total = 11
         gf = getattr(_thread_local, "gf_score", 0.0)
         text = val_str
         monopoly_kw = ["mission-critical", "infrastructure", "monopoly", "dominant", "network effect"]
@@ -399,41 +401,41 @@ def calculate_scoring(metric_name, value):
         growth_kw   = ["high-growth", "disruptive", "emerging", "hypergrowth"]
         commodity_kw = ["commodity", "cyclical", "oil", "mining", "brick", "retail"]
         if gf >= 3.0 or any(k in text for k in monopoly_kw):
-            obtained = 10
+            obtained = 11
         elif gf >= 2.0 or any(k in text for k in saas_kw):
-            obtained = 7
+            obtained = 8
         elif gf >= 1.0 or any(k in text for k in growth_kw):
-            obtained = 4
+            obtained = 5
         elif any(k in text for k in commodity_kw):
             obtained = 1
         else:
             obtained = 3   # N/A / unknown fallback
 
     elif "ceo ownership" in name:
-        total = 4
+        total = 3
         if "not disclosed" in val_str or val_str in _NA:
             obtained = 1
         elif val_num >= 5:
-            obtained = 4
-        elif val_num >= 2:
             obtained = 3
-        elif val_num >= 1:
+        elif val_num >= 2:
             obtained = 2
+        elif val_num >= 1:
+            obtained = 1
         else:
             obtained = 1
 
     elif "buying vs selling" in name or "insider buying" in name:
-        total = 4
+        total = 3
         if val_str in _NA:
             obtained = 1   # unknown — neutral
         elif val_num >= 5:
-            obtained = 4   # strong insider conviction (≥5% net buying)
+            obtained = 3   # strong insider conviction (≥5% net buying)
         elif val_num >= 1:
-            obtained = 3   # meaningful net buying
+            obtained = 2   # meaningful net buying
         elif val_num > 0:
-            obtained = 2   # any net buying is a positive signal
+            obtained = 1   # any net buying is a positive signal
         elif val_num == 0:
-            obtained = 1   # neutral
+            obtained = 1   # neutral — not a negative signal
         # net selling: 0 pts
 
     elif "institutional ownership" in name:
@@ -452,14 +454,14 @@ def calculate_scoring(metric_name, value):
             obtained = 1   # over-owned — little room for new institutional demand
 
     elif "short float" in name:
-        total = 3
+        total = 2
         if val_str not in _NA:
             if 10 <= val_num <= 25:
-                obtained = 3   # moderate short interest = potential squeeze catalyst
+                obtained = 2   # moderate short interest = potential squeeze catalyst
             elif 25 < val_num <= 40:
-                obtained = 2
+                obtained = 1
             elif 5 <= val_num < 10:
-                obtained = 2
+                obtained = 1
             elif val_num > 40:
                 obtained = 1   # excessive short pressure — elevated risk
             # < 5%: 0 pts (no short squeeze potential)
@@ -636,9 +638,9 @@ def _build_report(ticker: str, results):
     is_rejected = any(r["Obtained points"] == "rejected" for r in table_rows)
     verdict = (
         "Rejected"              if is_rejected else
-        "Elite LEAPS Candidate" if score >= 82 else
-        "Qualified"             if score >= 65 else
-        "Watchlist"             if score >= 49 else
+        "Elite LEAPS Candidate" if score >= 75 else
+        "Qualified"             if score >= 60 else
+        "Watchlist"             if score >= 45 else
         "Rejected"
     )
 

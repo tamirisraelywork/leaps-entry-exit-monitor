@@ -323,21 +323,21 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     # If thesis has IMPROVED since entry, add 5 pts patience.
     # If thesis has DECLINED a lot, tighten by 5 pts.
     if house_money:
-        _thesis_exit = 44     # only exit on near-total collapse when fully covered
+        _thesis_exit = 40     # only exit on near-total collapse when fully covered
     elif cost_recovery_pct >= 70:
-        _thesis_exit = 54
+        _thesis_exit = 50
     elif cost_recovery_pct >= 30:
-        _thesis_exit = 58
+        _thesis_exit = 53
     else:
-        _thesis_exit = 65     # standard (new 109pt max)
+        _thesis_exit = 60     # standard (100pt max)
 
     if thesis_gap is not None:
         if thesis_gap >= 10:       # thesis improved → more patient
             _thesis_exit = max(30, _thesis_exit - 5)
         elif thesis_gap <= -20:    # thesis deteriorated a lot → tighter
-            _thesis_exit = min(70, _thesis_exit + 10)
+            _thesis_exit = min(65, _thesis_exit + 10)
         elif thesis_gap <= -10:    # thesis somewhat worse
-            _thesis_exit = min(70, _thesis_exit + 5)
+            _thesis_exit = min(65, _thesis_exit + 5)
 
     mid          = market.get("mid")
     bid          = market.get("bid")
@@ -405,13 +405,13 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 recovery_ctx = (
                     f"\n  POSITION STATUS: HOUSE MONEY ({cost_recovery_pct:.0f}% cost recovered via trims)\n"
                     f"  Your original capital is already safe. The remaining {qty} contracts\n"
-                    f"  represent pure profit. Threshold relaxed to {_thesis_exit}/100 (standard: 65).\n"
+                    f"  represent pure profit. Threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
                     f"  Exiting only because thesis has reached near-total collapse.\n"
                 )
             elif cost_recovery_pct >= 30:
                 recovery_ctx = (
                     f"\n  COST RECOVERY: {cost_recovery_pct:.0f}% recovered via trims.\n"
-                    f"  Thesis exit threshold relaxed to {_thesis_exit}/100 (standard: 65).\n"
+                    f"  Thesis exit threshold relaxed to {_thesis_exit}/100 (standard: 60).\n"
                 )
 
             # Thesis gap context
@@ -721,19 +721,19 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
     if pnl is not None:
 
         if pnl <= _T["stop_loss"]:
-            _thesis_strong = thesis_score is not None and thesis_score >= 70
+            _thesis_strong = thesis_score is not None and thesis_score >= 65
             if _thesis_strong:
-                # Thesis is intact — wrong strike/timing, not wrong thesis.
+                # Thesis is intact (≥65 = Qualified) — wrong strike/timing, not wrong thesis.
                 # Recommend rolling down to a higher-delta strike rather than exiting.
                 alerts.append(Alert(
                     type="ROLL_STOP", severity="AMBER",
-                    subject=f"⚠️ ROLL DOWN SIGNAL: {ticker}  P&L: {pnl:+.1f}%  Thesis: {thesis_score}/109",
+                    subject=f"⚠️ ROLL DOWN SIGNAL: {ticker}  P&L: {pnl:+.1f}%  Thesis: {thesis_score}/100",
                     body=(
                         hdr()
                         + "SIGNAL: ROLL DOWN — STOP LOSS HIT BUT THESIS INTACT\n"
                         + f"{'─'*50}\n"
                         + f"  Position is at {pnl:+.1f}% — below the -60% stop level.\n"
-                        + f"  However, thesis score is {thesis_score}/109 (≥70) — the story is still valid.\n"
+                        + f"  However, thesis score is {thesis_score}/100 (≥65 = Qualified) — the story is still valid.\n"
                         + "  This is a strike/timing problem, NOT a thesis problem.\n\n"
                         + "  RECOMMENDED ACTION: ROLL DOWN\n"
                         + "  • Close current position (limit order at mid)\n"
@@ -1208,7 +1208,7 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
 
     # Adjust Pillar 1 exit threshold if tone is deteriorating consecutive quarters
     if earnings_tone_delta == "DETERIORATING":
-        _thesis_exit = min(70, _thesis_exit + 5)
+        _thesis_exit = min(65, _thesis_exit + 5)
 
     # -----------------------------------------------------------------------
     # PILLAR 6 — IV Timing: Strike while the iron is hot

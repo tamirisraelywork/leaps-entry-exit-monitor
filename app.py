@@ -31,7 +31,7 @@ import db
 import options_data
 import email_alerts
 import score_thesis
-from recommender import recommend_options, format_recommendation
+from recommender import recommend_options, format_recommendation, recommend_asymmetric
 from technical import get_price_and_range, get_weekly_rsi
 from exit_engine import evaluate, evaluate_entry
 # Monitor engine runs as a separate process (monitor_engine/main.py).
@@ -892,8 +892,8 @@ if page == "🔍 New Analysis":
             verdict     = _verdict_from_score(final_score, is_rej)
             vc          = _verdict_color(verdict)
 
-            bar_p1 = min(int(p1 / 35 * 100), 100)
-            bar_p2 = min(int(p2 / 65 * 100), 100)
+            bar_p1 = min(int(p1 / 34 * 100), 100)
+            bar_p2 = min(int(p2 / 66 * 100), 100)
             st.markdown(f"""
 <div style="background:#0f172a;padding:20px 24px;border-radius:12px;margin:8px 0">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1073,10 +1073,23 @@ elif page == "📋 Past Analyses":
         st.caption(f"Showing **{len(df)}** of {len(master_df)} analyses")
         st.divider()
 
+        # Build ticker → position mode map for status badges
+        try:
+            _all_pos = db.get_positions()
+            _pos_status = {}
+            for _p in _all_pos:
+                _t = _p.get("ticker", "").upper()
+                _m = _p.get("mode", "")
+                # Active takes priority over Watchlist
+                if _t not in _pos_status or _m == "ACTIVE":
+                    _pos_status[_t] = _m
+        except Exception:
+            _pos_status = {}
+
         if df.empty:
             st.info("No analyses match the current filters.")
         else:
-            hdr = st.columns([1, 2.5, 2.2, 1.5, 2, 1, 1])
+            hdr = st.columns([1, 3.5, 2.2, 1.5, 2, 1, 1])
             for txt, c in zip(
                 ["**#**","**Ticker**","**Date**","**Score**","**Verdict**","",""],
                 hdr,
@@ -1084,12 +1097,18 @@ elif page == "📋 Past Analyses":
                 c.write(txt)
             st.divider()
 
+            _STATUS_BADGE = {
+                "ACTIVE":    '<span style="background:#166534;color:#fff;padding:1px 6px;border-radius:4px;font-size:0.75em">📊 Portfolio</span>',
+                "WATCHLIST": '<span style="background:#1e3a5f;color:#fff;padding:1px 6px;border-radius:4px;font-size:0.75em">📌 Watchlist</span>',
+            }
+
             for row_num, row in df.iterrows():
                 ticker = row["Ticker"]
                 vc     = _verdict_color(row["Verdict"])
-                rc     = st.columns([1, 2.5, 2.2, 1.5, 2, 1, 1])
+                rc     = st.columns([1, 3.5, 2.2, 1.5, 2, 1, 1])
                 rc[0].write(row_num + 1)
-                rc[1].write(f"**{ticker}**")
+                _badge = _STATUS_BADGE.get(_pos_status.get(ticker.upper(), ""), "")
+                rc[1].markdown(f"**{ticker}** {_badge}", unsafe_allow_html=True)
                 rc[2].write(str(row.get("date", "N/A")))
                 rc[3].write(str(row["Score"]))
                 rc[4].markdown(
@@ -1109,22 +1128,32 @@ elif page == "📋 Past Analyses":
     elif st.session_state.past_view == "detail":
         ticker = st.session_state.past_selected
 
-        btn_c1, btn_c2, btn_c3, _ = st.columns([1.2, 1.8, 1.8, 4])
+        btn_c1, btn_c2, btn_c3, btn_c4 = st.columns([1.2, 1.8, 1.8, 1.8])
         if btn_c1.button("← Back"):
             st.session_state.past_view    = "history"
             st.session_state.past_selected = None
             st.rerun()
 
-        # Add to watchlist button
+        # Load current position state for this ticker
         existing_pos     = db.get_positions()
-        existing_tickers = {p.get("ticker","").upper() for p in existing_pos}
-        if ticker in existing_tickers:
+        existing_by_mode = {p.get("ticker","").upper(): p for p in existing_pos}
+        cur_pos          = existing_by_mode.get(ticker)
+        cur_mode         = cur_pos.get("mode") if cur_pos else None
+
+        # ── Watchlist / Remove button ─────────────────────────────────────────
+        if cur_mode == "WATCHLIST":
             if btn_c2.button("✅ In Watchlist — Remove", key="detail_rm"):
-                pos_to_rm = next((p for p in existing_pos if p.get("ticker","").upper() == ticker), None)
-                if pos_to_rm:
-                    db.delete_position(str(pos_to_rm["id"]))
-                    st.toast(f"Removed {ticker} from watchlist.")
-                    st.rerun()
+                db.delete_position(str(cur_pos["id"]))
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith(f"wl_rec_{cur_pos['id']}") or _k.startswith(f"wl_sig_{cur_pos['id']}"):
+                        del st.session_state[_k]
+                st.toast(f"Removed {ticker} from watchlist.")
+                st.rerun()
+        elif cur_mode == "ACTIVE":
+            btn_c2.markdown(
+                '<span style="background:#166534;color:#fff;padding:4px 10px;border-radius:6px;font-size:0.9em">📊 In Portfolio</span>',
+                unsafe_allow_html=True,
+            )
         else:
             if btn_c2.button("📌 Add to Watchlist", key="detail_add"):
                 score_from_master = db.get_leaps_monitor_score(ticker)
@@ -1145,8 +1174,99 @@ elif page == "📋 Past Analyses":
                     "mode":            "WATCHLIST",
                     "notes":           f"Added from Past Analyses.",
                 })
-                st.toast(f"Added {ticker} to watchlist.")
+                st.session_state["detail_show_rec"] = ticker
+                st.toast(f"Added {ticker} to watchlist! See contract recommendation below.")
                 st.rerun()
+
+        # Contract recommendation panel (shown after adding to watchlist)
+        if st.session_state.get("detail_show_rec") == ticker:
+            with st.container(border=True):
+                st.markdown(f"**Recommended LEAPS Contract for {ticker} (40–50% OTM)**")
+                with st.spinner("Fetching live options chain..."):
+                    _det_rec = recommend_asymmetric(ticker)
+                _det_sp  = _det_rec.get("stock_price")
+                _det_cs  = _det_rec.get("contracts", [])
+                if _det_rec.get("error") and not _det_cs:
+                    st.warning(_det_rec["error"])
+                elif not _det_cs:
+                    st.info("No qualifying contracts found at this time.")
+                else:
+                    for _ci, _c in enumerate(_det_cs):
+                        _lbl = f"**#{_ci+1}** ${_c.get('strike')}C · {_c.get('expiration_date')} · " \
+                               f"${_c.get('mid','?')}/share · Δ {_c.get('delta','?')} · " \
+                               f"{_c.get('otm_pct','?')}% OTM · {_c.get('dte','?')}d"
+                        st.markdown(_lbl)
+                        if _ci == 0:
+                            st.caption(
+                                f"10x target requires stock at +{_c.get('10x_required_move_pct','?')}% "
+                                f"from ${_det_sp:.2f}"
+                            )
+                    st.info("Go to **Dashboard → Watchlist** to monitor entry signals and mark as bought.")
+                if st.button("✕ Dismiss", key="detail_dismiss_rec"):
+                    del st.session_state["detail_show_rec"]
+                    st.rerun()
+
+        # ── In Portfolio button ───────────────────────────────────────────────
+        if cur_mode != "ACTIVE":
+            if btn_c4.button("📊 Already Bought", key="detail_portfolio"):
+                st.session_state["detail_portfolio_form"] = ticker
+        else:
+            if btn_c4.button("🗑️ Remove from Portfolio", key="detail_rm_portfolio"):
+                db.delete_position(str(cur_pos["id"]))
+                st.toast(f"Removed {ticker} from portfolio.")
+                st.rerun()
+
+        # In-Portfolio entry form
+        if st.session_state.get("detail_portfolio_form") == ticker:
+            with st.container(border=True):
+                st.markdown(f"**Log {ticker} Purchase**")
+                pf1, pf2, pf3, pf4 = st.columns(4)
+                pf_contract = pf1.text_input("Contract (OCC)", placeholder="e.g. O:NVDA270115C00150000", key="pf_contract")
+                pf_price    = pf2.number_input("Entry Price ($/contract)", min_value=0.01, step=0.05, value=1.0, key="pf_price")
+                pf_qty      = pf3.number_input("Quantity", min_value=1, step=1, value=1, key="pf_qty")
+                pf_date     = pf4.date_input("Entry Date", value=date.today(), key="pf_date")
+                pf_strike   = st.number_input("Strike", min_value=0.0, step=0.5, value=0.0, key="pf_strike")
+                pf_exp      = st.date_input("Expiration", key="pf_exp")
+                _pc1, _pc2, _ = st.columns([1, 1, 4])
+                if _pc1.button("💾 Save to Portfolio", key="pf_save", type="primary"):
+                    _score = db.get_leaps_monitor_score(ticker)
+                    if cur_pos:
+                        # Update existing watchlist position → ACTIVE
+                        db.update_position(str(cur_pos["id"]), {
+                            "contract":        pf_contract,
+                            "strike":          pf_strike if pf_strike > 0 else None,
+                            "expiration_date": pf_exp,
+                            "entry_price":     pf_price,
+                            "quantity":        int(pf_qty),
+                            "entry_date":      pf_date,
+                            "entry_thesis_score": _score,
+                            "mode":            "ACTIVE",
+                        })
+                    else:
+                        # Brand-new position
+                        db.save_position({
+                            "ticker":          ticker,
+                            "contract":        pf_contract,
+                            "option_type":     "CALL",
+                            "strike":          pf_strike if pf_strike > 0 else None,
+                            "expiration_date": pf_exp,
+                            "entry_date":      pf_date,
+                            "entry_price":     pf_price,
+                            "quantity":        int(pf_qty),
+                            "entry_delta":     None,
+                            "entry_iv_rank":   None,
+                            "entry_thesis_score": _score,
+                            "position_type":   "CORE",
+                            "target_return":   "5-10x",
+                            "mode":            "ACTIVE",
+                            "notes":           "Added from Past Analyses.",
+                        })
+                    del st.session_state["detail_portfolio_form"]
+                    st.toast(f"{ticker} added to portfolio! Monitor it on the Dashboard.")
+                    st.rerun()
+                if _pc2.button("Cancel", key="pf_cancel"):
+                    del st.session_state["detail_portfolio_form"]
+                    st.rerun()
 
         # Re-analyze button
         _analyzing = st.session_state.get("detail_analyzing")
@@ -1254,8 +1374,8 @@ elif page == "📋 Past Analyses":
             verdict = _verdict_from_score(final, is_rej)
             vc      = _verdict_color(verdict)
 
-            bar_p1 = min(int(p1 / 35 * 100), 100)
-            bar_p2 = min(int(p2 / 65 * 100), 100)
+            bar_p1 = min(int(p1 / 34 * 100), 100)
+            bar_p2 = min(int(p2 / 66 * 100), 100)
 
             st.subheader("Score Summary")
             st.markdown(f"""
@@ -1417,11 +1537,11 @@ elif page == "📊 Dashboard":
                     # Force-check: clear this position's cache entry then re-fetch
                     _clear_snapshot_cache(ticker, contract)
                     mkt = _live_market(pos)
-                    polygon_error = None
+                    snap_error = None
                 else:
                     snap = _get_snapshot_cached(ticker, contract) if contract else {}
                     snap = snap or {}
-                    polygon_error = snap.get("_error")
+                    snap_error = snap.get("_error")
                     dte_fallback = None
                     try:
                         raw_exp = pos.get("expiration_date")
@@ -1431,36 +1551,35 @@ elif page == "📊 Dashboard":
                     except Exception:
                         pass
                     iv_pct_dash = (snap.get("implied_volatility") or 0) * 100 or None
-                    _mid_is_live = snap.get("_mid_is_live", False)
+                    _mid_is_live  = snap.get("_mid_is_live", False)
+                    _mid_reliable = snap.get("_mid_reliable", True)
                     mkt = {
-                        # mid_display: always what we show — live bid/ask or stale lastPrice
-                        # mid (for engine): ONLY live bid/ask. Stale price → None.
-                        # This prevents stop-loss/profit alerts firing on months-old lastPrice.
-                        "mid":          snap.get("mid") if _mid_is_live else None,
-                        "mid_display":  snap.get("mid"),
-                        "bid":          snap.get("bid"),
-                        "ask":          snap.get("ask"),
-                        "delta":        snap.get("delta"),
-                        "dte":          snap.get("dte") or dte_fallback,
-                        "iv_rank":      _get_iv_rank_cached(ticker, iv_pct_dash),
-                        "thesis_score": None,
-                        "_mid_source":  snap.get("_mid_source", "market"),
-                        "_mid_is_live": _mid_is_live,
+                        "mid":           snap.get("mid"),   # always pass through — use whatever price is available
+                        "mid_display":   snap.get("mid"),
+                        "bid":           snap.get("bid"),
+                        "ask":           snap.get("ask"),
+                        "delta":         snap.get("delta"),
+                        "dte":           snap.get("dte") or dte_fallback,
+                        "iv_rank":       _get_iv_rank_cached(ticker, iv_pct_dash),
+                        "thesis_score":  None,
+                        "_mid_source":   snap.get("_mid_source", "market"),
+                        "_mid_is_live":  _mid_is_live,
+                        "_mid_reliable": _mid_reliable,
                     }
 
-            # ── Data quality assessment ───────────────────────────────────────
-            # Track what's missing so we can block or warn on affected pillars.
+            # ── Data quality notes ────────────────────────────────────────────
             _mid_is_live   = mkt.get("_mid_is_live", False)
-            _mid_display   = mkt.get("mid_display")   # for display only
+            _mid_reliable  = mkt.get("_mid_reliable", True)
+            _mid_display   = mkt.get("mid_display")
             _mid_source    = mkt.get("_mid_source", "market")
             data_gaps = []
             if not contract:
-                data_gaps.append("❌ No contract symbol — cannot fetch option price")
-            elif polygon_error or not _mid_display:
-                data_gaps.append("❌ No option price available (fetch failed)")
+                data_gaps.append("❌ No contract symbol — add contract details to enable live pricing")
+            elif snap_error or not _mid_display:
+                data_gaps.append(f"⚠️ Price fetch failed — {snap_error or 'no price data'}. "
+                                 "DTE and delta signals still active.")
             elif not _mid_is_live:
-                data_gaps.append("⚠️ No live bid/ask — showing last traded price (stale). "
-                                 "P&L and stop-loss signals are disabled until live price is available.")
+                data_gaps.append("ℹ️ No active bid/ask — using last traded price. P&L is approximate.")
 
             mid      = mkt.get("mid")          # None if not live — engine skips P&L pillar
             delta    = mkt.get("delta")
@@ -1494,9 +1613,6 @@ elif page == "📊 Dashboard":
                 a.type in ("DTE_HARD_STOP", "DTE_URGENT", "DTE_REVIEW")
                 for a in position_alerts
             )
-            _has_non_dte_gap  = any("P&L" in g or "stop-loss" in g or "price" in g.lower() or "Thesis" in g
-                                    for g in data_gaps)
-
             if position_alerts:
                 worst_alert   = max(position_alerts, key=_alert_priority)
                 severity      = worst_alert.severity
@@ -1505,12 +1621,6 @@ elif page == "📊 Dashboard":
                 worst_alert   = None
                 severity      = "GREEN"
                 posture_label = "HOLD"
-
-            # If no alerts fired but there are data gaps that could affect recommendations,
-            # replace HOLD with INCOMPLETE so the user knows to get data first.
-            if posture_label == "HOLD" and data_gaps and _has_non_dte_gap:
-                severity      = "GREY"
-                posture_label = "INCOMPLETE DATA"
 
             # Auto-email EXIT/ROLL signals (once per session per alert key)
             # Only email if data was complete enough for the alert to be reliable.
@@ -1584,7 +1694,7 @@ elif page == "📊 Dashboard":
                 # Data gaps warning — shown immediately under posture badge
                 if data_gaps:
                     for _gap in data_gaps:
-                        _gap_color = "#dc2626" if _gap.startswith("❌") else "#d97706"
+                        _gap_color = "#dc2626" if _gap.startswith("❌") else ("#2563eb" if _gap.startswith("ℹ️") else "#d97706")
                         st.markdown(
                             f"<div style='background:{_gap_color}18;border-left:3px solid {_gap_color};"
                             f"padding:6px 10px;border-radius:4px;font-size:0.82em;color:{_gap_color};"
@@ -1593,14 +1703,21 @@ elif page == "📊 Dashboard":
                         )
 
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                # Use mid_display for the price metric (shows stale lastPrice with label)
-                # Use mid (engine mid, live-only) for P&L
+                # Use mid_display for the price metric (shows last traded price with label)
+                # Use mid (engine mid) for P&L — live bid/ask or reliable exchange last-trade
                 _mid_source_val = mkt.get("_mid_source", "market")
-                if not _mid_is_live and _mid_display:
+                _snap_source    = snap.get("_source", "") if snap else ""
+                if not _mid_is_live and _mid_display and _mid_reliable:
+                    # marketdata.app last-trade — exchange feed, reliable
+                    _mid_label = "Last Trade (exchange)"
+                    _mid_help  = ("No active market maker (bid/ask = 0). Showing the last traded "
+                                  "price from the exchange feed via marketdata.app. "
+                                  "P&L is calculated from this price.")
+                elif not _mid_is_live and _mid_display and not _mid_reliable:
                     _mid_label = "Last Trade (stale)"
-                    _mid_help  = ("No live bid/ask. This is the last traded price — it may be "
-                                  "weeks or months old. P&L and stop-loss signals are disabled "
-                                  "until a live bid/ask is available. Verify in your broker.")
+                    _mid_help  = ("No live bid/ask. This is the last traded price from yfinance — "
+                                  "it may be weeks or months old (could be your own entry trade). "
+                                  "P&L and stop-loss signals are disabled until a reliable price is available.")
                 elif _mid_source_val != "market":
                     _mid_label = "Mid (no live mkt)"
                     _mid_help  = "No live bid/ask — showing last available price."
@@ -1620,7 +1737,7 @@ elif page == "📊 Dashboard":
                     age_label = f" ({score_age}d ago)" if score_age is not None else ""
                     stale_30  = score_age is not None and score_age > 30
                     stale_90  = score_age is not None and score_age > 90
-                    m6.metric("Thesis Score", f"{score}/109{age_label}",
+                    m6.metric("Thesis Score", f"{score}/100{age_label}",
                               delta="⚠️ signals disabled — re-score" if stale_90 else
                                     ("⚠️ stale" if stale_30 else None),
                               delta_color="inverse" if stale_30 else "normal")
@@ -1765,8 +1882,8 @@ elif page == "📊 Dashboard":
                         help="Proceeds from trims ÷ original cost. ≥100% = house money (risk-free remaining contracts)",
                     )
 
-                if polygon_error:
-                    st.warning(f"⚠️ Live data unavailable: {polygon_error}")
+                if snap_error:
+                    st.warning(f"⚠️ Live data unavailable: {snap_error}")
                     # If we can't get live price, warn explicitly that stop-loss can't be evaluated
                     if ep and ep > 0:
                         _stop_price = round(ep * 0.40, 2)   # -60% stop level
@@ -1979,36 +2096,238 @@ elif page == "📊 Dashboard":
     # ── Watchlist ─────────────────────────────────────────────────────────────
     if watchlist:
         st.markdown("---")
-        st.subheader("Watchlist — Waiting for Entry Signal")
+        wl_hdr_c1, wl_hdr_c2 = st.columns([4, 1])
+        wl_hdr_c1.subheader("Watchlist — Entry Signals & Contract Recommendations")
+        if wl_hdr_c2.button("🔄 Refresh All Signals", key="wl_refresh_all", use_container_width=True):
+            # Clear cached watchlist signal data so next render re-fetches
+            for k in list(st.session_state.keys()):
+                if k.startswith("wl_sig_") or k.startswith("wl_rec_"):
+                    del st.session_state[k]
+            st.rerun()
+
         for pos in watchlist:
             ticker = pos.get("ticker", "?")
             pos_id = str(pos.get("id", ""))
 
-            stock_data = get_price_and_range(ticker)
-            price      = stock_data.get("price")
-            pfl        = stock_data.get("pct_from_low")
+            # ── Fetch / use cached signals ─────────────────────────────────
+            sig_key = f"wl_sig_{pos_id}"
+            rec_key = f"wl_rec_{pos_id}"
 
-            score = db.get_leaps_monitor_score(ticker)
-            if score is None:
-                with st.spinner(f"First-time scoring for {ticker}..."):
-                    _s, _v = score_thesis.compute_and_save_score(ticker)
-                    score  = _s
-            score_str = f"{score}/100" if score else "N/A"
+            if sig_key not in st.session_state:
+                with st.spinner(f"Loading signals for {ticker}..."):
+                    try:
+                        _sd = get_price_and_range(ticker)
+                        _rsi = get_weekly_rsi(ticker)
+                        _sd["weekly_rsi"] = _rsi
+                        _ivr = None
+                        try:
+                            from iv_rank import get_iv_rank_advanced
+                            _ivr_raw = get_iv_rank_advanced(ticker)
+                            if _ivr_raw and "Success" in _ivr_raw:
+                                import re as _re
+                                _m = _re.search(r"([\d.]+)", _ivr_raw.split("is:")[-1])
+                                _ivr = float(_m.group(1)) if _m else None
+                        except Exception:
+                            pass
+                        _entry = evaluate_entry(pos, _sd, _ivr)
+                        st.session_state[sig_key] = {
+                            "price":      _sd.get("price"),
+                            "pfl":        _sd.get("pct_from_low"),
+                            "rsi":        _rsi,
+                            "iv_rank":    _ivr,
+                            "entry":      _entry,
+                            "entry_score": _entry.context.get("entry_score", 0) if _entry else 0,
+                        }
+                    except Exception as _e:
+                        st.session_state[sig_key] = {"error": str(_e)}
+
+            if rec_key not in st.session_state:
+                with st.spinner(f"Loading contract recs for {ticker}..."):
+                    try:
+                        st.session_state[rec_key] = recommend_asymmetric(ticker)
+                    except Exception as _e:
+                        st.session_state[rec_key] = {"error": str(_e), "contracts": []}
+
+            sig = st.session_state.get(sig_key, {})
+            rec = st.session_state.get(rec_key, {})
+
+            price   = sig.get("price")
+            pfl     = sig.get("pfl")
+            rsi     = sig.get("rsi")
+            iv_rank = sig.get("iv_rank")
+            entry   = sig.get("entry")
+            entry_score = sig.get("entry_score", 0)
+
+            thesis_score = db.get_leaps_monitor_score(ticker)
+
+            # Derive BUY/WAIT badge
+            if entry and entry.severity == "GREEN":
+                action_badge = "🟢 BUY NOW"
+                badge_color  = "green"
+            elif entry and entry.severity == "AMBER":
+                action_badge = "🟡 ENTRY IMPROVING"
+                badge_color  = "orange"
+            elif entry:
+                action_badge = "🔵 LOW IV — CONSIDER ENTRY"
+                badge_color  = "blue"
+            else:
+                action_badge = "⚪ WAIT"
+                badge_color  = "gray"
 
             with st.container(border=True):
-                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-                c1.metric("Ticker",        ticker)
-                c2.metric("Current Price", f"${price:.2f}" if price else "N/A")
-                c3.metric("52w Position",  f"{pfl*100:.0f}% from low" if pfl is not None else "N/A")
-                c4.metric("Thesis Score",  score_str)
-                with c5:
-                    if st.button("Move to Active", key=f"activate_{pos_id}"):
-                        db.update_position_mode(pos_id, "ACTIVE")
-                        st.rerun()
-                    if st.button("Remove", key=f"rm_watch_{pos_id}"):
+                # ── Header row ─────────────────────────────────────────────
+                hc1, hc2, hc3, hc4, hc5 = st.columns([2, 2, 2, 3, 1])
+                hc1.metric("Ticker", ticker)
+                hc2.metric("Price",  f"${price:.2f}" if price else "N/A")
+                hc3.metric("Thesis", f"{thesis_score}/100" if thesis_score else "N/A")
+                hc4.markdown(
+                    f"<div style='padding-top:6px'>"
+                    f"<span style='font-size:1.15em;font-weight:700;color:{badge_color}'>{action_badge}</span>"
+                    f"<span style='color:#888;font-size:0.85em;margin-left:10px'>Entry score: {entry_score}/100</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                with hc5:
+                    if st.button("✕ Remove", key=f"rm_watch_{pos_id}"):
                         db.delete_position(pos_id)
                         st.rerun()
-            st.caption(pos.get("notes", ""))
+
+                # ── Body: signals | contract rec ───────────────────────────
+                sc1, sc2 = st.columns(2)
+
+                with sc1:
+                    st.markdown("**Entry Signals**")
+                    # RSI
+                    if rsi is not None:
+                        if rsi < 30:
+                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** 🔥 Oversold — strong buy")
+                        elif rsi < 40:
+                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** ⚠️ Approaching oversold")
+                        elif rsi > 70:
+                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** ⛔ Overbought — wait")
+                        else:
+                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** (neutral)")
+                    else:
+                        st.markdown("📊 Weekly RSI: N/A")
+
+                    # IV Rank
+                    if iv_rank is not None:
+                        if iv_rank < 20:
+                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ⭐ Options very cheap — great time to buy")
+                        elif iv_rank < 30:
+                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ✅ Options cheap")
+                        elif iv_rank < 50:
+                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** (neutral)")
+                        else:
+                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ⚠️ Options expensive — reduces entry quality")
+                    else:
+                        st.markdown("📉 IV Rank: N/A")
+
+                    # 52w position
+                    if pfl is not None:
+                        if pfl < 0.15:
+                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low** 🔥 Near 52w low")
+                        elif pfl < 0.30:
+                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low** (lower third)")
+                        else:
+                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low**")
+                    else:
+                        st.markdown("📍 52w Position: N/A")
+
+                    # Entry score bar
+                    bar_val = min(entry_score, 100)
+                    bar_color = "#16a34a" if bar_val >= 60 else "#f59e0b" if bar_val >= 40 else "#6b7280"
+                    st.markdown(
+                        f"<div style='margin-top:8px'>"
+                        f"<div style='font-size:0.8em;color:#888;margin-bottom:3px'>Entry score: {bar_val}/100</div>"
+                        f"<div style='background:#e5e7eb;border-radius:4px;height:8px'>"
+                        f"<div style='width:{bar_val}%;background:{bar_color};height:8px;border-radius:4px'></div>"
+                        f"</div></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                with sc2:
+                    st.markdown("**Recommended Contract (40–50% OTM)**")
+                    contracts = rec.get("contracts", [])
+                    if rec.get("error") and not contracts:
+                        st.caption(f"⚠️ {rec['error']}")
+                    elif not contracts:
+                        st.caption("No qualifying contracts found.")
+                    else:
+                        sp = rec.get("stock_price") or price or 0
+                        top = contracts[0]
+                        strike    = top.get("strike")
+                        exp_date  = top.get("expiration_date")
+                        dte_val   = top.get("dte")
+                        mid_val   = top.get("mid")
+                        delta_val = top.get("delta")
+                        oi_val    = top.get("open_interest")
+                        otm_pct   = top.get("otm_pct")
+                        move10    = top.get("10x_required_move_pct")
+                        contract_sym = top.get("contract", "")
+
+                        st.markdown(
+                            f"**${strike}C  ·  {exp_date}**  \n"
+                            f"Premium: **${mid_val:.2f}**/share  ·  {dte_val}d DTE  \n"
+                            f"Delta: **{delta_val:.2f}**  ·  OTM: {otm_pct}%  ·  OI: {oi_val or '—'}  \n"
+                            f"10x needs stock at: **+{move10}%** from ${sp:.2f}"
+                        )
+                        if len(contracts) > 1:
+                            with st.expander(f"See {len(contracts)-1} more contract(s)"):
+                                for alt in contracts[1:]:
+                                    st.markdown(
+                                        f"• **${alt.get('strike')}C {alt.get('expiration_date')}** — "
+                                        f"${alt.get('mid','?')}/share · Δ {alt.get('delta','?')} · "
+                                        f"{alt.get('otm_pct','?')}% OTM"
+                                    )
+
+                        # Mark as Bought button
+                        buy_key = f"buying_{pos_id}"
+                        if st.button("✅ Mark as Bought", key=f"buy_btn_{pos_id}", type="primary"):
+                            st.session_state[buy_key] = {
+                                "contract":        contract_sym,
+                                "strike":          strike,
+                                "expiration_date": exp_date,
+                                "delta":           delta_val,
+                                "mid":             mid_val,
+                            }
+
+                # ── Mark as Bought inline form ──────────────────────────────
+                buy_key = f"buying_{pos_id}"
+                if buy_key in st.session_state:
+                    prefill = st.session_state[buy_key]
+                    st.markdown("---")
+                    st.markdown("**Confirm Purchase Details**")
+                    fc1, fc2, fc3, fc4 = st.columns(4)
+                    buy_contract  = fc1.text_input("Contract (OCC)", value=prefill.get("contract", ""), key=f"bc_{pos_id}")
+                    buy_price     = fc2.number_input("Entry Price ($/contract)", min_value=0.01, step=0.05,
+                                                     value=float(prefill.get("mid") or 1.0), key=f"bp_{pos_id}")
+                    buy_qty       = fc3.number_input("Quantity", min_value=1, step=1, value=1, key=f"bq_{pos_id}")
+                    buy_date      = fc4.date_input("Entry Date", value=date.today(), key=f"bd_{pos_id}")
+
+                    dc1, dc2, _ = st.columns([1, 1, 4])
+                    if dc1.button("💾 Confirm & Move to Active", key=f"bconfirm_{pos_id}", type="primary"):
+                        db.update_position(pos_id, {
+                            "contract":        buy_contract,
+                            "strike":          prefill.get("strike"),
+                            "expiration_date": prefill.get("expiration_date"),
+                            "entry_price":     buy_price,
+                            "quantity":        int(buy_qty),
+                            "entry_date":      buy_date,
+                            "entry_delta":     prefill.get("delta"),
+                            "entry_iv_rank":   iv_rank,
+                            "entry_thesis_score": thesis_score,
+                            "mode":            "ACTIVE",
+                        })
+                        del st.session_state[buy_key]
+                        # Also clear cached signal so dashboard refreshes
+                        st.session_state.pop(sig_key, None)
+                        st.session_state.pop(rec_key, None)
+                        st.toast(f"{ticker} moved to Active Positions!")
+                        st.rerun()
+                    if dc2.button("Cancel", key=f"bcancel_{pos_id}"):
+                        del st.session_state[buy_key]
+                        st.rerun()
 
 
 # ===========================================================================
@@ -2599,13 +2918,70 @@ elif page == "⚙️ Settings":
     else:
         st.warning("Gmail not configured. Add **GMAIL_SENDER** and **GMAIL_APP_PASSWORD** to Streamlit Cloud secrets.")
 
-    if st.button("Send Test Exit-Alert Email"):
+    _email_btn_c1, _email_btn_c2 = st.columns(2)
+    if _email_btn_c1.button("✉️ Send Test Email"):
         with st.spinner("Sending..."):
             ok, err = email_alerts.send_test_email()
         if ok:
             st.success("Test email sent successfully!")
         else:
             st.error(f"Test email failed: {err}")
+
+    if _email_btn_c2.button("📊 Send Daily Summary Now", help="Send today's portfolio + watchlist summary email immediately (same as the 5 PM scheduled email)"):
+        with st.spinner("Building summary and sending — this may take 30–60 seconds..."):
+            try:
+                _sum_positions = db.get_positions()
+                _sum_snapshots = {}
+                for _sp in _sum_positions:
+                    if _sp.get("mode") == "ACTIVE":
+                        try:
+                            _snap = options_data.get_option_snapshot(_sp.get("ticker",""), _sp.get("contract",""))
+                            _sum_snapshots[str(_sp["id"])] = {
+                                "mid":          _snap.get("mid"),
+                                "delta":        _snap.get("delta"),
+                                "dte":          _snap.get("dte"),
+                                "iv_rank":      None,
+                                "thesis_score": db.get_leaps_monitor_score(_sp.get("ticker","")),
+                            } if _snap and "_error" not in _snap else {}
+                        except Exception:
+                            _sum_snapshots[str(_sp["id"])] = {}
+
+                _sum_wl_signals = {}
+                for _sp in _sum_positions:
+                    if _sp.get("mode") != "WATCHLIST":
+                        continue
+                    try:
+                        from technical import get_price_and_range as _gpr, get_weekly_rsi as _grsi
+                        _sd = _gpr(_sp.get("ticker",""))
+                        _sd["weekly_rsi"] = _grsi(_sp.get("ticker",""))
+                        _ea = evaluate_entry(_sp, _sd, None)
+                        _rec = recommend_asymmetric(_sp.get("ticker",""))
+                        _top = _rec.get("contracts", [None])[0] or {}
+                        _sum_wl_signals[str(_sp["id"])] = {
+                            "entry_alert":  _ea,
+                            "thesis_score": db.get_leaps_monitor_score(_sp.get("ticker","")),
+                            "iv_rank":      None,
+                            "price":        _sd.get("price"),
+                            "rsi":          _sd.get("weekly_rsi"),
+                            "rec_strike":   _top.get("strike"),
+                            "rec_expiry":   str(_top.get("expiration_date","")) if _top.get("expiration_date") else None,
+                            "rec_premium":  _top.get("mid"),
+                            "rec_delta":    _top.get("delta"),
+                            "rec_otm_pct":  _top.get("otm_pct"),
+                        }
+                    except Exception:
+                        pass
+
+                ok, err = email_alerts.send_daily_summary(
+                    _sum_positions, _sum_snapshots,
+                    watchlist_signals=_sum_wl_signals,
+                )
+                if ok:
+                    st.success("Daily summary email sent!")
+                else:
+                    st.error(f"Email failed: {err}")
+            except Exception as _e:
+                st.error(f"Failed to build summary: {_e}")
 
     st.divider()
 

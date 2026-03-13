@@ -14,7 +14,7 @@ Checks:
   - Earnings date refresh                    6:10 AM ET daily  [NEW]
   - Post-earnings call analysis              10:00 AM ET daily [NEW]
   - News sentiment checks                    every 4 hours     [NEW]
-  - Daily portfolio summary email            9:35 AM ET daily
+  - Daily portfolio summary email            5:00 PM ET daily (after market close)
 
 Architecture:
   - Communicates with UI (Streamlit app) ONLY through BigQuery.
@@ -305,18 +305,84 @@ def run_news_checks():
 
 
 def send_morning_summary():
-    """Build and send the daily portfolio summary email (with earnings calendar)."""
-    logger.info("Sending morning summary…")
+    """Build and send the 5 PM daily portfolio summary email."""
+    logger.info("Sending daily summary…")
     try:
         positions = db.get_positions()
+
+        # ── Active position live data ─────────────────────────────────────────
         snapshots = {}
         for pos in positions:
             if pos.get("mode") == "ACTIVE":
                 mkt = _fetch_market_data(pos)
                 snapshots[str(pos["id"])] = mkt
-                time.sleep(12)
+                time.sleep(2)
 
-        # Build earnings calendar section for email
+        # ── Watchlist entry signals + contract recommendations ────────────────
+        watchlist_signals = {}
+        for pos in positions:
+            if pos.get("mode") != "WATCHLIST":
+                continue
+            try:
+                ticker = pos.get("ticker", "")
+                pos_id = str(pos.get("id", ""))
+
+                stock_data = get_price_and_range(ticker)
+                stock_data["weekly_rsi"] = get_weekly_rsi(ticker)
+
+                iv_rank = None
+                try:
+                    from iv_rank import get_iv_rank_advanced
+                    result = get_iv_rank_advanced(ticker)
+                    if result and "Success" in result:
+                        m = re.search(r"([\d.]+)", result.split("is:")[-1])
+                        iv_rank = float(m.group(1)) if m else None
+                except Exception:
+                    pass
+
+                entry_alert  = evaluate_entry(pos, stock_data, iv_rank)
+                thesis_score = db.get_leaps_monitor_score(ticker)
+
+                # Contract recommendation for email
+                rec_strike = rec_expiry = rec_premium = rec_delta = rec_otm = None
+                try:
+                    from recommender import recommend_asymmetric
+                    rec = recommend_asymmetric(ticker)
+                    if rec.get("contracts"):
+                        top = rec["contracts"][0]
+                        rec_strike  = top.get("strike")
+                        rec_expiry  = str(top.get("expiration_date", ""))
+                        rec_premium = top.get("mid")
+                        rec_delta   = top.get("delta")
+                        rec_otm     = top.get("otm_pct")
+                except Exception:
+                    pass
+
+                watchlist_signals[pos_id] = {
+                    "entry_alert":   entry_alert,
+                    "thesis_score":  thesis_score,
+                    "iv_rank":       iv_rank,
+                    "price":         stock_data.get("price"),
+                    "rsi":           stock_data.get("weekly_rsi"),
+                    "rec_strike":    rec_strike,
+                    "rec_expiry":    rec_expiry,
+                    "rec_premium":   rec_premium,
+                    "rec_delta":     rec_delta,
+                    "rec_otm_pct":   rec_otm,
+                }
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"Watchlist signal fetch failed for {pos.get('ticker')}: {e}")
+
+        # ── Posture changes since yesterday ───────────────────────────────────
+        posture_changes = {}
+        try:
+            changed_rows = db.get_recent_posture_changes(hours=26)
+            posture_changes = {str(r["id"]): r.get("last_posture", "HOLD") for r in changed_rows}
+        except Exception as e:
+            logger.warning(f"Could not fetch posture changes: {e}")
+
+        # ── Earnings calendar section ─────────────────────────────────────────
         earnings_section = ""
         try:
             from monitor_engine.earnings_calendar import get_upcoming_earnings_for_email
@@ -324,7 +390,17 @@ def send_morning_summary():
         except Exception:
             pass
 
-        email_alerts.send_daily_summary(positions, snapshots, earnings_section=earnings_section)
+        ok, err = email_alerts.send_daily_summary(
+            positions,
+            snapshots,
+            posture_changes=posture_changes,
+            watchlist_signals=watchlist_signals,
+            earnings_section=earnings_section,
+        )
+        if ok:
+            logger.info("Daily summary email sent successfully.")
+        else:
+            logger.error(f"Daily summary email failed: {err}")
     except Exception as e:
         logger.error(f"Daily summary failed: {e}")
 
@@ -356,10 +432,10 @@ def get_scheduler() -> BackgroundScheduler:
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="0", timezone=ET),
         id="watchlist_checks", replace_existing=True,
     )
-    # Daily portfolio summary — 9:35 AM ET, Mon-Fri
+    # Daily portfolio summary — 5:00 PM ET, Mon-Fri (after market close)
     sched.add_job(
         send_morning_summary,
-        CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=ET),
         id="daily_summary", replace_existing=True,
     )
     # Thesis refresh — 6:00 AM ET, Mon-Fri

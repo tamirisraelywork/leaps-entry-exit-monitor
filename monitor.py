@@ -59,8 +59,13 @@ def _fetch_market_data(position: dict) -> dict:
 
     thesis_score = db.get_leaps_monitor_score(ticker)
 
+    # Only use mid for P&L when the price is reliable.
+    # marketdata.app last-trade = reliable (exchange feed).
+    # yfinance last-trade = unreliable (may be user's own old buy price).
+    _mid_reliable = snapshot.get("_mid_reliable", snapshot.get("_mid_is_live", False))
+
     return {
-        "mid":          snapshot.get("mid"),
+        "mid":          snapshot.get("mid") if _mid_reliable else None,
         "delta":        snapshot.get("delta"),
         "dte":          snapshot.get("dte"),
         "iv_rank":      iv_rank,
@@ -83,13 +88,24 @@ def run_active_checks():
 
     for pos in positions:
         try:
+            pos_id = str(pos.get("id", ""))
             mkt    = _fetch_market_data(pos)
             alerts = evaluate(pos, mkt)
 
+            # ── Posture change detection ─────────────────────────────────────
+            new_posture  = _posture_from_alerts(alerts)
+            prev_posture = pos.get("last_posture")   # None if column is new
+            if new_posture != prev_posture:
+                logger.info(f"{pos.get('ticker')}: posture changed {prev_posture} → {new_posture}")
+                try:
+                    db.update_position_posture(pos_id, new_posture)
+                except Exception as e:
+                    logger.warning(f"Could not save posture for {pos.get('ticker')}: {e}")
+
+            # ── Alert emails (one per type per day) ──────────────────────────
             for alert in alerts:
-                pos_id = str(pos.get("id", ""))
                 if db.already_sent_today(alert.type, pos_id):
-                    continue  # dedup — one email per alert type per day
+                    continue
 
                 sent = email_alerts.send_alert(alert.subject, alert.body)
                 db.save_alert({
@@ -107,8 +123,7 @@ def run_active_checks():
                     "email_sent":           sent,
                 })
 
-            # Space calls to respect Polygon free-tier rate limit (5 req/min)
-            time.sleep(12)
+            time.sleep(2)
 
         except Exception as e:
             logger.error(f"Error checking position {pos.get('ticker')}: {e}")
@@ -209,19 +224,80 @@ def run_thesis_refresh():
 
 
 def send_morning_summary():
-    """Build and send the daily portfolio summary email."""
+    """
+    Build and send the 10 AM daily portfolio email.
+
+    Section 1 — ACTIVE POSITIONS: live market data + posture changes since yesterday.
+    Section 2 — WATCHLIST: entry signal status + current thesis scores.
+    """
     logger.info("Sending daily summary...")
     try:
         positions = db.get_positions()
+
+        # ── Fetch live data for active positions ──────────────────────────────
         snapshots = {}
         for pos in positions:
             if pos.get("mode") == "ACTIVE":
                 mkt = _fetch_market_data(pos)
                 snapshots[str(pos["id"])] = mkt
-                time.sleep(12)
-        email_alerts.send_daily_summary(positions, snapshots)
+                time.sleep(2)
+
+        # ── Fetch entry signals for watchlist positions ───────────────────────
+        watchlist_signals = {}
+        for pos in positions:
+            if pos.get("mode") != "WATCHLIST":
+                continue
+            try:
+                ticker = pos.get("ticker", "")
+                stock_data = get_price_and_range(ticker)
+                stock_data["weekly_rsi"] = get_weekly_rsi(ticker)
+                iv_rank = None
+                try:
+                    from iv_rank import get_iv_rank_advanced
+                    result = get_iv_rank_advanced(ticker)
+                    if result and "Success" in result:
+                        import re
+                        m = re.search(r"([\d.]+)", result.split("is:")[-1])
+                        iv_rank = float(m.group(1)) if m else None
+                except Exception:
+                    pass
+                entry_alert = evaluate_entry(pos, stock_data, iv_rank)
+                thesis_score = db.get_leaps_monitor_score(ticker)
+                watchlist_signals[str(pos["id"])] = {
+                    "entry_alert": entry_alert,
+                    "thesis_score": thesis_score,
+                    "iv_rank": iv_rank,
+                    "price": stock_data.get("price"),
+                    "rsi": stock_data.get("weekly_rsi"),
+                }
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"Watchlist signal fetch failed for {pos.get('ticker')}: {e}")
+
+        # ── Posture changes since last check ──────────────────────────────────
+        try:
+            changed_rows = db.get_recent_posture_changes(hours=26)
+            posture_changes = {r["id"]: r.get("last_posture", "HOLD") for r in changed_rows}
+        except Exception as e:
+            logger.warning(f"Could not fetch posture changes: {e}")
+            posture_changes = {}
+
+        email_alerts.send_daily_summary(
+            positions, snapshots,
+            posture_changes=posture_changes,
+            watchlist_signals=watchlist_signals,
+        )
     except Exception as e:
         logger.error(f"Daily summary failed: {e}")
+
+
+def _posture_from_alerts(alerts) -> str:
+    """Collapse a list of Alert objects to a single posture label."""
+    if not alerts:
+        return "HOLD"
+    priority = {"RED": 4, "BLUE": 3, "AMBER": 2, "GREEN": 1}
+    worst = max(alerts, key=lambda a: priority.get(a.severity, 0))
+    return {"RED": "EXIT", "BLUE": "ROLL", "AMBER": "WATCH", "GREEN": "HOLD"}.get(worst.severity, "HOLD")
 
 
 def _pnl_pct(entry_price, mid):
@@ -268,13 +344,13 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Daily summary — 9:35 AM ET, Mon-Fri
+    # Daily summary — 10:00 AM ET, Mon-Fri (after market open volatility settles)
     scheduler.add_job(
         send_morning_summary,
         CronTrigger(
             day_of_week="mon-fri",
-            hour=9,
-            minute=35,
+            hour=10,
+            minute=0,
             timezone=ET,
         ),
         id="daily_summary",

@@ -161,6 +161,74 @@ def recommend_options(ticker: str) -> dict:
     }
 
 
+def recommend_asymmetric(ticker: str) -> dict:
+    """
+    Recommend the best LEAPS contracts for an asymmetric entry strategy:
+      - Strike target: 40–50% above current stock price
+      - Expiry: furthest available ≥ 18 months (maximize time value)
+      - Strategy: accept high OTM for leveraged upside; premium stays low
+
+    Returns:
+        {
+          "stock_price":    float,
+          "target_strike_lo": float,   # 40% OTM
+          "target_strike_hi": float,   # 50% OTM
+          "contracts":      [list, best first],
+          "error":          str | None,
+        }
+    """
+    stock_price = get_stock_price(ticker)
+    if not stock_price:
+        return {"error": f"Could not fetch stock price for {ticker}.", "contracts": []}
+
+    target_lo = round(stock_price * 1.40, 2)
+    target_hi = round(stock_price * 1.50, 2)
+
+    chain = get_leaps_chain(ticker, min_dte=540)
+    if not chain:
+        return {
+            "stock_price":      stock_price,
+            "target_strike_lo": target_lo,
+            "target_strike_hi": target_hi,
+            "error": f"No LEAPS options found for {ticker} (≥ 18 months out).",
+            "contracts": [],
+        }
+
+    candidates = []
+    # Widen tolerance: accept strikes 35-60% OTM so we always return something
+    for c in chain:
+        strike = c.get("strike")
+        mid    = c.get("mid")
+        if not (strike and mid and mid > 0):
+            continue
+        otm_pct = (strike / stock_price - 1) * 100
+        if not (35 <= otm_pct <= 65):
+            continue
+
+        targets = calculate_return_targets(stock_price, strike, mid)
+        c.update(targets)
+
+        # Quality score: prefer strikes closer to 40-50% band + longer expiry + liquidity
+        closeness = max(0, 10 - abs(otm_pct - 45))        # 0-10: perfect = 45% OTM
+        dte_bonus  = 15 if c.get("dte", 0) >= 600 else 5  # prefer 20+ months
+        oi_bonus   = 8  if (c.get("open_interest") or 0) >= 500 else 0
+        iv_penalty = -5 if (c.get("implied_volatility") or 0) > 0.80 else 0
+        c["otm_pct"]      = round(otm_pct, 1)
+        c["rec_score"]    = closeness + dte_bonus + oi_bonus + iv_penalty
+        c["role"]         = "ASYMMETRIC"
+        candidates.append(c)
+
+    candidates.sort(key=lambda x: x["rec_score"], reverse=True)
+
+    return {
+        "stock_price":      stock_price,
+        "target_strike_lo": target_lo,
+        "target_strike_hi": target_hi,
+        "error":            None if candidates else f"No contracts found in 35-65% OTM range for {ticker}.",
+        "contracts":        candidates[:3],
+    }
+
+
 def format_recommendation(c: dict, stock_price: float) -> str:
     """Format a single contract recommendation as a human-readable string."""
     expiry  = c.get("expiration_date", "")

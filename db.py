@@ -115,9 +115,11 @@ def ensure_tables():
     # BigQuery ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent — safe to
     # run on every startup.
     _migrate_cols = [
-        ("quantity_trimmed",    "INT64"),
-        ("proceeds_from_trims", "FLOAT64"),
-        ("earnings_date",       "DATE"),      # next expected earnings date [NEW]
+        ("quantity_trimmed",       "INT64"),
+        ("proceeds_from_trims",    "FLOAT64"),
+        ("earnings_date",          "DATE"),       # next expected earnings date
+        ("last_posture",           "STRING"),     # last known recommendation: HOLD/WATCH/ROLL/EXIT
+        ("last_posture_changed_at","TIMESTAMP"),  # when posture last changed (for daily diff)
     ]
     pos_tbl_ref = f"`{client.project}.{DATASET}.positions`"
     for col_name, col_type in _migrate_cols:
@@ -214,13 +216,14 @@ def update_position(position_id: str, fields: dict):
     client = get_client()
     allowed = {"entry_price", "quantity", "entry_date", "expiration_date",
                "strike", "mode", "notes", "contract",
-               "quantity_trimmed", "proceeds_from_trims", "entry_thesis_score"}
+               "quantity_trimmed", "proceeds_from_trims", "entry_thesis_score",
+               "entry_delta", "entry_iv_rank", "position_type"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
 
     _INT64_COLS   = {"quantity", "quantity_trimmed", "entry_thesis_score"}
-    _FLOAT64_COLS = {"entry_price", "strike", "proceeds_from_trims"}
+    _FLOAT64_COLS = {"entry_price", "strike", "proceeds_from_trims", "entry_delta", "entry_iv_rank"}
     _DATE_COLS    = {"entry_date", "expiration_date"}
 
     set_clauses = []
@@ -261,6 +264,43 @@ def update_position_mode(position_id: str, mode: str):
         bigquery.ScalarQueryParameter("id", "STRING", position_id),
     ])
     client.query(q, job_config=job_config).result()
+
+
+def update_position_posture(position_id: str, posture: str):
+    """
+    Store the current recommendation posture on the position row.
+    Only writes if the posture changed so last_posture_changed_at is meaningful.
+    """
+    client = get_client()
+    q = f"""
+        UPDATE `{client.project}.{DATASET}.positions`
+        SET last_posture = @posture,
+            last_posture_changed_at = CURRENT_TIMESTAMP()
+        WHERE id = @id
+          AND (last_posture IS NULL OR last_posture != @posture)
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("posture", "STRING", posture),
+        bigquery.ScalarQueryParameter("id",      "STRING", position_id),
+    ])
+    client.query(q, job_config=job_config).result()
+
+
+def get_recent_posture_changes(hours: int = 26) -> list[dict]:
+    """
+    Return positions whose posture changed within the last `hours` hours.
+    Used by the morning summary to highlight what changed overnight.
+    """
+    client = get_client()
+    q = f"""
+        SELECT id, ticker, contract, last_posture, last_posture_changed_at
+        FROM `{client.project}.{DATASET}.positions`
+        WHERE mode = 'ACTIVE'
+          AND last_posture_changed_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+        ORDER BY last_posture_changed_at DESC
+    """
+    rows = list(client.query(q).result())
+    return [dict(r) for r in rows]
 
 
 def delete_position(position_id: str):

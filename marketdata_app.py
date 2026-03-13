@@ -168,6 +168,7 @@ def get_option_quote(ticker: str, contract: str) -> dict:
             "_source":            "marketdata.app",
             "_mid_source":        mid_source,
             "_mid_is_live":       mid_is_live,
+            "_mid_reliable":      True,   # marketdata.app prices (even last-trade) come from exchange feed — reliable for P&L
         }
 
     except Exception as e:

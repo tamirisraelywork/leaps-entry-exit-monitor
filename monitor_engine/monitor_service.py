@@ -102,12 +102,18 @@ def _fetch_market_data(position: dict) -> dict:
     iv_rank = None
     try:
         from iv_rank import get_iv_rank_advanced
-        result = get_iv_rank_advanced(ticker)
+        _iv_hint = (snapshot.get("implied_volatility") or 0) * 100 or None
+        result = get_iv_rank_advanced(ticker, current_iv_pct=_iv_hint)
         if result and "Success" in result:
             m = re.search(r"([\d.]+)", result.split("is:")[-1])
-            iv_rank = float(m.group(1)) if m else None
-    except Exception:
-        pass
+            if m:
+                iv_rank = float(m.group(1))
+            else:
+                logger.warning(f"IV rank parse failed for {ticker}: unexpected format '{result}'")
+        elif result:
+            logger.warning(f"IV rank unavailable for {ticker}: {result}")
+    except Exception as e:
+        logger.warning(f"IV rank fetch error for {ticker}: {e}")
 
     thesis_score = db.get_leaps_monitor_score(ticker)
 
@@ -122,12 +128,14 @@ def _fetch_market_data(position: dict) -> dict:
     except Exception:
         pass
 
+    earnings_thesis_impact = None
     try:
         from monitor_engine.earnings_call_analysis import get_latest_call_data, get_tone_delta
         call_data = get_latest_call_data(ticker)
         if call_data:
-            earnings_tone_score = call_data.get("tone_score")
+            earnings_tone_score      = call_data.get("tone_score")
             earnings_guidance_change = call_data.get("guidance_change")
+            earnings_thesis_impact   = call_data.get("thesis_impact")   # WEAKENED / UNCHANGED / STRENGTHENED
             earnings_tone_delta = get_tone_delta(ticker)
     except Exception:
         pass
@@ -151,6 +159,7 @@ def _fetch_market_data(position: dict) -> dict:
         "earnings_tone_score":       earnings_tone_score,
         "earnings_guidance_change":  earnings_guidance_change,
         "earnings_tone_delta":       earnings_tone_delta,
+        "thesis_impact":             earnings_thesis_impact,   # for EARNINGS_THESIS_BREAK alert
         "news_sentiment_score":      news_sentiment_score,
     }
 

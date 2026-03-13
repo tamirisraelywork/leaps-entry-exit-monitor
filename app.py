@@ -218,21 +218,83 @@ def _resolve_contract(pos: dict) -> str:
     return ""
 
 
+@st.cache_data(ttl=3600)
+def _get_earnings_data_cached(ticker: str) -> dict:
+    """
+    Fetch latest earnings call tone/guidance from BigQuery (cached 1 hr).
+    Returns keys: earnings_tone_score, earnings_guidance_change, thesis_impact, earnings_tone_delta.
+    Falls back gracefully to all-None if the table doesn't exist yet.
+    """
+    result = {
+        "earnings_tone_score":       None,
+        "earnings_guidance_change":  None,
+        "thesis_impact":             None,
+        "earnings_tone_delta":       None,
+        "news_sentiment_score":      None,
+    }
+    try:
+        from monitor_engine.earnings_call_analysis import get_latest_call_data, get_tone_delta
+        call_data = get_latest_call_data(ticker)
+        if call_data:
+            result["earnings_tone_score"]      = call_data.get("tone_score")
+            result["earnings_guidance_change"] = call_data.get("guidance_change")
+            result["thesis_impact"]            = call_data.get("thesis_impact")
+            result["earnings_tone_delta"]      = get_tone_delta(ticker)
+    except Exception:
+        pass
+    return result
+
+
+def _earnings_state_from_pos(pos: dict) -> str | None:
+    """Compute earnings_state from the stored earnings_date field — no API call needed."""
+    _ed = pos.get("earnings_date")
+    if not _ed:
+        return None
+    try:
+        _ed_d = _ed if hasattr(_ed, "toordinal") else date.fromisoformat(str(_ed))
+        _days = (_ed_d - date.today()).days
+        if _days < 0:
+            return "post"
+        if _days == 0:
+            return "day_of"
+        if _days <= 7:
+            return "week_of"
+        if _days <= 14:
+            return "imminent"
+        return "upcoming"
+    except Exception:
+        return None
+
+
 def _live_market(pos: dict) -> dict:
     ticker   = pos.get("ticker", "")
     contract = _resolve_contract(pos)
     snapshot = _get_snapshot_cached(ticker, contract) if contract else {}
     snapshot = snapshot or {}
-    # Reuse IV from snapshot to skip the option-chain round-trip in iv_rank
-    iv_pct = (snapshot.get("implied_volatility") or 0) * 100 or None
+    iv_pct   = (snapshot.get("implied_volatility") or 0) * 100 or None
+    raw_exp  = pos.get("expiration_date")
+    dte_fallback = None
+    if raw_exp:
+        try:
+            exp_d        = raw_exp if isinstance(raw_exp, date) else date.fromisoformat(str(raw_exp))
+            dte_fallback = max(0, (exp_d - date.today()).days)
+        except Exception:
+            pass
+    earnings = _get_earnings_data_cached(ticker)
     return {
-        "mid":          snapshot.get("mid"),
-        "bid":          snapshot.get("bid"),
-        "ask":          snapshot.get("ask"),
-        "delta":        snapshot.get("delta"),
-        "dte":          snapshot.get("dte"),
-        "iv_rank":      _get_iv_rank_cached(ticker, iv_pct),
-        "thesis_score": None,
+        "mid":                       snapshot.get("mid"),
+        "bid":                       snapshot.get("bid"),
+        "ask":                       snapshot.get("ask"),
+        "delta":                     snapshot.get("delta"),
+        "dte":                       snapshot.get("dte") or dte_fallback,
+        "iv_rank":                   _get_iv_rank_cached(ticker, iv_pct),
+        "thesis_score":              None,
+        "earnings_state":            _earnings_state_from_pos(pos),
+        "earnings_tone_score":       earnings["earnings_tone_score"],
+        "earnings_guidance_change":  earnings["earnings_guidance_change"],
+        "thesis_impact":             earnings["thesis_impact"],
+        "earnings_tone_delta":       earnings["earnings_tone_delta"],
+        "news_sentiment_score":      earnings["news_sentiment_score"],
     }
 
 
@@ -1652,18 +1714,26 @@ elif page == "📊 Dashboard":
                     iv_pct_dash = (snap.get("implied_volatility") or 0) * 100 or None
                     _mid_is_live  = snap.get("_mid_is_live", False)
                     _mid_reliable = snap.get("_mid_reliable", True)
+                    _earnings_d   = _get_earnings_data_cached(ticker)
                     mkt = {
-                        "mid":           snap.get("mid"),   # always pass through — use whatever price is available
-                        "mid_display":   snap.get("mid"),
-                        "bid":           snap.get("bid"),
-                        "ask":           snap.get("ask"),
-                        "delta":         snap.get("delta"),
-                        "dte":           snap.get("dte") or dte_fallback,
-                        "iv_rank":       _get_iv_rank_cached(ticker, iv_pct_dash),
-                        "thesis_score":  None,
-                        "_mid_source":   snap.get("_mid_source", "market"),
-                        "_mid_is_live":  _mid_is_live,
-                        "_mid_reliable": _mid_reliable,
+                        "mid":                       snap.get("mid"),
+                        "mid_display":               snap.get("mid"),
+                        "bid":                       snap.get("bid"),
+                        "ask":                       snap.get("ask"),
+                        "delta":                     snap.get("delta"),
+                        "dte":                       snap.get("dte") or dte_fallback,
+                        "iv_rank":                   _get_iv_rank_cached(ticker, iv_pct_dash),
+                        "thesis_score":              None,
+                        "_mid_source":               snap.get("_mid_source", "market"),
+                        "_mid_is_live":              _mid_is_live,
+                        "_mid_reliable":             _mid_reliable,
+                        # Pillar 5 — earnings & news signals
+                        "earnings_state":            _earnings_state_from_pos(pos),
+                        "earnings_tone_score":       _earnings_d["earnings_tone_score"],
+                        "earnings_guidance_change":  _earnings_d["earnings_guidance_change"],
+                        "thesis_impact":             _earnings_d["thesis_impact"],
+                        "earnings_tone_delta":       _earnings_d["earnings_tone_delta"],
+                        "news_sentiment_score":      _earnings_d["news_sentiment_score"],
                     }
 
             # ── Data quality notes ────────────────────────────────────────────
@@ -1709,7 +1779,7 @@ elif page == "📊 Dashboard":
             # alerts are from pillars that can't fire reliably, don't show a HOLD label —
             # show INCOMPLETE instead so the user knows they need to get data first.
             _dte_only_alerts = all(
-                a.type in ("DTE_HARD_STOP", "DTE_URGENT", "DTE_REVIEW")
+                a.type in ("EXIT_TIME_URGENT", "EXIT_TIME_WARNING", "ROLL_TIME")
                 for a in position_alerts
             )
             if position_alerts:

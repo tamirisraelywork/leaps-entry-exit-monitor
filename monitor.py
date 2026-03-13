@@ -35,41 +35,103 @@ ET = pytz.timezone("America/New_York")
 def _fetch_market_data(position: dict) -> dict:
     """
     Fetch live market data for an active position.
-    Returns a dict with: mid, delta, dte, iv_rank, thesis_score.
+    Returns a dict with: mid, delta, dte, iv_rank, thesis_score,
+    earnings_state, earnings_tone_score, earnings_guidance_change,
+    earnings_tone_delta, thesis_impact, news_sentiment_score.
     Missing values are None (handled gracefully by exit_engine).
     """
+    import re as _re
+    from datetime import date as _date
+
     ticker   = position.get("ticker", "")
-    contract = position.get("contract", "")
+    contract = (position.get("contract", "") or "").strip()
+
+    # Construct OCC from position fields if contract is missing
+    if not contract:
+        _strike = position.get("strike")
+        _exp    = position.get("expiration_date")
+        if _strike and _exp:
+            try:
+                _exp_d = _exp if hasattr(_exp, "strftime") else _date.fromisoformat(str(_exp))
+                _ot    = position.get("option_type", "C") or "C"
+                contract = options_data.to_occ(ticker, _exp_d, _ot, float(_strike))
+            except Exception as e:
+                logger.warning(f"Could not construct OCC for {ticker}: {e}")
 
     snapshot = {}
     if contract:
-        snapshot = options_data.get_option_snapshot(ticker, contract) or {}
+        try:
+            snapshot = options_data.get_option_snapshot(ticker, contract) or {}
+            if "_error" in snapshot:
+                logger.warning(f"Snapshot error for {ticker}: {snapshot['_error']}")
+                snapshot = {}
+        except Exception as e:
+            logger.warning(f"Snapshot failed for {ticker}: {e}")
 
-    # IV Rank (optional — may be slow; skip if unavailable)
+    # DTE fallback — always compute from expiration_date if snapshot missing
+    if snapshot.get("dte") is None:
+        _exp = position.get("expiration_date")
+        if _exp:
+            try:
+                _exp_d = _exp if hasattr(_exp, "toordinal") else _date.fromisoformat(str(_exp))
+                snapshot["dte"] = max(0, (_exp_d - _date.today()).days)
+            except Exception:
+                pass
+
+    # IV Rank
     iv_rank = None
     try:
         from iv_rank import get_iv_rank_advanced
-        result = get_iv_rank_advanced(ticker)
+        _iv_hint = (snapshot.get("implied_volatility") or 0) * 100 or None
+        result = get_iv_rank_advanced(ticker, current_iv_pct=_iv_hint)
         if result and "Success" in result:
-            import re
-            m = re.search(r"([\d.]+)", result.split("is:")[-1])
-            iv_rank = float(m.group(1)) if m else None
-    except Exception:
-        pass
+            m = _re.search(r"([\d.]+)", result.split("is:")[-1])
+            if m:
+                iv_rank = float(m.group(1))
+            else:
+                logger.warning(f"IV rank parse failed for {ticker}: '{result}'")
+    except Exception as e:
+        logger.warning(f"IV rank fetch failed for {ticker}: {e}")
 
     thesis_score = db.get_leaps_monitor_score(ticker)
 
-    # Only use mid for P&L when the price is reliable.
-    # marketdata.app last-trade = reliable (exchange feed).
-    # yfinance last-trade = unreliable (may be user's own old buy price).
-    _mid_reliable = snapshot.get("_mid_reliable", snapshot.get("_mid_is_live", False))
+    # Earnings data (Pillar 5 signals)
+    earnings_state = earnings_tone_score = earnings_guidance_change = None
+    earnings_tone_delta = earnings_thesis_impact = news_sentiment_score = None
+    try:
+        # earnings_state from stored earnings_date in position (no extra API call)
+        _ed = position.get("earnings_date")
+        if _ed:
+            try:
+                _ed_d   = _ed if hasattr(_ed, "toordinal") else _date.fromisoformat(str(_ed))
+                _days   = (_ed_d - _date.today()).days
+                if _days < 0:
+                    earnings_state = "post"
+                elif _days == 0:
+                    earnings_state = "day_of"
+                elif _days <= 7:
+                    earnings_state = "week_of"
+                elif _days <= 14:
+                    earnings_state = "imminent"
+                else:
+                    earnings_state = "upcoming"
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     return {
-        "mid":          snapshot.get("mid") if _mid_reliable else None,
-        "delta":        snapshot.get("delta"),
-        "dte":          snapshot.get("dte"),
-        "iv_rank":      iv_rank,
-        "thesis_score": thesis_score,
+        "mid":                       snapshot.get("mid"),
+        "delta":                     snapshot.get("delta"),
+        "dte":                       snapshot.get("dte"),
+        "iv_rank":                   iv_rank,
+        "thesis_score":              thesis_score,
+        "earnings_state":            earnings_state,
+        "earnings_tone_score":       earnings_tone_score,
+        "earnings_guidance_change":  earnings_guidance_change,
+        "earnings_tone_delta":       earnings_tone_delta,
+        "thesis_impact":             earnings_thesis_impact,
+        "news_sentiment_score":      news_sentiment_score,
     }
 
 
@@ -95,12 +157,26 @@ def run_active_checks():
             # ── Posture change detection ─────────────────────────────────────
             new_posture  = _posture_from_alerts(alerts)
             prev_posture = pos.get("last_posture")   # None if column is new
-            if new_posture != prev_posture:
+            # Only record a real change — not first-time initialisation to HOLD
+            _real_change = (
+                prev_posture is not None            # already had a known posture
+                and new_posture != prev_posture     # and it changed
+            ) or (
+                prev_posture is None                # first observation
+                and new_posture != "HOLD"           # but it's already actionable
+            )
+            if _real_change:
                 logger.info(f"{pos.get('ticker')}: posture changed {prev_posture} → {new_posture}")
                 try:
                     db.update_position_posture(pos_id, new_posture)
                 except Exception as e:
                     logger.warning(f"Could not save posture for {pos.get('ticker')}: {e}")
+            elif prev_posture is None:
+                # Quietly initialise — don't fire a "change" but do persist the baseline
+                try:
+                    db.update_position_posture(pos_id, new_posture)
+                except Exception:
+                    pass
 
             # ── Alert emails (one per type per day) ──────────────────────────
             for alert in alerts:

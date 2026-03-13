@@ -339,6 +339,12 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
         elif thesis_gap <= -10:    # thesis somewhat worse
             _thesis_exit = min(65, _thesis_exit + 5)
 
+    # Earnings tone deterioration → tighten thesis exit threshold (must happen
+    # BEFORE any pillar evaluates against _thesis_exit, not after)
+    _earnings_tone_delta_pre = market.get("earnings_tone_delta")
+    if _earnings_tone_delta_pre == "DETERIORATING":
+        _thesis_exit = min(65, _thesis_exit + 5)
+
     mid          = market.get("mid")
     bid          = market.get("bid")
     delta        = market.get("delta")
@@ -1205,10 +1211,6 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 ),
                 context=market,
             ))
-
-    # Adjust Pillar 1 exit threshold if tone is deteriorating consecutive quarters
-    if earnings_tone_delta == "DETERIORATING":
-        _thesis_exit = min(65, _thesis_exit + 5)
 
     # -----------------------------------------------------------------------
     # PILLAR 6 — IV Timing: Strike while the iron is hot

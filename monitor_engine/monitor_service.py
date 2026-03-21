@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -339,75 +340,179 @@ def run_news_checks():
         logger.error(f"News sentiment check failed: {e}")
 
 
+def _fetch_watchlist_signal(pos: dict) -> tuple[str, dict]:
+    """Fetch entry signal + contract recommendation for a single watchlist position."""
+    ticker = pos.get("ticker", "")
+    pos_id = str(pos.get("id", ""))
+    try:
+        stock_data = get_price_and_range(ticker)
+        stock_data["weekly_rsi"] = get_weekly_rsi(ticker)
+        price = stock_data.get("price")
+        if price is None:
+            logger.warning(f"Watchlist {ticker}: price fetch returned None (yfinance may be rate-limited)")
+
+        iv_rank = None
+        try:
+            from iv_rank import get_iv_rank_advanced
+            result = get_iv_rank_advanced(ticker)
+            if result and "Success" in result:
+                m = re.search(r"([\d.]+)", result.split("is:")[-1])
+                iv_rank = float(m.group(1)) if m else None
+        except Exception:
+            pass
+
+        entry_alert  = evaluate_entry(pos, stock_data, iv_rank)
+        thesis_score = db.get_leaps_monitor_score(ticker)
+
+        rec_strike = rec_expiry = rec_premium = rec_delta = rec_otm = None
+        try:
+            from recommender import recommend_asymmetric
+            rec = recommend_asymmetric(ticker)
+            if rec.get("contracts"):
+                top = rec["contracts"][0]
+                rec_strike  = top.get("strike")
+                rec_expiry  = str(top.get("expiration_date", ""))
+                rec_premium = top.get("mid")
+                rec_delta   = top.get("delta")
+                rec_otm     = top.get("otm_pct")
+        except Exception:
+            pass
+
+        return pos_id, {
+            "entry_alert":  entry_alert,
+            "thesis_score": thesis_score,
+            "iv_rank":      iv_rank,
+            "price":        price,
+            "rsi":          stock_data.get("weekly_rsi"),
+            "rec_strike":   rec_strike,
+            "rec_expiry":   rec_expiry,
+            "rec_premium":  rec_premium,
+            "rec_delta":    rec_delta,
+            "rec_otm_pct":  rec_otm,
+        }
+    except Exception as e:
+        logger.warning(f"Watchlist signal fetch failed for {ticker}: {e}")
+        return pos_id, {}
+
+
+def _build_earnings_tone_section(active_tickers: list[str]) -> str:
+    """
+    Build a text block summarising latest earnings call tone for active positions.
+    Returns empty string if no data available.
+    """
+    try:
+        from monitor_engine.earnings_call_analysis import get_latest_call_data, get_tone_delta
+    except Exception:
+        return ""
+
+    rows = []
+    for ticker in active_tickers:
+        try:
+            data = get_latest_call_data(ticker)
+            if not data:
+                continue
+            tone_label = data.get("tone_label") or data.get("overall_tone", "?")
+            guidance   = data.get("guidance_change") or data.get("forward_guidance", "?")
+            quarter    = data.get("quarter", "")
+            delta      = get_tone_delta(ticker) or "—"
+            tone_icon  = {"BULLISH": "🟢", "NEUTRAL": "🟡", "BEARISH": "🔴"}.get(tone_label, "⚪")
+            guide_icon = {"RAISED": "↑", "LOWERED": "↓", "WITHDRAWN": "✗"}.get(guidance, "→")
+            rows.append(
+                f"  {ticker:<6}  {tone_icon} {tone_label:<8} | Guidance {guide_icon} {guidance:<11}"
+                f"| Trend {delta:<14}| {quarter}"
+            )
+        except Exception:
+            pass
+
+    if not rows:
+        return ""
+
+    header = "  Ticker   Tone            Guidance             Trend              Quarter\n"
+    header += "  " + "─" * 70 + "\n"
+    return header + "\n".join(rows)
+
+
+def _build_news_section(active_tickers: list[str]) -> str:
+    """
+    Build a news sentiment section for active positions.
+    Only includes tickers with BEARISH or VERY_BEARISH signals.
+    Returns empty string if no concerning news.
+    """
+    try:
+        from monitor_engine.news_sentiment import get_news_sentiment_cached
+    except Exception:
+        return ""
+
+    bearish_rows = []
+    for ticker in active_tickers:
+        try:
+            data = get_news_sentiment_cached(ticker)
+            if not data:
+                continue
+            signal = data.get("signal", "NEUTRAL")
+            if signal not in ("BEARISH", "VERY_BEARISH"):
+                continue
+            score     = data.get("score", 0)
+            headline  = data.get("top_headline", "")
+            count     = data.get("article_count", 0)
+            icon      = "🔴" if signal == "VERY_BEARISH" else "⚠️"
+            bearish_rows.append(
+                f"  {icon} {ticker:<6}  score {score:+.2f} ({count} articles)\n"
+                f"       → {headline[:80]}"
+            )
+        except Exception:
+            pass
+
+    if not bearish_rows:
+        return "  ✓ No bearish news signals for active positions.\n"
+
+    return "\n".join(bearish_rows)
+
+
 def send_morning_summary():
     """Build and send the 5 PM daily portfolio summary email."""
     logger.info("Sending daily summary…")
     try:
         positions = db.get_positions()
+        active    = [p for p in positions if p.get("mode") == "ACTIVE"]
+        watchlist = [p for p in positions if p.get("mode") == "WATCHLIST"]
+        active_tickers = list({p.get("ticker", "") for p in active if p.get("ticker")})
 
-        # ── Active position live data ─────────────────────────────────────────
-        snapshots = {}
-        for pos in positions:
-            if pos.get("mode") == "ACTIVE":
-                mkt = _fetch_market_data(pos)
-                snapshots[str(pos["id"])] = mkt
-                time.sleep(2)
+        # ── Active position live data — parallel fetch ────────────────────────
+        snapshots: dict = {}
+        if active:
+            logger.info(f"Fetching market data for {len(active)} active positions (parallel)…")
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futures = {ex.submit(_fetch_market_data, pos): pos for pos in active}
+                for future in as_completed(futures):
+                    pos = futures[future]
+                    pos_id = str(pos.get("id", ""))
+                    try:
+                        mkt = future.result()
+                        snapshots[pos_id] = mkt
+                        if mkt.get("mid") is None:
+                            logger.warning(
+                                f"Active {pos.get('ticker')}: no option mid price "
+                                f"(contract='{pos.get('contract', '')}' "
+                                f"strike={pos.get('strike')} exp={pos.get('expiration_date')})"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Market data fetch failed for {pos.get('ticker')}: {e}")
+                        snapshots[pos_id] = {}
 
-        # ── Watchlist entry signals + contract recommendations ────────────────
-        watchlist_signals = {}
-        for pos in positions:
-            if pos.get("mode") != "WATCHLIST":
-                continue
-            try:
-                ticker = pos.get("ticker", "")
-                pos_id = str(pos.get("id", ""))
-
-                stock_data = get_price_and_range(ticker)
-                stock_data["weekly_rsi"] = get_weekly_rsi(ticker)
-
-                iv_rank = None
-                try:
-                    from iv_rank import get_iv_rank_advanced
-                    result = get_iv_rank_advanced(ticker)
-                    if result and "Success" in result:
-                        m = re.search(r"([\d.]+)", result.split("is:")[-1])
-                        iv_rank = float(m.group(1)) if m else None
-                except Exception:
-                    pass
-
-                entry_alert  = evaluate_entry(pos, stock_data, iv_rank)
-                thesis_score = db.get_leaps_monitor_score(ticker)
-
-                # Contract recommendation for email
-                rec_strike = rec_expiry = rec_premium = rec_delta = rec_otm = None
-                try:
-                    from recommender import recommend_asymmetric
-                    rec = recommend_asymmetric(ticker)
-                    if rec.get("contracts"):
-                        top = rec["contracts"][0]
-                        rec_strike  = top.get("strike")
-                        rec_expiry  = str(top.get("expiration_date", ""))
-                        rec_premium = top.get("mid")
-                        rec_delta   = top.get("delta")
-                        rec_otm     = top.get("otm_pct")
-                except Exception:
-                    pass
-
-                watchlist_signals[pos_id] = {
-                    "entry_alert":   entry_alert,
-                    "thesis_score":  thesis_score,
-                    "iv_rank":       iv_rank,
-                    "price":         stock_data.get("price"),
-                    "rsi":           stock_data.get("weekly_rsi"),
-                    "rec_strike":    rec_strike,
-                    "rec_expiry":    rec_expiry,
-                    "rec_premium":   rec_premium,
-                    "rec_delta":     rec_delta,
-                    "rec_otm_pct":   rec_otm,
-                }
-                time.sleep(2)
-            except Exception as e:
-                logger.warning(f"Watchlist signal fetch failed for {pos.get('ticker')}: {e}")
+        # ── Watchlist entry signals — parallel fetch ──────────────────────────
+        watchlist_signals: dict = {}
+        if watchlist:
+            logger.info(f"Fetching signals for {len(watchlist)} watchlist positions (parallel)…")
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = {ex.submit(_fetch_watchlist_signal, pos): pos for pos in watchlist}
+                for future in as_completed(futures):
+                    pos = futures[future]
+                    try:
+                        pos_id, sig = future.result()
+                        watchlist_signals[pos_id] = sig
+                    except Exception as e:
+                        logger.warning(f"Watchlist signal failed for {pos.get('ticker')}: {e}")
 
         # ── Posture changes since yesterday ───────────────────────────────────
         posture_changes = {}
@@ -425,12 +530,20 @@ def send_morning_summary():
         except Exception:
             pass
 
+        # ── Earnings call tone trends section ─────────────────────────────────
+        earnings_tone_section = _build_earnings_tone_section(active_tickers)
+
+        # ── News sentiment section ────────────────────────────────────────────
+        news_section = _build_news_section(active_tickers)
+
         ok, err = email_alerts.send_daily_summary(
             positions,
             snapshots,
             posture_changes=posture_changes,
             watchlist_signals=watchlist_signals,
             earnings_section=earnings_section,
+            earnings_tone_section=earnings_tone_section,
+            news_section=news_section,
         )
         if ok:
             logger.info("Daily summary email sent successfully.")
@@ -447,11 +560,54 @@ def send_morning_summary():
 _scheduler: BackgroundScheduler | None = None
 
 
+def _startup_check():
+    """
+    Log the status of all required secrets and config on startup.
+    Makes missing secrets immediately visible in the log instead of
+    causing silent failures hours later when the first job runs.
+    """
+    from shared.config import cfg
+
+    checks = [
+        ("GMAIL_SENDER",           cfg("GMAIL_SENDER") or cfg("ALERT_EMAIL_FROM")),
+        ("GMAIL_APP_PASSWORD",     cfg("GMAIL_APP_PASSWORD") or cfg("ALERT_EMAIL_PASS")),
+        ("ALERT_RECIPIENT_EMAIL",  cfg("ALERT_RECIPIENT_EMAIL")),
+        ("SERVICE_ACCOUNT_JSON",   cfg("SERVICE_ACCOUNT_JSON")[:12] if cfg("SERVICE_ACCOUNT_JSON") else ""),
+        ("MARKETDATA_TOKEN",       cfg("MARKETDATA_TOKEN")),
+        ("ALPHA_VANTAGE_API_KEY_1",cfg("ALPHA_VANTAGE_API_KEY_1")),
+        ("GEMINI_API_KEY",         cfg("GEMINI_API_KEY")),
+    ]
+
+    logger.info("─" * 55)
+    logger.info("Startup configuration check:")
+    for k, v in checks:
+        status = "OK  " if v else "MISSING"
+        logger.info(f"  {status}  {k}")
+    logger.info("─" * 55)
+
+    email_ok = (
+        (cfg("GMAIL_SENDER") or cfg("ALERT_EMAIL_FROM")) and
+        (cfg("GMAIL_APP_PASSWORD") or cfg("ALERT_EMAIL_PASS"))
+    )
+    if not email_ok:
+        logger.warning(
+            "Email is NOT configured. Daily summary and alert emails will fail silently. "
+            "Set GMAIL_SENDER + GMAIL_APP_PASSWORD in .streamlit/secrets.toml."
+        )
+    if not cfg("SERVICE_ACCOUNT_JSON"):
+        logger.error(
+            "SERVICE_ACCOUNT_JSON is MISSING. BigQuery operations will fail. "
+            "Monitor will not be able to read positions or save alerts."
+        )
+
+
 def get_scheduler() -> BackgroundScheduler:
     """Return the singleton scheduler, creating and starting it if needed."""
     global _scheduler
     if _scheduler is not None and _scheduler.running:
         return _scheduler
+
+    _startup_check()
 
     sched = BackgroundScheduler(timezone=ET)
 

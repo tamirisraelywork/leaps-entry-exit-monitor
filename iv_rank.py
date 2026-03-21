@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 IV Rank via yfinance — no Playwright, no proxy, no scraping needed.
 

@@ -19,6 +19,8 @@ Expert-recommended refresh schedule
   Earnings months  re-score if last score is >  7 days old
   (Feb/May/Aug/Nov) — most earnings releases happen in these months
 """
+from __future__ import annotations
+
 
 import asyncio
 import json

@@ -7,6 +7,8 @@ hours (9:30-16:00 ET, Mon-Fri) and send a daily summary at 9:35 AM ET.
 The scheduler is started once via @st.cache_resource so it survives
 Streamlit reruns and shares a single instance across all sessions.
 """
+from __future__ import annotations
+
 
 import time
 import logging

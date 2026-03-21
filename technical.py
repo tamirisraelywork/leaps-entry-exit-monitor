@@ -6,8 +6,29 @@ Used for:
   - Current stock price fallback
 """
 
+from __future__ import annotations
+
+import threading
+import time
+
 import yfinance as yf
 import pandas as pd
+
+# Shared rate gate — prevents concurrent yfinance calls from bursting Yahoo Finance.
+# Max 2 simultaneous calls; each call waits at least 0.5 s after the previous one.
+_yf_sem   = threading.Semaphore(2)
+_yf_last  = 0.0
+_yf_lock  = threading.Lock()
+_YF_GAP   = 0.5   # seconds between calls through this module
+
+
+def _technical_yf_throttle():
+    global _yf_last
+    with _yf_lock:
+        gap = _YF_GAP - (time.time() - _yf_last)
+        if gap > 0:
+            time.sleep(gap)
+        _yf_last = time.time()
 
 
 def get_weekly_rsi(ticker: str, period: int = 14) -> float | None:
@@ -16,8 +37,10 @@ def get_weekly_rsi(ticker: str, period: int = 14) -> float | None:
     A reading below 30 is considered technically oversold (good LEAPS entry timing).
     """
     try:
-        data = yf.download(ticker, period="2y", interval="1wk",
-                           auto_adjust=True, progress=False)
+        with _yf_sem:
+            _technical_yf_throttle()
+            data = yf.download(ticker, period="2y", interval="1wk",
+                               auto_adjust=True, progress=False)
         if data.empty or len(data) < period + 1:
             return None
         close = data["Close"].squeeze()
@@ -54,7 +77,9 @@ def get_price_and_range(ticker: str) -> dict:
         "ma50_above_ma200": None,
     }
     try:
-        info   = yf.Ticker(ticker).info
+        with _yf_sem:
+            _technical_yf_throttle()
+            info   = yf.Ticker(ticker).info
         price  = info.get("currentPrice") or info.get("regularMarketPrice")
         low52  = info.get("fiftyTwoWeekLow")
         high52 = info.get("fiftyTwoWeekHigh")

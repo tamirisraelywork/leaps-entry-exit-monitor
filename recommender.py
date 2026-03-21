@@ -16,6 +16,8 @@ Portfolio strategy this engine is designed for:
   - 4 CORE positions    (moderate risk, targeting 3-5x)
   - 4 remaining         (tactical / exit-managed)
 """
+from __future__ import annotations
+
 
 from datetime import date
 from options_data import get_leaps_chain, get_stock_price
@@ -108,15 +110,18 @@ def recommend_options(ticker: str) -> dict:
     if not stock_price:
         return {"error": f"Could not fetch stock price for {ticker}. Check the ticker.", "MOONSHOT": [], "CORE": []}
 
-    chain = get_leaps_chain(ticker, min_dte=540)  # >= 18 months
+    chain = get_leaps_chain(ticker, min_dte=540)  # tries 18m → 12m → 9m fallback
     if not chain:
         return {
             "stock_price": stock_price,
-            "error": f"No LEAPS options found for {ticker} (>= 18 months out). "
+            "error": f"No LEAPS options found for {ticker} (tried 18, 12, and 9 months out). "
                      "This ticker may not have long-dated options available.",
             "MOONSHOT": [],
             "CORE": [],
         }
+
+    # Note the actual min DTE in the chain so the UI can show the right context
+    actual_min_dte = min(c.get("dte", 0) for c in chain)
 
     moonshots = []
     cores     = []
@@ -154,10 +159,11 @@ def recommend_options(ticker: str) -> dict:
     cores.sort(    key=lambda x: x["score"], reverse=True)
 
     return {
-        "stock_price": stock_price,
-        "error":       None,
-        "MOONSHOT":    moonshots[:3],   # top 3 moonshot candidates
-        "CORE":        cores[:3],       # top 3 core candidates
+        "stock_price":   stock_price,
+        "error":         None,
+        "actual_min_dte": actual_min_dte,
+        "MOONSHOT":      moonshots[:3],
+        "CORE":          cores[:3],
     }
 
 
@@ -184,13 +190,13 @@ def recommend_asymmetric(ticker: str) -> dict:
     target_lo = round(stock_price * 1.40, 2)
     target_hi = round(stock_price * 1.50, 2)
 
-    chain = get_leaps_chain(ticker, min_dte=540)
+    chain = get_leaps_chain(ticker, min_dte=540)  # tries 18m → 12m → 9m fallback
     if not chain:
         return {
             "stock_price":      stock_price,
             "target_strike_lo": target_lo,
             "target_strike_hi": target_hi,
-            "error": f"No LEAPS options found for {ticker} (≥ 18 months out).",
+            "error": f"No LEAPS options found for {ticker} (tried 18, 12, and 9 months out).",
             "contracts": [],
         }
 

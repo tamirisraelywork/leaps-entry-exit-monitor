@@ -12,6 +12,8 @@ Response fields (all arrays, index 0 for single contract):
 Add to .streamlit/secrets.toml:
   MARKETDATA_TOKEN = "your_token_here"
 """
+from __future__ import annotations
+
 
 import requests
 import time
@@ -86,13 +88,18 @@ def get_option_quote(ticker: str, contract: str) -> dict:
         return {"_error": "marketdata.app: account not authorized"}
     if resp.status_code == 404:
         return {"_error": f"marketdata.app: contract not found ({symbol})"}
-    if resp.status_code != 200:
+    if not (200 <= resp.status_code < 300):
         return {"_error": f"marketdata.app: HTTP {resp.status_code}"}
 
     try:
         body = resp.json()
-        if body.get("s") != "ok":
-            msg = body.get("errmsg") or body.get("s") or "unknown"
+        status = body.get("s")
+        if status == "no_data":
+            # marketdata.app returns this when there are genuinely no quotes right now
+            # (market closed, illiquid, or after-hours). Soft miss — fall through to yfinance.
+            return {"_error": "marketdata.app: no_data"}
+        if status != "ok":
+            msg = body.get("errmsg") or status or "unknown"
             return {"_error": f"marketdata.app: {msg}"}
 
         # All values are single-element arrays

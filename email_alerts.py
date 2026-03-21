@@ -7,6 +7,8 @@ Required secrets:
   GMAIL_APP_PASSWORD    — 16-char Google App Password (not your regular password)
   ALERT_RECIPIENT_EMAIL — address to send alerts TO (can be same as sender)
 """
+from __future__ import annotations
+
 
 import logging
 import smtplib
@@ -14,7 +16,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 
+import pytz
+
 from shared.config import cfg
+
+_ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +48,11 @@ def _make_message(subject: str, body: str) -> MIMEMultipart:
     msg["To"]      = recipient
 
     # Plain-text version (primary — no HTML needed for alert emails)
+    now_et = datetime.now(_ET)
     footer = (
         "\n\n"
         + "─" * 50 + "\n"
-        + f"LEAPS Position Manager · {datetime.now().strftime('%b %d, %Y  %H:%M')} UTC\n"
+        + f"LEAPS Position Manager · {now_et.strftime('%b %d, %Y  %I:%M %p')} ET\n"
         + "Automated alert — do not reply.\n"
     )
     msg.attach(MIMEText(body + footer, "plain"))
@@ -116,17 +123,21 @@ def send_daily_summary(
     posture_changes: dict | None = None,
     watchlist_signals: dict | None = None,
     earnings_section: str = "",
+    earnings_tone_section: str = "",
+    news_section: str = "",
 ) -> tuple[bool, str]:
     """
     Build and send the 5 PM daily portfolio summary email.
 
     Args:
-        positions:         list of position dicts (from db.get_positions)
-        market_snapshots:  dict keyed by position id → market data dict (active only)
-        posture_changes:   dict keyed by position id → new posture (changed since yesterday)
-        watchlist_signals: dict keyed by position id → {entry_alert, thesis_score, iv_rank, price, rsi,
-                                                         rec_strike, rec_expiry, rec_premium, rec_delta, rec_otm_pct}
-        earnings_section:  optional pre-built earnings calendar text block
+        positions:              list of position dicts (from db.get_positions)
+        market_snapshots:       dict keyed by position id → market data dict (active only)
+        posture_changes:        dict keyed by position id → new posture (changed since yesterday)
+        watchlist_signals:      dict keyed by position id → {entry_alert, thesis_score, iv_rank,
+                                                              price, rsi, rec_strike, ...}
+        earnings_section:       optional pre-built earnings calendar text block
+        earnings_tone_section:  optional pre-built earnings call tone trends block
+        news_section:           optional pre-built news sentiment summary block
     """
     from exit_engine import evaluate
 
@@ -314,9 +325,26 @@ def send_daily_summary(
     if earnings_section:
         body += (
             "\n" + "━" * 60 + "\n"
-            "  EARNINGS CALENDAR\n"
+            "  SECTION 3 — EARNINGS CALENDAR\n"
             + "━" * 60 + "\n"
             + earnings_section + "\n"
         )
+
+    # Earnings call tone trends section
+    if earnings_tone_section:
+        body += (
+            "\n" + "━" * 60 + "\n"
+            "  SECTION 4 — EARNINGS CALL TONE TRENDS\n"
+            + "━" * 60 + "\n"
+            + earnings_tone_section + "\n"
+        )
+
+    # News sentiment section
+    body += (
+        "\n" + "━" * 60 + "\n"
+        "  SECTION 5 — NEWS SENTIMENT (Active Positions)\n"
+        + "━" * 60 + "\n"
+        + (news_section if news_section else "  No news data available.\n")
+    )
 
     return send_alert(subject, body)

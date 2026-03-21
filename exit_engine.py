@@ -26,6 +26,8 @@ Each alert has:
   context  — dict of the market data snapshot that triggered it
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import date
 from options_data import get_roll_contract_price

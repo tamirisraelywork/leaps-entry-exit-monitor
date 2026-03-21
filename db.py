@@ -3,6 +3,8 @@ BigQuery operations for the LEAPS Exit Agent.
 Manages two tables: positions and alerts.
 """
 
+from __future__ import annotations
+
 import json
 import uuid
 from datetime import datetime, date
@@ -401,6 +403,48 @@ def get_leaps_monitor_score(ticker: str) -> int | None:
     except Exception:
         pass
     return None
+
+
+def get_all_leaps_scores_with_age(tickers: list[str]) -> dict[str, tuple[int | None, int | None]]:
+    """
+    Batch fetch the latest thesis score + age for multiple tickers in ONE BigQuery query.
+    Returns {TICKER_UPPER: (score, days_old)}.
+    Replaces N individual get_leaps_monitor_score_with_age() calls on the dashboard.
+    """
+    if not tickers:
+        return {}
+    try:
+        client = get_client()
+        raw_dataset = cfg("DATASET_ID") or cfg("LEAPS_MONITOR_DATASET", "leaps_monitor")
+        table = cfg("LEAPS_MONITOR_TABLE", "master_table")
+        if "." in str(raw_dataset):
+            full_table = f"`{raw_dataset}.{table}`"
+        else:
+            full_table = f"`{client.project}.{raw_dataset}.{table}`"
+
+        q = f"""
+            SELECT UPPER(Ticker) AS ticker, Score, date
+            FROM {full_table}
+            WHERE UPPER(Ticker) IN UNNEST(@tickers)
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY UPPER(Ticker) ORDER BY date DESC) = 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("tickers", "STRING", [t.upper() for t in tickers])
+            ]
+        )
+        rows = list(client.query(q, job_config=job_config).result())
+        result = {}
+        for row in rows:
+            score = int(float(row["Score"]))
+            try:
+                days_old = (date.today() - date.fromisoformat(str(row["date"])[:10])).days
+            except Exception:
+                days_old = None
+            result[str(row["ticker"]).upper()] = (score, days_old)
+        return result
+    except Exception:
+        return {}
 
 
 def get_leaps_monitor_score_with_age(ticker: str) -> tuple[int | None, int | None]:

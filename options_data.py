@@ -8,6 +8,8 @@ Add to .streamlit/secrets.toml:
   MARKETDATA_TOKEN = "your_token_here"
 """
 
+from __future__ import annotations
+
 import math
 import time
 import threading
@@ -17,16 +19,27 @@ from shared.config import cfg
 import marketdata_app
 
 # ---------------------------------------------------------------------------
-# Module-level TTL cache — avoids re-hitting yfinance on every page reload
+# Module-level contract snapshot cache — avoids re-hitting APIs on every reload
 # ---------------------------------------------------------------------------
 _cache: dict = {}
 _cache_lock = threading.Lock()
-_CACHE_TTL = 600   # 10 minutes
+_CACHE_TTL = 1200   # 20 minutes (up from 10)
+
+# ---------------------------------------------------------------------------
+# Ticker-level yfinance chain cache — ONE chain fetch per ticker+expiry
+# regardless of how many individual contracts reference it.
+# Eliminates the N×yfinance burst when loading 10 positions at once.
+# ---------------------------------------------------------------------------
+_yf_chain_cache: dict = {}          # key: f"{ticker}::{exp_str}" → (ts, df_calls, df_puts)
+_yf_opts_cache:  dict = {}          # key: ticker            → (ts, available_expiries)
+_yf_price_cache: dict = {}          # key: ticker            → (ts, price)
+_yf_chain_lock  = threading.Lock()
+_YF_CHAIN_TTL   = 1800   # 30 minutes — chain data
+_YF_PRICE_TTL   = 300    #  5 minutes — stock price
 
 # ---------------------------------------------------------------------------
 # Global yfinance rate limiter — serializes ALL yfinance network calls
-# so 16 simultaneous dashboard loads don't burst Yahoo Finance.
-# Ensures ≥1.5 s between consecutive yfinance requests across all threads.
+# so concurrent dashboard loads don't burst Yahoo Finance.
 # ---------------------------------------------------------------------------
 _yf_gate = threading.Lock()
 _yf_last_call_ts: float = 0.0
@@ -34,7 +47,6 @@ _YF_CALL_GAP = 1.5   # seconds between yfinance network calls
 
 
 def _yf_throttle():
-    """Acquire the rate gate and wait if needed before making a yfinance call."""
     global _yf_last_call_ts
     with _yf_gate:
         gap = _YF_CALL_GAP - (time.time() - _yf_last_call_ts)
@@ -42,6 +54,10 @@ def _yf_throttle():
             time.sleep(gap)
         _yf_last_call_ts = time.time()
 
+
+# ---------------------------------------------------------------------------
+# Snapshot cache helpers
+# ---------------------------------------------------------------------------
 
 def _cache_get(key: str):
     with _cache_lock:
@@ -57,11 +73,102 @@ def _cache_set(key: str, value):
 
 
 # ---------------------------------------------------------------------------
+# Ticker-level yfinance cached helpers
+# ---------------------------------------------------------------------------
+
+def _yf_get_options_list(ticker: str) -> list[str] | None:
+    """
+    Return the list of available expiry date strings for a ticker.
+    Cached for 30 minutes; serialized through the global rate gate.
+    """
+    with _yf_chain_lock:
+        entry = _yf_opts_cache.get(ticker)
+        if entry and (time.time() - entry[0]) < _YF_CHAIN_TTL:
+            return entry[1]
+
+    # Not in cache — fetch
+    import yfinance as yf
+    _yf_throttle()
+    try:
+        available = yf.Ticker(ticker).options
+    except Exception as e:
+        err = str(e)
+        if any(x in err for x in ("Too Many Requests", "rate limit", "429")):
+            time.sleep(12)
+            _yf_throttle()
+            try:
+                available = yf.Ticker(ticker).options
+            except Exception:
+                return None
+        else:
+            return None
+
+    if not available:
+        return None
+
+    with _yf_chain_lock:
+        _yf_opts_cache[ticker] = (time.time(), list(available))
+    return list(available)
+
+
+def _yf_get_chain(ticker: str, exp_str: str):
+    """
+    Return (df_calls, df_puts) for a ticker+expiry, cached 30 min.
+    """
+    key = f"{ticker}::{exp_str}"
+    with _yf_chain_lock:
+        entry = _yf_chain_cache.get(key)
+        if entry and (time.time() - entry[0]) < _YF_CHAIN_TTL:
+            return entry[1], entry[2]
+
+    import yfinance as yf
+    _yf_throttle()
+    try:
+        chain = yf.Ticker(ticker).option_chain(exp_str)
+    except Exception as e:
+        err = str(e)
+        if any(x in err for x in ("Too Many Requests", "rate limit", "429")):
+            time.sleep(12)
+            _yf_throttle()
+            try:
+                chain = yf.Ticker(ticker).option_chain(exp_str)
+            except Exception:
+                return None, None
+        else:
+            return None, None
+
+    with _yf_chain_lock:
+        _yf_chain_cache[key] = (time.time(), chain.calls, chain.puts)
+    return chain.calls, chain.puts
+
+
+def _yf_get_price(ticker: str) -> float | None:
+    """Return latest stock price, cached 5 min."""
+    with _yf_chain_lock:
+        entry = _yf_price_cache.get(ticker)
+        if entry and (time.time() - entry[0]) < _YF_PRICE_TTL:
+            return entry[1]
+
+    import yfinance as yf
+    _yf_throttle()
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price = fi.last_price or fi.previous_close
+        if price:
+            price = float(price)
+            with _yf_chain_lock:
+                _yf_price_cache[ticker] = (time.time(), price)
+            return price
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _norm_cdf(x: float) -> float:
-    """Standard normal CDF via math.erf — no scipy needed."""
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
 
@@ -71,11 +178,7 @@ def _norm_pdf(x: float) -> float:
 
 def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
                option_type: str = "C") -> dict:
-    """
-    Full Black-Scholes Greeks for a European option.
-    Returns dict with delta, gamma, theta (per day), vega (per 1% IV move).
-    Returns empty dict on bad inputs.
-    """
+    """Full Black-Scholes Greeks. Returns empty dict on bad inputs."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {}
     try:
@@ -86,14 +189,13 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
 
         delta = _norm_cdf(d1) if is_call else (_norm_cdf(d1) - 1.0)
         gamma = pdf1 / (S * sigma * math.sqrt(T))
-        vega  = S * pdf1 * math.sqrt(T) * 0.01          # per 1% change in IV
+        vega  = S * pdf1 * math.sqrt(T) * 0.01
         theta_raw = (
             -(S * pdf1 * sigma) / (2 * math.sqrt(T))
             - r * K * math.exp(-r * T) * (_norm_cdf(d2) if is_call else _norm_cdf(-d2))
         )
-        theta = theta_raw / 365.0                         # per calendar day
+        theta = theta_raw / 365.0
 
-        # Sanity-check delta — 0.0001 lower bound to preserve deeply OTM LEAPS deltas
         if not (0.0001 <= abs(delta) <= 0.9999):
             delta = None
 
@@ -108,15 +210,10 @@ def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
 
 
 def _bs_delta(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "C") -> float | None:
-    """Black-Scholes delta only (kept for backward compatibility)."""
     return _bs_greeks(S, K, T, r, sigma, option_type).get("delta")
 
 
 def _parse_occ(contract: str, ticker: str) -> dict | None:
-    """
-    Parse an OCC symbol back to (expiry, strike, option_type).
-    e.g. 'O:NVDA270115C00150000' → {expiry: date(2027,1,15), strike: 150.0, option_type: 'C'}
-    """
     try:
         s = contract
         if s.startswith("O:"):
@@ -126,7 +223,7 @@ def _parse_occ(contract: str, ticker: str) -> dict | None:
             return None
         s = s[len(ticker_upper):]
         exp_date = datetime.strptime(s[:6], "%y%m%d").date()
-        opt_type = s[6]   # 'C' or 'P'
+        opt_type = s[6]
         strike   = int(s[7:]) / 1000.0
         return {"expiry": exp_date, "strike": strike, "option_type": opt_type}
     except Exception:
@@ -134,44 +231,25 @@ def _parse_occ(contract: str, ticker: str) -> dict | None:
 
 
 def to_occ(ticker: str, expiry: date, option_type: str, strike: float) -> str:
-    """
-    Build an OCC option symbol from human-readable inputs.
-    Example: NVDA, 2027-01-15, 'C', 150.0  →  O:NVDA270115C00150000
-    """
+    """Build an OCC option symbol. Example: O:NVDA270115C00150000"""
     exp = expiry.strftime("%y%m%d")
     strike_str = f"{int(round(strike * 1000)):08d}"
     return f"O:{ticker.upper()}{exp}{option_type.upper()}{strike_str}"
 
 
 # ---------------------------------------------------------------------------
-# yfinance option snapshot (free, always available)
+# yfinance option snapshot — uses ticker-level chain cache
 # ---------------------------------------------------------------------------
 
 def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type: str = "C") -> dict:
     """
-    Fetch option bid/ask/IV via yfinance and compute all Greeks via Black-Scholes.
-    Retries up to 3 times on rate-limit errors with exponential back-off.
+    Fetch option bid/ask/IV via yfinance (chain-level cache) + Black-Scholes greeks.
+    The chain is cached per ticker+expiry, so 10 positions on the same ticker+expiry
+    result in only ONE yfinance network call.
     """
     try:
-        import yfinance as yf
-        t = yf.Ticker(ticker)
-
-        # Fetch available expiries — global rate gate prevents burst across threads
-        _yf_throttle()
-        try:
-            available = t.options
-        except Exception as e:
-            last_err = str(e)
-            if any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
-                # One retry after a longer wait
-                time.sleep(10)
-                try:
-                    _yf_throttle()
-                    available = t.options
-                except Exception as e2:
-                    return {"_error": f"yfinance rate-limited after retries: {e2}"}
-            else:
-                return {"_error": f"yfinance could not fetch option chain: {e}"}
+        # Step 1: find the closest available expiry
+        available = _yf_get_options_list(ticker)
         if not available:
             return {"_error": "yfinance returned no expiry dates for this ticker"}
 
@@ -180,24 +258,12 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             target_str = min(available, key=lambda d: abs((date.fromisoformat(d) - expiry).days))
         actual_expiry = date.fromisoformat(target_str)
 
-        # Fetch option chain — throttle before this call too
-        _yf_throttle()
-        try:
-            chain = t.option_chain(target_str)
-        except Exception as e:
-            last_err = str(e)
-            if any(x in last_err for x in ("Too Many Requests", "rate limit", "429")):
-                time.sleep(10)
-                try:
-                    _yf_throttle()
-                    chain = t.option_chain(target_str)
-                except Exception as e2:
-                    return {"_error": f"yfinance rate-limited after retries: {e2}"}
-            else:
-                return {"_error": f"yfinance option_chain failed: {e}"}
-        last_err = ""
+        # Step 2: get chain from cache (or fetch once)
+        df_calls, df_puts = _yf_get_chain(ticker, target_str)
+        if df_calls is None:
+            return {"_error": "yfinance rate-limited after retries: Too Many Requests"}
 
-        df = chain.calls if option_type.upper() == "C" else chain.puts
+        df = df_calls if option_type.upper() == "C" else df_puts
         exact = df[df["strike"] == float(strike)]
         if exact.empty:
             exact = df.iloc[(df["strike"] - float(strike)).abs().argsort()[:1]]
@@ -210,29 +276,27 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         last = float(row.get("lastPrice") or 0)
         mid  = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else None
 
-        # IV — cap at 200% to avoid BS degeneration on illiquid options
         raw_iv = float(row.get("impliedVolatility") or 0)
         iv = min(raw_iv, 2.0) if raw_iv > 0 else None
 
-        # Black-Scholes Greeks (delta, gamma, theta, vega) — computed from IV + stock price
+        # Step 3: stock price from cache for BS greeks
         greeks = {}
-        mid_source = "market"
         try:
-            _yf_throttle()
-            fi = t.fast_info
-            S  = fi.last_price or fi.previous_close
+            S = _yf_get_price(ticker)
             if S and iv and iv > 0.01:
-                T      = max((actual_expiry - date.today()).days, 1) / 365.0
+                T = max((actual_expiry - date.today()).days, 1) / 365.0
                 greeks = _bs_greeks(float(S), float(strike), T, 0.045, iv, option_type)
         except Exception:
             pass
 
-        # For illiquid options with no live bid/ask, fall back to last traded price.
         mid_is_live = (bid > 0 and ask > 0)
+        mid_source = "market"
+        if mid is None and last > 0:
+            mid = last
+            mid_source = "last trade"
+
         if mid is None:
-            if last > 0:
-                mid = last
-                mid_source = "last trade"
+            return {"_error": f"yfinance: no price data for {ticker} {target_str} ${strike}"}
 
         return {
             "delta":              greeks.get("delta"),
@@ -250,7 +314,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             "_source":            "yfinance+BS",
             "_mid_source":        mid_source,
             "_mid_is_live":       mid_is_live,
-            "_mid_reliable":      True,   # use whatever price is available for P&L
+            "_mid_reliable":      True,
         }
 
     except Exception as e:
@@ -262,10 +326,6 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
 # ---------------------------------------------------------------------------
 
 def _historical_vol(ticker: str, days: int = 30) -> float | None:
-    """
-    Compute annualized historical volatility from the last N trading days.
-    Used as an IV proxy for delta calculation when option IV is unavailable.
-    """
     try:
         import yfinance as yf
         import math as _math
@@ -286,18 +346,12 @@ def _historical_vol(ticker: str, days: int = 30) -> float | None:
 
 
 def _fill_missing_delta(result: dict, ticker: str, parsed: dict | None) -> dict:
-    """
-    If delta is missing (illiquid option, no IV), compute it using the stock's
-    historical volatility as an IV proxy. Marks result as 'estimated'.
-    """
     if result.get("delta") is not None:
         return result
     if not parsed:
         return result
     try:
-        import yfinance as yf
-        _yf_throttle()
-        S = yf.Ticker(ticker).fast_info.last_price
+        S = _yf_get_price(ticker)
         if not S:
             return result
         expiry = parsed["expiry"]
@@ -325,12 +379,9 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
 
     Source priority:
       1. marketdata.app — requires MARKETDATA_TOKEN in secrets.toml
-      2. yfinance       — free fallback; unreliable for illiquid options
+      2. yfinance       — free fallback; chain cached per ticker+expiry
 
-    If delta is missing (illiquid option, no IV), computes delta from the
-    stock's 30-day historical volatility as a proxy.
-
-    Results cached 10 minutes. Errors cached 1 minute.
+    Results cached 20 minutes. Errors cached 1 minute.
     """
     cache_key = f"{ticker}::{contract}"
     cached = _cache_get(cache_key)
@@ -368,7 +419,7 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
         return yf_result
     errors["yfinance"] = yf_result.get("_error", "unknown")
 
-    # Both failed — cache briefly so we don't hammer the APIs
+    # Both failed — cache briefly
     err_msg = " | ".join(f"{k}: {v}" for k, v in errors.items())
     err_result = {"_error": f"All sources failed — {err_msg}"}
     with _cache_lock:
@@ -378,16 +429,31 @@ def get_option_snapshot(ticker: str, contract: str) -> dict:
 
 def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
     """
-    Fetch all LEAPS call contracts for a ticker with at least min_dte days
-    to expiration, including their greeks.
+    Fetch all LEAPS call contracts with at least min_dte days to expiration.
 
-    Falls back to yfinance option chain.
+    Fallback logic: if no options meet the min_dte threshold, automatically
+    tries 365 days (12 months) and then 270 days (9 months) before giving up.
+    This handles small/mid-caps that don't have 18-month options listed yet.
+
+    Returns a list of contract dicts with greeks.
     """
-    # --- yfinance ---
+    # Try progressively shorter min_dte thresholds if the preferred window is empty
+    thresholds = sorted(set([min_dte, 365, 270]), reverse=True)
+
+    for threshold in thresholds:
+        chain = _fetch_leaps_chain(ticker, threshold)
+        if chain:
+            return chain
+
+    return []
+
+
+def _fetch_leaps_chain(ticker: str, min_dte: int) -> list[dict]:
+    """Internal: fetch LEAPS chain for a specific min_dte threshold."""
     try:
         import yfinance as yf
-        t = yf.Ticker(ticker)
-        available = t.options
+
+        available = _yf_get_options_list(ticker)
         if not available:
             return []
 
@@ -396,22 +462,19 @@ def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
         if not leaps_dates:
             return []
 
-        # Get stock price once
-        try:
-            fi = t.fast_info
-            S = fi.last_price or fi.previous_close
-        except Exception:
-            S = None
+        S = _yf_get_price(ticker)
 
-        chain = []
+        chain_out = []
         for exp_str in leaps_dates:
             try:
                 expiry = date.fromisoformat(exp_str)
                 dte = (expiry - date.today()).days
-                calls = t.option_chain(exp_str).calls
-                time.sleep(0.5)  # gentle rate limiting
 
-                for _, row in calls.iterrows():
+                df_calls, _ = _yf_get_chain(ticker, exp_str)
+                if df_calls is None:
+                    continue
+
+                for _, row in df_calls.iterrows():
                     strike = float(row.get("strike", 0))
                     bid    = float(row.get("bid") or 0)
                     ask    = float(row.get("ask") or 0)
@@ -425,7 +488,7 @@ def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
                         delta = _bs_delta(S, strike, T, 0.045, iv, "C")
 
                     contract = to_occ(ticker, expiry, "C", strike)
-                    chain.append({
+                    chain_out.append({
                         "contract":           contract,
                         "strike":             strike,
                         "expiration_date":    expiry,
@@ -440,27 +503,18 @@ def get_leaps_chain(ticker: str, min_dte: int = 540) -> list[dict]:
             except Exception:
                 continue
 
-        return chain
+        return chain_out
 
     except Exception:
         return []
 
 
 def get_stock_price(ticker: str) -> float | None:
-    """Get latest stock price via yfinance."""
-    try:
-        import yfinance as yf
-        fi = yf.Ticker(ticker).fast_info
-        return fi.last_price or fi.previous_close
-    except Exception:
-        return None
+    """Get latest stock price, cached 5 min."""
+    return _yf_get_price(ticker)
 
 
 def get_roll_contract_price(ticker: str, strike: float, expiry: date, option_type: str = "C") -> float | None:
-    """
-    Get the current mid-price for a potential roll target contract.
-    Used by exit_engine to determine if a roll is cost-effective.
-    """
     contract = to_occ(ticker, expiry, option_type, strike)
     snapshot = get_option_snapshot(ticker, contract)
     return snapshot.get("mid") if snapshot and "_error" not in snapshot else None

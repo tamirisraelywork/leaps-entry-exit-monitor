@@ -266,6 +266,108 @@ def _earnings_state_from_pos(pos: dict) -> str | None:
         return None
 
 
+def _get_positions_cached() -> list[dict]:
+    """
+    Return db.get_positions() with a 3-minute session-state TTL.
+    Eliminates redundant BigQuery round-trips on every Streamlit rerun
+    (which happens on every widget interaction).
+    Call _invalidate_positions_cache() after any write to the positions table.
+    """
+    import time as _t
+    entry = st.session_state.get("_positions_cache")
+    if entry and (_t.time() - entry[0]) < 60:
+        return entry[1]
+    try:
+        positions = db.get_positions()
+        st.session_state["_positions_cache"] = (_t.time(), positions)
+        return positions
+    except Exception as e:
+        st.error(f"Could not load positions: {e}")
+        return []
+
+
+def _invalidate_positions_cache():
+    """Force-expire the positions cache so the next read hits BigQuery."""
+    st.session_state.pop("_positions_cache", None)
+
+
+def _prefetch_active_data(active: list[dict], force_check: bool = False) -> dict:
+    """
+    Fetch all market data for active positions IN PARALLEL using ThreadPoolExecutor.
+
+    Each position's snapshot, IV rank, and earnings data is fetched concurrently
+    rather than sequentially — cuts total dashboard load time from N×T to ~T
+    (where T is the slowest single fetch, typically 1-2 s).
+
+    Returns {pos_id: {"contract": str, "snap": dict, "iv_rank": float|None, "earnings": dict}}
+
+    Note: Uses options_data module cache directly (thread-safe) instead of
+    session-state caching (not thread-safe). Session state is updated in the
+    main thread after all futures complete.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _t
+
+    def _fetch_one(pos: dict) -> tuple:
+        pos_id   = str(pos.get("id", ""))
+        ticker   = pos.get("ticker", "")
+        contract = _resolve_contract(pos)
+
+        snap: dict = {}
+        if contract:
+            cache_key = f"{ticker}::{contract}"
+            # On force-check: evict module-level cache so a fresh fetch is triggered
+            if force_check:
+                with options_data._cache_lock:
+                    options_data._cache.pop(cache_key, None)
+            else:
+                # Try the module-level cache first — avoids duplicate in-flight requests
+                cached = options_data._cache_get(cache_key)
+                if cached is not None and "_error" not in cached:
+                    snap = cached
+
+            if not snap:
+                raw = options_data.get_option_snapshot(ticker, contract)
+                if "_error" not in raw:
+                    snap = raw
+
+        iv_pct   = (snap.get("implied_volatility") or 0) * 100 or None
+        iv_rank  = _get_iv_rank_cached(ticker, iv_pct)     # @st.cache_data — thread-safe
+        earnings = _get_earnings_data_cached(ticker)        # @st.cache_data — thread-safe
+
+        return pos_id, contract, snap, iv_rank, earnings
+
+    results: dict = {}
+    max_workers = min(len(active), 8)  # cap threads; BigQuery/yfinance don't need more
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, pos): pos for pos in active}
+        for future in as_completed(futures):
+            try:
+                pos_id, contract, snap, iv_rank, earnings = future.result()
+                results[pos_id] = {
+                    "contract": contract,
+                    "snap":     snap,
+                    "iv_rank":  iv_rank,
+                    "earnings": earnings,
+                }
+            except Exception:
+                pos_id = str(futures[future].get("id", ""))
+                results[pos_id] = {"contract": "", "snap": {}, "iv_rank": None, "earnings": {}}
+
+    # Write successful snapshots back to session-state cache in the main thread
+    now = _t.time()
+    for pos in active:
+        pos_id  = str(pos.get("id", ""))
+        pf      = results.get(pos_id, {})
+        ticker   = pos.get("ticker", "")
+        contract = pf.get("contract", "")
+        snap     = pf.get("snap", {})
+        if contract and snap and "_error" not in snap and snap.get("mid", 0) > 0:
+            st.session_state[f"_snap::{ticker}::{contract}"] = (now, snap)
+
+    return results
+
+
 def _live_market(pos: dict) -> dict:
     ticker   = pos.get("ticker", "")
     contract = _resolve_contract(pos)
@@ -763,7 +865,7 @@ if page == "🔍 New Analysis":
         jstatus = job.get("status")
         if jstatus == "running":
             st.info(f"⏳ Analyzing **{cur}**… (~60 seconds)  You can leave and return later.")
-            time.sleep(5)
+            time.sleep(1)
             st.rerun()
         elif jstatus == "complete":
             st.session_state.eval_report_data = job["table_rows"]
@@ -804,7 +906,7 @@ if page == "🔍 New Analysis":
             st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
         if _bj["status"] == "running":
-            time.sleep(5)
+            time.sleep(1)
             st.rerun()
 
         st.stop()
@@ -1135,14 +1237,13 @@ elif page == "📋 Past Analyses":
         st.caption(f"Showing **{len(df)}** of {len(master_df)} analyses")
         st.divider()
 
-        # Build ticker → position mode map for status badges
+        # Build ticker → position mode map for status badges (uses 3-min session cache)
         try:
-            _all_pos = db.get_positions()
+            _all_pos = _get_positions_cached()
             _pos_status = {}
             for _p in _all_pos:
                 _t = _p.get("ticker", "").upper()
                 _m = _p.get("mode", "")
-                # Active takes priority over Watchlist
                 if _t not in _pos_status or _m == "ACTIVE":
                     _pos_status[_t] = _m
         except Exception:
@@ -1626,13 +1727,10 @@ elif page == "📊 Dashboard":
         if st.button("🗑️ Refresh Data", use_container_width=True,
                      help="Clear cached prices and re-fetch all positions from scratch"):
             _clear_all_snapshot_cache()
+            _invalidate_positions_cache()
             st.rerun()
 
-    try:
-        positions = db.get_positions()
-    except Exception as e:
-        st.error(f"Could not load positions: {e}")
-        positions = []
+    positions = _get_positions_cached()
 
     active    = [p for p in positions if p.get("mode") == "ACTIVE"]
     watchlist = [p for p in positions if p.get("mode") == "WATCHLIST"]
@@ -1676,6 +1774,54 @@ elif page == "📊 Dashboard":
     # ── Active position cards ─────────────────────────────────────────────────
     if active:
         st.subheader("Active Positions")
+
+        # Pre-fetch ALL market data in parallel before rendering any card.
+        # This is the key performance win: N positions in ~T seconds instead of N×T.
+        with st.spinner("Loading live market data…"):
+            _prefetched = _prefetch_active_data(active, force_check=force_check)
+
+        # Batch-fetch thesis scores: one BigQuery query for all tickers at once.
+        _active_tickers   = [p.get("ticker", "") for p in active]
+        _all_scores       = db.get_all_leaps_scores_with_age(_active_tickers)
+
+        # Pre-compute any missing scores BEFORE the render loop (parallel, single spinner).
+        # Avoids blocking spinners inside per-card rendering.
+        _missing_score_tickers = [
+            p.get("ticker", "") for p in active
+            if _all_scores.get(p.get("ticker", "").upper(), (None, None))[0] is None
+            and p.get("ticker")
+        ]
+        if _missing_score_tickers:
+            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+            with st.spinner(
+                f"Computing first-time thesis scores for "
+                f"{', '.join(_missing_score_tickers)} (~30s each)…"
+            ):
+                with _TPE(max_workers=3) as _ex:
+                    _score_futures = {
+                        _ex.submit(score_thesis.compute_and_save_score, t): t
+                        for t in _missing_score_tickers
+                    }
+                    for _f in _ac(_score_futures):
+                        _t = _score_futures[_f]
+                        try:
+                            _s, _v = _f.result()
+                            if _s is not None:
+                                _all_scores[_t.upper()] = (_s, 0)
+                        except Exception:
+                            pass
+
+        # Persist auto-built contracts for positions that lack one (runs in main thread)
+        for _p in active:
+            _pid = str(_p.get("id", ""))
+            _pf  = _prefetched.get(_pid, {})
+            _ct  = _pf.get("contract", "")
+            if _ct and not (_p.get("contract") or "").strip():
+                try:
+                    db.update_position(_pid, {"contract": _ct})
+                except Exception:
+                    pass
+
         for pos in active:
             ticker   = pos.get("ticker", "?")
             strike   = pos.get("strike", "?")
@@ -1686,55 +1832,43 @@ elif page == "📊 Dashboard":
             pos_id   = str(pos.get("id", ""))
             cost_basis = (ep or 0) * (qty or 0) * 100
 
-            with st.spinner(f"Loading {ticker}..."):
-                contract = _resolve_contract(pos)
-                # Persist auto-built contract so future loads don't need to recompute it
-                if contract and not (pos.get("contract") or "").strip():
-                    try:
-                        db.update_position(pos_id, {"contract": contract})
-                    except Exception:
-                        pass
-                if force_check:
-                    # Force-check: clear this position's cache entry then re-fetch
-                    _clear_snapshot_cache(ticker, contract)
-                    mkt = _live_market(pos)
-                    snap_error = None
-                else:
-                    snap = _get_snapshot_cached(ticker, contract) if contract else {}
-                    snap = snap or {}
-                    snap_error = snap.get("_error")
-                    dte_fallback = None
-                    try:
-                        raw_exp = pos.get("expiration_date")
-                        if raw_exp:
-                            exp_d = raw_exp if isinstance(raw_exp, date) else date.fromisoformat(str(raw_exp))
-                            dte_fallback = (exp_d - date.today()).days
-                    except Exception:
-                        pass
-                    iv_pct_dash = (snap.get("implied_volatility") or 0) * 100 or None
-                    _mid_is_live  = snap.get("_mid_is_live", False)
-                    _mid_reliable = snap.get("_mid_reliable", True)
-                    _earnings_d   = _get_earnings_data_cached(ticker)
-                    mkt = {
-                        "mid":                       snap.get("mid"),
-                        "mid_display":               snap.get("mid"),
-                        "bid":                       snap.get("bid"),
-                        "ask":                       snap.get("ask"),
-                        "delta":                     snap.get("delta"),
-                        "dte":                       snap.get("dte") or dte_fallback,
-                        "iv_rank":                   _get_iv_rank_cached(ticker, iv_pct_dash),
-                        "thesis_score":              None,
-                        "_mid_source":               snap.get("_mid_source", "market"),
-                        "_mid_is_live":              _mid_is_live,
-                        "_mid_reliable":             _mid_reliable,
-                        # Pillar 5 — earnings & news signals
-                        "earnings_state":            _earnings_state_from_pos(pos),
-                        "earnings_tone_score":       _earnings_d["earnings_tone_score"],
-                        "earnings_guidance_change":  _earnings_d["earnings_guidance_change"],
-                        "thesis_impact":             _earnings_d["thesis_impact"],
-                        "earnings_tone_delta":       _earnings_d["earnings_tone_delta"],
-                        "news_sentiment_score":      _earnings_d["news_sentiment_score"],
-                    }
+            # Use pre-fetched data — all API calls already done in parallel above
+            pf       = _prefetched.get(pos_id, {})
+            contract = pf.get("contract") or _resolve_contract(pos)
+            snap     = pf.get("snap") or {}
+            snap_error   = snap.get("_error") if snap else None
+            dte_fallback = None
+            try:
+                raw_exp = pos.get("expiration_date")
+                if raw_exp:
+                    exp_d = raw_exp if isinstance(raw_exp, date) else date.fromisoformat(str(raw_exp))
+                    dte_fallback = (exp_d - date.today()).days
+            except Exception:
+                pass
+
+            _mid_is_live  = snap.get("_mid_is_live", False)
+            _mid_reliable = snap.get("_mid_reliable", True)
+            _earnings_d   = pf.get("earnings") or {}
+            mkt = {
+                "mid":                       snap.get("mid"),
+                "mid_display":               snap.get("mid"),
+                "bid":                       snap.get("bid"),
+                "ask":                       snap.get("ask"),
+                "delta":                     snap.get("delta"),
+                "dte":                       snap.get("dte") or dte_fallback,
+                "iv_rank":                   pf.get("iv_rank"),
+                "thesis_score":              None,
+                "_mid_source":               snap.get("_mid_source", "market"),
+                "_mid_is_live":              _mid_is_live,
+                "_mid_reliable":             _mid_reliable,
+                # Pillar 5 — earnings & news signals
+                "earnings_state":            _earnings_state_from_pos(pos),
+                "earnings_tone_score":       _earnings_d.get("earnings_tone_score"),
+                "earnings_guidance_change":  _earnings_d.get("earnings_guidance_change"),
+                "thesis_impact":             _earnings_d.get("thesis_impact"),
+                "earnings_tone_delta":       _earnings_d.get("earnings_tone_delta"),
+                "news_sentiment_score":      _earnings_d.get("news_sentiment_score"),
+            }
 
             # ── Data quality notes ────────────────────────────────────────────
             _mid_is_live   = mkt.get("_mid_is_live", False)
@@ -1750,18 +1884,12 @@ elif page == "📊 Dashboard":
             elif not _mid_is_live:
                 data_gaps.append("ℹ️ No active bid/ask — using last traded price. P&L is approximate.")
 
-            mid      = mkt.get("mid")          # None if not live — engine skips P&L pillar
+            mid      = mkt.get("mid")
             delta    = mkt.get("delta")
             dte_days = mkt.get("dte")
-            pnl      = _pnl_pct(ep, mid)      # None if mid is None (stale price)
+            pnl      = _pnl_pct(ep, mid)
 
-            score, score_age = db.get_leaps_monitor_score_with_age(ticker)
-
-            if score is None:
-                with st.spinner(f"First-time thesis scoring for {ticker} (~30s)..."):
-                    _s, _v = score_thesis.compute_and_save_score(ticker)
-                if _s is not None:
-                    score, score_age = _s, 0
+            score, score_age = _all_scores.get(ticker.upper(), (None, None))
 
             # Thesis score: use for evaluate() only if reasonably fresh (≤90 days).
             # An exit recommendation based on a 4-month-old score is unreliable.
@@ -2506,9 +2634,10 @@ elif page == "📊 Dashboard":
 elif page == "➕ Add Position":
     st.title("Add Position")
 
-    tab_new, tab_existing = st.tabs([
+    tab_new, tab_existing, tab_ibkr = st.tabs([
         "🔍 New Entry — Recommend Options",
         "📋 Existing Position — Already Bought",
+        "📥 Import from IBKR",
     ])
 
     with tab_new:
@@ -2686,6 +2815,226 @@ elif page == "➕ Add Position":
             else:
                 st.info("All pillars clear — position looks healthy.")
 
+    # ── Tab 3: Import from IBKR ────────────────────────────────────────────
+    with tab_ibkr:
+        st.markdown(
+            "Upload an Interactive Brokers **Activity Statement** (PDF or CSV) to automatically "
+            "detect positions you bought, sold, trimmed, or rolled — and sync them to BigQuery."
+        )
+
+        with st.expander("How to export from IBKR", expanded=False):
+            st.markdown("""
+**PDF — Default Activity Statement:**
+1. Log into IBKR Client Portal or TWS
+2. Go to **Reports → Activity → Activity Statement**
+3. Select your date range (e.g. past 6 months or full year)
+4. Choose **PDF** format and download
+
+**CSV — Recommended for best accuracy:**
+1. Go to **Reports → Flex Queries**
+2. Create a new Flex Query: select **Trades** section, all fields
+3. Run the query → download as CSV
+4. Upload the CSV file here
+
+The CSV Flex Report is more reliably parsed than the PDF.
+            """)
+
+        uploaded = st.file_uploader(
+            "Upload IBKR Activity Statement",
+            type=["pdf", "csv", "txt"],
+            help="PDF or CSV from IBKR Account Management",
+        )
+
+        if uploaded is not None:
+            file_bytes = uploaded.read()
+            filename   = uploaded.name
+
+            with st.spinner(f"Parsing {filename}…"):
+                try:
+                    from ibkr_parser import parse_file, reconcile_with_bq
+                    raw_trades, summaries = parse_file(file_bytes, filename)
+                except ImportError:
+                    st.error("pdfplumber is not installed. Run: `pip install pdfplumber`")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"Failed to parse file: {e}")
+                    st.stop()
+
+            if not raw_trades:
+                st.warning(
+                    "No option trades were detected in this file. "
+                    "Make sure the file contains a **Trades** section with **Options** data. "
+                    "Try the CSV Flex Report format for better results."
+                )
+                st.stop()
+
+            st.success(f"Found **{len(raw_trades)} raw trades** → **{len(summaries)} unique contracts**")
+
+            # ── Raw trades preview ─────────────────────────────────────────
+            with st.expander(f"Raw trades ({len(raw_trades)})", expanded=False):
+                import pandas as _pd
+                raw_rows = [
+                    {
+                        "Date":       t.trade_date.isoformat(),
+                        "Symbol":     t.raw_symbol,
+                        "Qty":        t.quantity,
+                        "Price":      f"${t.price:.2f}",
+                        "Proceeds":   f"${t.proceeds:,.2f}",
+                        "Code":       t.code,
+                    }
+                    for t in raw_trades
+                ]
+                st.dataframe(_pd.DataFrame(raw_rows), use_container_width=True, hide_index=True)
+
+            # ── Reconcile against existing BQ positions ────────────────────
+            bq_positions = _get_positions_cached()
+            reconciled   = reconcile_with_bq(summaries, bq_positions)
+
+            # ── Preview table ──────────────────────────────────────────────
+            st.subheader("Detected Changes")
+            st.caption(
+                "Review the changes below. Deselect any row you don't want to apply, "
+                "then click **Apply Selected Changes**."
+            )
+
+            _ACTION_COLOR = {
+                "CREATE": "🟢",
+                "UPDATE": "🔵",
+                "CLOSE":  "🔴",
+                "SKIP":   "⚪",
+            }
+
+            apply_rows   = []   # rows the user can select
+            display_rows = []   # rows for the preview table
+
+            for i, rec in enumerate(reconciled):
+                s   = rec["summary"]
+                act = rec["bq_action"]
+                chg = rec["changes"]
+
+                # Readable change summary
+                chg_desc = []
+                if "quantity" in chg:
+                    chg_desc.append(f"qty→{chg['quantity']}")
+                if "entry_price" in chg:
+                    chg_desc.append(f"avg→${chg['entry_price']:.2f}")
+                if "quantity_trimmed" in chg:
+                    chg_desc.append(f"trimmed→{chg['quantity_trimmed']}")
+                if "proceeds_from_trims" in chg:
+                    chg_desc.append(f"proceeds→${chg['proceeds_from_trims']:,.2f}")
+                if "mode" in chg:
+                    chg_desc.append(f"mode→{chg['mode']}")
+
+                display_rows.append({
+                    "":        _ACTION_COLOR.get(act, "⚪"),
+                    "Action":  act,
+                    "Ticker":  s.ticker,
+                    "Strike":  f"${s.strike}",
+                    "Expiry":  s.expiry.isoformat(),
+                    "Type":    s.option_type,
+                    "Net Qty": s.net_qty,
+                    "Avg Buy": f"${s.avg_buy_price:.2f}" if s.avg_buy_price else "-",
+                    "Sold":    s.total_sold or "-",
+                    "Proceeds":f"${s.gross_proceeds:,.2f}" if s.gross_proceeds else "-",
+                    "Changes": ", ".join(chg_desc) if chg_desc else "(no change)",
+                    "⚠️":     rec["conflict"] or "",
+                })
+                apply_rows.append(rec)
+
+            import pandas as _pd2
+            preview_df = _pd2.DataFrame(display_rows)
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            # ── Selection checkboxes ───────────────────────────────────────
+            actionable = [(i, r) for i, r in enumerate(apply_rows)
+                          if r["bq_action"] in ("CREATE", "UPDATE", "CLOSE")]
+
+            if not actionable:
+                st.info("All positions are already up to date — nothing to apply.")
+            else:
+                st.markdown(f"**{len(actionable)} change(s) ready to apply:**")
+                selected_indices = []
+                for i, rec in actionable:
+                    s   = rec["summary"]
+                    act = rec["bq_action"]
+                    lbl = (f"{_ACTION_COLOR.get(act, '⚪')} **{act}** — "
+                           f"{s.ticker} {s.expiry} ${s.strike}{s.option_type} "
+                           f"(net {s.net_qty} contracts)")
+                    chk = st.checkbox(lbl, value=(act != "CLOSE"), key=f"ibkr_chk_{i}")
+                    if chk:
+                        selected_indices.append(i)
+
+                st.markdown("---")
+                col_apply, col_cancel = st.columns([1, 3])
+
+                with col_apply:
+                    apply_btn = st.button(
+                        f"✅ Apply {len(selected_indices)} Selected Change(s)",
+                        type="primary",
+                        disabled=not selected_indices,
+                        use_container_width=True,
+                    )
+
+                if apply_btn and selected_indices:
+                    applied = 0
+                    errors  = []
+
+                    for idx in selected_indices:
+                        rec = apply_rows[idx]
+                        s   = rec["summary"]
+                        act = rec["bq_action"]
+                        chg = rec["changes"]
+
+                        try:
+                            if act == "CREATE":
+                                # Build a full position record
+                                from options_data import to_occ
+                                contract_sym = to_occ(
+                                    s.ticker, s.expiry,
+                                    s.option_type,
+                                    s.strike,
+                                )
+                                score = db.get_leaps_monitor_score(s.ticker)
+                                db.save_position({
+                                    "ticker":          s.ticker,
+                                    "contract":        contract_sym,
+                                    "option_type":     "CALL" if s.option_type == "C" else "PUT",
+                                    "strike":          s.strike,
+                                    "expiration_date": s.expiry,
+                                    "entry_price":     s.avg_buy_price,
+                                    "quantity":        s.net_qty,
+                                    "entry_delta":     None,
+                                    "entry_iv_rank":   None,
+                                    "entry_thesis_score": score,
+                                    "position_type":   "STANDARD",
+                                    "target_return":   "5-10x",
+                                    "mode":            "ACTIVE",
+                                    "quantity_trimmed":     s.total_sold,
+                                    "proceeds_from_trims":  s.gross_proceeds,
+                                    "notes": f"Imported from IBKR {filename}",
+                                })
+                                applied += 1
+
+                            elif act in ("UPDATE", "CLOSE"):
+                                bq_pos = rec["bq_pos"]
+                                if bq_pos and chg:
+                                    db.update_position(str(bq_pos["id"]), chg)
+                                    applied += 1
+
+                        except Exception as e:
+                            errors.append(f"{s.ticker} ${s.strike} {s.expiry}: {e}")
+
+                    _invalidate_positions_cache()
+
+                    if applied:
+                        st.success(f"✅ Applied {applied} change(s) to BigQuery.")
+                        st.balloons()
+                    if errors:
+                        for err in errors:
+                            st.error(f"Failed: {err}")
+
+                    st.caption("Go to the **Dashboard** to see your updated positions.")
+
 
 # ===========================================================================
 # PAGE: ALERT HISTORY
@@ -2754,6 +3103,274 @@ elif page == "🔔 Alert History":
 
 elif page == "⚙️ Settings":
     st.title("Settings")
+
+    # ── IBKR Activity Sync ────────────────────────────────────────────────────
+    st.subheader("📥 Sync IBKR Activity Statement")
+    st.caption(
+        "Upload your IBKR Activity Statement CSV (or PDF) to sync quantities, entry prices, "
+        "trims, rolls, and closures — options activity only. Re-upload at any time; "
+        "only actual changes are written to BigQuery."
+    )
+
+    # ── Portfolio metrics panel ────────────────────────────────────────────
+    _pf_all  = _get_positions_cached()
+    _pf_act  = [p for p in _pf_all if str(p.get("mode", "")).upper() == "ACTIVE"]
+    if _pf_act:
+        _pf_cost      = sum(float(p.get("entry_price") or 0) * int(p.get("quantity") or 0) * 100
+                            for p in _pf_act)
+        _pf_proceeds  = sum(float(p.get("proceeds_from_trims") or 0) for p in _pf_act)
+        _pf_net_cost  = max(_pf_cost - _pf_proceeds, 0)
+        _pf_c1, _pf_c2, _pf_c3, _pf_c4 = st.columns(4)
+        _pf_c1.metric("Active Positions", len(_pf_act))
+        _pf_c2.metric("Gross Cost Basis", f"${_pf_cost:,.0f}",
+                      help="Sum of entry_price × contracts × 100 for all active positions")
+        _pf_c3.metric("Trim Proceeds Collected", f"${_pf_proceeds:,.0f}",
+                      help="Total cash received from partial sells / trims so far")
+        _pf_c4.metric("Net Capital at Risk", f"${_pf_net_cost:,.0f}",
+                      help="Gross cost minus proceeds already collected (money still at risk)")
+
+    with st.expander("How to export from IBKR", expanded=False):
+        st.markdown("""
+**CSV Flex Report (recommended — best parsing accuracy):**
+1. Log into IBKR Client Portal
+2. Go to **Reports → Flex Queries → Create** (or run existing)
+3. Select **Trades** section, include all columns
+4. Run → download as **CSV**
+
+**Default Activity Statement (CSV or PDF):**
+1. Go to **Reports → Activity → Activity Statement**
+2. Select your full date range
+3. Download as **CSV** (preferred) or **PDF**
+4. Upload here
+
+> The CSV Flex Report is more reliably parsed. Use a date range that covers your full history.
+        """)
+
+    _ibkr_upload = st.file_uploader(
+        "Step 1 — Select your IBKR Activity Statement",
+        type=["csv", "txt", "pdf"],
+        key="settings_ibkr_upload",
+        help="CSV Flex Report, default Activity Statement CSV, or Activity Statement PDF",
+    )
+
+    _ibkr_parse_btn = st.button(
+        "📤 Upload & Analyze",
+        type="primary",
+        disabled=(_ibkr_upload is None),
+        help="Select a file above, then click here to parse and preview changes",
+        key="settings_ibkr_parse_btn",
+    )
+
+    if _ibkr_upload is not None and not _ibkr_parse_btn:
+        st.caption("File selected — click **📤 Upload & Analyze** to continue.")
+
+    if _ibkr_upload is not None and _ibkr_parse_btn:
+        _ibkr_bytes    = _ibkr_upload.read()
+        _ibkr_filename = _ibkr_upload.name
+
+        with st.spinner(f"Parsing {_ibkr_filename}…"):
+            try:
+                from ibkr_parser import parse_file as _ibkr_parse, reconcile_with_bq as _ibkr_reconcile
+                _ibkr_trades, _ibkr_summaries = _ibkr_parse(_ibkr_bytes, _ibkr_filename)
+            except ImportError:
+                st.error("pdfplumber is required for PDF parsing. Run: `pip install pdfplumber`")
+                st.stop()
+            except Exception as _pe:
+                st.error(f"Failed to parse file: {_pe}")
+                st.stop()
+
+        if not _ibkr_trades:
+            st.warning(
+                "No option trades detected. Make sure the file contains a **Trades** section "
+                "with **Options** rows. Try the CSV Flex Report format for best results."
+            )
+        else:
+            st.success(
+                f"Parsed **{len(_ibkr_trades)} trades** across **{len(_ibkr_summaries)} contracts**"
+            )
+
+            with st.expander(f"Raw trades ({len(_ibkr_trades)})", expanded=False):
+                _rt_rows = [
+                    {"Date": t.trade_date.isoformat(), "Symbol": t.raw_symbol,
+                     "Qty": t.quantity, "Price": f"${t.price:.2f}",
+                     "Proceeds": f"${t.proceeds:,.2f}", "Code": t.code}
+                    for t in _ibkr_trades
+                ]
+                st.dataframe(pd.DataFrame(_rt_rows), use_container_width=True, hide_index=True)
+
+            # Reconcile against BigQuery
+            _ibkr_bq_positions = _get_positions_cached()
+            _ibkr_reconciled   = _ibkr_reconcile(_ibkr_summaries, _ibkr_bq_positions)
+
+            # ── Preview table ──────────────────────────────────────────────
+            st.subheader("Detected Changes")
+
+            _ACT_ICON = {"CREATE": "🟢", "UPDATE": "🔵", "CLOSE": "🔴",
+                         "ROLLED": "🔄", "SKIP": "⚪"}
+
+            _ibkr_display = []
+            _ibkr_apply   = []
+
+            for _ii, _rec in enumerate(_ibkr_reconciled):
+                _s   = _rec["summary"]
+                _act = _rec["bq_action"]
+                _chg = _rec["changes"]
+
+                _chg_parts = []
+                if "quantity"             in _chg: _chg_parts.append(f"qty→{_chg['quantity']}")
+                if "entry_price"          in _chg: _chg_parts.append(f"avg→${_chg['entry_price']:.2f}")
+                if "quantity_trimmed"     in _chg: _chg_parts.append(f"trimmed→{_chg['quantity_trimmed']}")
+                if "proceeds_from_trims"  in _chg: _chg_parts.append(f"proceeds→${_chg['proceeds_from_trims']:,.2f}")
+                if "mode"                 in _chg: _chg_parts.append(f"mode→{_chg['mode']}")
+
+                # Roll flag: IBKR activity shows a roll completed
+                _roll_note = ""
+                if _s.action in ("ROLLED", "ROLLED_INTO"):
+                    _roll_note = "ROLL DETECTED — position already rolled in IBKR"
+
+                _ibkr_display.append({
+                    "":        _ACT_ICON.get(_act, "⚪"),
+                    "Action":  _act,
+                    "Ticker":  _s.ticker,
+                    "Strike":  f"${_s.strike}",
+                    "Expiry":  _s.expiry.isoformat(),
+                    "Type":    _s.option_type,
+                    "Net Qty": _s.net_qty,
+                    "Avg Buy": f"${_s.avg_buy_price:.2f}" if _s.avg_buy_price else "-",
+                    "Sold":    _s.total_sold or "-",
+                    "Proceeds":f"${_s.gross_proceeds:,.2f}" if _s.gross_proceeds else "-",
+                    "IBKR Action": _s.action,
+                    "Changes": ", ".join(_chg_parts) if _chg_parts else "(no change)",
+                    "Note":    _rec["conflict"] or _roll_note,
+                })
+                _ibkr_apply.append(_rec)
+
+            st.dataframe(pd.DataFrame(_ibkr_display), use_container_width=True, hide_index=True)
+
+            # ── Actionable items with checkboxes ──────────────────────────
+            _ibkr_actionable = [
+                (_ii2, _r2) for _ii2, _r2 in enumerate(_ibkr_apply)
+                if _r2["bq_action"] in ("CREATE", "UPDATE", "CLOSE")
+            ]
+
+            if not _ibkr_actionable:
+                st.info("All positions are already up to date — nothing to apply.")
+            else:
+                st.markdown(f"**{len(_ibkr_actionable)} change(s) to apply:**")
+                _ibkr_selected = []
+                for _ii2, _rec2 in _ibkr_actionable:
+                    _s2  = _rec2["summary"]
+                    _a2  = _rec2["bq_action"]
+                    _lbl = (
+                        f"{_ACT_ICON.get(_a2, '⚪')} **{_a2}** — "
+                        f"{_s2.ticker} {_s2.expiry} ${_s2.strike}{_s2.option_type} "
+                        f"(net {_s2.net_qty} contracts)"
+                        + (f" — ⚠️ {_rec2['conflict']}" if _rec2["conflict"] else "")
+                        + (f" — 🔄 ROLL" if _s2.action in ("ROLLED", "ROLLED_INTO") else "")
+                    )
+                    if st.checkbox(_lbl, value=(_a2 != "CLOSE"), key=f"settings_ibkr_chk_{_ii2}"):
+                        _ibkr_selected.append(_ii2)
+
+                st.markdown("---")
+                _ibkr_apply_btn = st.button(
+                    f"✅ Apply {len(_ibkr_selected)} Selected Change(s)",
+                    type="primary",
+                    disabled=not _ibkr_selected,
+                    use_container_width=True,
+                    key="settings_ibkr_apply_btn",
+                )
+
+                if _ibkr_apply_btn and _ibkr_selected:
+                    _ibkr_applied = 0
+                    _ibkr_errors  = []
+                    _ibkr_log     = []
+
+                    for _idx in _ibkr_selected:
+                        _rec3 = _ibkr_apply[_idx]
+                        _s3   = _rec3["summary"]
+                        _a3   = _rec3["bq_action"]
+                        _chg3 = _rec3["changes"]
+
+                        try:
+                            if _a3 == "CREATE":
+                                from options_data import to_occ as _to_occ
+                                _score3 = db.get_leaps_monitor_score(_s3.ticker)
+                                db.save_position({
+                                    "ticker":               _s3.ticker,
+                                    "contract":             _to_occ(_s3.ticker, _s3.expiry, _s3.option_type, _s3.strike),
+                                    "option_type":          "CALL" if _s3.option_type == "C" else "PUT",
+                                    "strike":               _s3.strike,
+                                    "expiration_date":      _s3.expiry,
+                                    "entry_price":          _s3.avg_buy_price,
+                                    "quantity":             _s3.net_qty,
+                                    "entry_delta":          None,
+                                    "entry_iv_rank":        None,
+                                    "entry_thesis_score":   _score3,
+                                    "position_type":        "STANDARD",
+                                    "target_return":        "5-10x",
+                                    "mode":                 "ACTIVE",
+                                    "quantity_trimmed":     _s3.total_sold,
+                                    "proceeds_from_trims":  _s3.gross_proceeds,
+                                    "notes": f"Imported from IBKR {_ibkr_filename}",
+                                })
+                                _ibkr_applied += 1
+                                _ibkr_log.append({"Ticker": _s3.ticker, "Action": "CREATED", "Detail": f"${_s3.strike} {_s3.expiry} ×{_s3.net_qty}"})
+
+                            elif _a3 in ("UPDATE", "CLOSE"):
+                                _bq3 = _rec3["bq_pos"]
+                                if _bq3 and _chg3:
+                                    db.update_position(str(_bq3["id"]), _chg3)
+                                    _ibkr_applied += 1
+                                    _detail3 = " | ".join(f"{k}→{v}" for k, v in _chg3.items())
+                                    _ibkr_log.append({"Ticker": _s3.ticker, "Action": _a3, "Detail": _detail3})
+
+                        except Exception as _err3:
+                            _ibkr_errors.append(f"{_s3.ticker} ${_s3.strike} {_s3.expiry}: {_err3}")
+
+                    # Set entry_thesis_score baselines for newly created positions
+                    _baseline_set = 0
+                    try:
+                        _master_df   = get_eval_master_data()
+                        _master_scores = {
+                            row["Ticker"].upper(): int(row["Score"])
+                            for _, row in _master_df.iterrows()
+                            if row.get("Score") is not None
+                        }
+                        _refreshed = db.get_positions()
+                        for _rp in _refreshed:
+                            if _rp.get("entry_thesis_score"):
+                                continue
+                            _rt = (_rp.get("ticker") or "").upper()
+                            if _rt in _master_scores:
+                                db.update_position(str(_rp["id"]), {"entry_thesis_score": _master_scores[_rt]})
+                                _baseline_set += 1
+                                _ibkr_log.append({
+                                    "Ticker": _rt,
+                                    "Action": "BASELINE SET",
+                                    "Detail": f"entry_thesis_score → {_master_scores[_rt]}/100",
+                                })
+                    except Exception as _be:
+                        st.warning(f"Could not set entry thesis baselines: {_be}")
+
+                    _invalidate_positions_cache()
+                    st.cache_data.clear()
+
+                    if _ibkr_applied:
+                        st.success(
+                            f"Sync complete — {_ibkr_applied} position(s) updated"
+                            + (f", {_baseline_set} thesis baseline(s) set." if _baseline_set else ".")
+                        )
+                        st.dataframe(pd.DataFrame(_ibkr_log), use_container_width=True, hide_index=True)
+                    if _ibkr_errors:
+                        for _e3 in _ibkr_errors:
+                            st.error(f"Failed: {_e3}")
+                    if _baseline_set > 0:
+                        st.info(
+                            "Entry thesis baselines set from today's scores. "
+                            "Future re-analyses will show the Δ gap vs this baseline."
+                        )
+
+
 
     # ── Thesis Rescore ────────────────────────────────────────────────────────
     st.subheader("🔄 Rescore All Analyses")
@@ -2917,129 +3534,6 @@ elif page == "⚙️ Settings":
     if _bj_status == "complete" and _bj_results:
         st.markdown("#### Last Batch Results")
         st.dataframe(pd.DataFrame(_bj_results), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ── IBKR Data Sync ────────────────────────────────────────────────────────
-    st.subheader("📥 Sync IBKR Position Data")
-    st.caption(
-        "Updates all BigQuery positions with exact quantities, average entry prices, "
-        "trim amounts, and proceeds from the IBKR activity statement (Aug 2025 – Mar 6, 2026). "
-        "Closed positions (EVGO, FLNC 13C, RUM) will be marked CLOSED."
-    )
-
-    _IBKR_SYNC_DATA = [
-        # (ticker, strike, expiry, opt_type, qty, avg_px, qty_trimmed, proceeds, mode)
-        ("AEHR",   40.00, "2027-01-15", "C",  25, 3.200,   10,  8400.00, "ACTIVE"),
-        ("DLO",    24.47, "2027-01-15", "C",  45, 1.900,    0,     0.00, "ACTIVE"),
-        ("DLO",    25.00, "2027-12-17", "C",  15, 1.900,    0,     0.00, "ACTIVE"),
-        ("EH",     35.00, "2027-01-15", "C",  70, 1.500,    0,     0.00, "ACTIVE"),
-        ("ENVX",   20.00, "2027-01-15", "C",  52, 2.119,    0,     0.00, "ACTIVE"),
-        ("EVGO",    5.00, "2027-01-15", "C",  80, 1.050,   80,  9600.00, "CLOSED"),
-        ("FIG",   100.00, "2028-01-21", "C",  22, 5.545,    0,     0.00, "ACTIVE"),
-        ("FLNC",   13.00, "2027-01-15", "C",  64, 1.700,   64, 87020.00, "CLOSED"),
-        ("FLNC",   37.00, "2028-01-21", "C",  12, 8.000,    0,     0.00, "ACTIVE"),
-        ("IWM",   195.00, "2027-12-17", "P",   7,11.050,    0,     0.00, "ACTIVE"),
-        ("JMIA",   12.00, "2027-01-15", "C",  60, 1.700,   40, 24000.00, "ACTIVE"),
-        ("LAC",     4.00, "2027-01-15", "C", 150, 0.740,  120, 36000.00, "ACTIVE"),
-        ("MVST",    4.50, "2027-01-15", "C", 100, 0.800,    0,     0.00, "ACTIVE"),
-        ("OKTA",  180.00, "2027-12-17", "C",  14, 4.000,    0,     0.00, "ACTIVE"),
-        ("OPRA",   25.00, "2027-12-17", "C",  22, 3.100,    0,     0.00, "ACTIVE"),
-        ("PACB",    3.00, "2027-01-15", "C", 290, 0.338,  100,  8000.00, "ACTIVE"),
-        ("REAL",   15.00, "2027-01-15", "C",  90, 1.244,   70, 37800.00, "ACTIVE"),
-        ("RUM",    15.00, "2027-01-15", "C",  60, 1.439,   60,  8400.00, "CLOSED"),
-        ("SHLS",   12.00, "2027-01-15", "C", 119, 0.871,   60, 16800.00, "ACTIVE"),
-        ("SILJ",   35.00, "2027-01-15", "C",  35, 2.550,   20, 18000.00, "ACTIVE"),
-        ("XPOF",   15.00, "2026-12-18", "C",  80, 1.200,    0,     0.00, "ACTIVE"),
-    ]
-
-    if st.button("📥 Apply IBKR Sync", type="primary"):
-        _sync_positions = db.get_positions()
-        _sync_log = []
-        _sync_updated = 0
-
-        def _ibkr_find(positions, ticker, strike, expiry):
-            candidates = [
-                p for p in positions
-                if p.get("ticker", "").upper() == ticker.upper()
-                and abs(float(p.get("strike") or 0) - strike) <= 0.5
-                and str(p.get("expiration_date", ""))[:10] == expiry
-            ]
-            if candidates:
-                return candidates[0]
-            by_ticker = [p for p in positions if p.get("ticker","").upper() == ticker.upper()]
-            return by_ticker[0] if len(by_ticker) == 1 else None
-
-        with st.spinner("Syncing positions…"):
-            for (tkr, stk, exp, otype, qty, px, trimmed, proceeds, mode) in _IBKR_SYNC_DATA:
-                pos = _ibkr_find(_sync_positions, tkr, stk, exp)
-                if pos is None:
-                    _sync_log.append({"Ticker": tkr, "Status": "NOT FOUND", "Changes": ""})
-                    continue
-                fields = {
-                    "quantity":            qty,
-                    "entry_price":         round(px, 4),
-                    "quantity_trimmed":    trimmed,
-                    "proceeds_from_trims": round(proceeds, 2),
-                    "mode":                mode,
-                }
-                old_fields = {
-                    "quantity":            pos.get("quantity"),
-                    "entry_price":         pos.get("entry_price"),
-                    "quantity_trimmed":    pos.get("quantity_trimmed"),
-                    "proceeds_from_trims": pos.get("proceeds_from_trims"),
-                    "mode":                pos.get("mode"),
-                }
-                changed = {k: v for k, v in fields.items() if str(old_fields.get(k)) != str(v)}
-                if changed:
-                    db.update_position(str(pos["id"]), changed)
-                    _sync_updated += 1
-                    _sync_log.append({
-                        "Ticker": tkr,
-                        "Status": "UPDATED",
-                        "Changes": " | ".join(f"{k}: {old_fields[k]} → {v}" for k, v in changed.items()),
-                    })
-                else:
-                    _sync_log.append({"Ticker": tkr, "Status": "OK", "Changes": "no changes"})
-
-        # ── Populate entry_thesis_score for positions that don't have it ──
-        _baseline_set = 0
-        try:
-            _master_df = get_eval_master_data()
-            _master_scores = {
-                row["Ticker"].upper(): int(row["Score"])
-                for _, row in _master_df.iterrows()
-                if row.get("Score") is not None
-            }
-            # Re-fetch positions with fresh data after the updates above
-            _refreshed = db.get_positions()
-            for _rp in _refreshed:
-                if _rp.get("entry_thesis_score"):
-                    continue          # already has a baseline
-                _rt = (_rp.get("ticker") or "").upper()
-                if _rt in _master_scores:
-                    db.update_position(str(_rp["id"]), {"entry_thesis_score": _master_scores[_rt]})
-                    _baseline_set += 1
-                    _sync_log.append({
-                        "Ticker": _rt,
-                        "Status": "BASELINE SET",
-                        "Changes": f"entry_thesis_score → {_master_scores[_rt]}/100 (today's score as baseline)",
-                    })
-        except Exception as _be:
-            st.warning(f"Could not set entry thesis baselines: {_be}")
-
-        st.success(
-            f"Sync complete — {_sync_updated} position(s) updated, "
-            f"{_baseline_set} thesis baseline(s) set."
-        )
-        st.cache_data.clear()
-        st.dataframe(pd.DataFrame(_sync_log), use_container_width=True, hide_index=True)
-        if _baseline_set > 0:
-            st.info(
-                "Entry thesis baselines have been set using today's scores. "
-                "Future re-analyses will show the Δ gap vs this baseline, "
-                "letting you track how the thesis evolves from this point forward."
-            )
 
     st.divider()
 
@@ -3250,6 +3744,49 @@ ALERT_RECIPIENT_EMAIL = "recipient@example.com"  # optional, defaults to sender
 # Legacy key names (also supported as fallback):
 # ALERT_EMAIL_FROM = "your-gmail@gmail.com"
 # ALERT_EMAIL_PASS = "your-app-password"
+        """, language="toml")
+
+    st.divider()
+
+    # ── Earnings & News API Keys ───────────────────────────────────────────────
+    st.subheader("Earnings Call & News Analysis")
+
+    _finnhub_key  = cfg("FINNHUB_API_KEY")
+    _aletheia_key = cfg("ALETHEIA_API_KEY")
+    _gemini_key   = cfg("GEMINI_API_KEY")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("GEMINI_API_KEY",   "✅ Set" if _gemini_key  else "❌ Missing",
+              help="Required for earnings call analysis (LLM)")
+    c2.metric("FINNHUB_API_KEY",  "✅ Set" if _finnhub_key  else "⚪ Optional",
+              help="Free tier — adds EPS beat/miss context to earnings analysis. finnhub.io")
+    c3.metric("ALETHEIA_API_KEY", "✅ Set" if _aletheia_key else "⚪ Optional",
+              help="Free tier — pre-computed earnings call sentiment. aletheia-api.com")
+
+    with st.expander("Earnings analysis source pipeline", expanded=False):
+        st.markdown("""
+**Source priority for each earnings call:**
+
+| # | Source | Key needed | What it provides |
+|---|--------|-----------|-----------------|
+| 1 | **Aletheia API** | `ALETHEIA_API_KEY` | Pre-computed call sentiment & guidance |
+| 2 | **SEC EDGAR 8-K** | None (free) | Actual management text from official filing |
+| 2b| **Finnhub EPS** | `FINNHUB_API_KEY` | Beat/miss %, prior quarter comparison |
+| 3 | **Gemini + Google Search** | `GEMINI_API_KEY` | Fallback: LLM searches for transcript |
+
+Sources 1 & 2 give Gemini **actual text to analyze** rather than guessing from training data.
+SEC EDGAR 8-K is always available for free — no API key required.
+        """)
+
+    with st.expander("Add optional API keys to secrets.toml"):
+        st.code("""
+# Finnhub — free tier at finnhub.io (60 calls/min)
+# Provides: EPS actual vs estimate, surprise %, analyst recommendations
+FINNHUB_API_KEY = "your_finnhub_key"
+
+# Aletheia — free tier at aletheia-api.com
+# Provides: earnings call sentiment analysis, insider trading, congressional trades
+ALETHEIA_API_KEY = "your_aletheia_key"
         """, language="toml")
 
     st.divider()

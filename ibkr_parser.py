@@ -9,7 +9,8 @@ Supported input formats:
   2. CSV  — any CSV export with at least the columns described below
 
 IBKR option symbol format:  TICKER DDMONYY STRIKE C/P
-  Example: NVDA 16JAN27 150 C  |  ENVX 16JAN26 7 C
+  Example: NVDA 16JAN27 150 C  |  AEHR 15JAN27 40 C  |  ENVX 16JAN26 7 C
+  Asset category in CSV: "Equity and Index Options"
 
 Trade rows have:
   Symbol | Date/Time | Quantity | T. Price | Proceeds | Comm/Fee | Code
@@ -172,12 +173,13 @@ def _parse_csv_content(content: str) -> list[IBKRTrade]:
     # ── Layout B: full activity statement CSV ─────────────────────────────
     # Rows look like: SectionName, DataType, col1, col2, ...
     # e.g.: "Trades","Header","Asset Category","Symbol","Date/Time",...
-    #       "Trades","Data","Options","NVDA 16JAN27 150 C","2026-01-15, 09:30",...
+    #       "Trades","Data","Equity and Index Options","AEHR 15JAN27 40 C","2026-01-15, 09:30",...
     #       "Trades","SubTotal",...
+    # Asset category is "Equity and Index Options" (not just "Options").
 
-    # Check if first column looks like a section name (non-numeric, non-header)
-    first_vals = [r[0].strip() if r else "" for r in rows[:5]]
-    is_multi = any(v in ("Trades", "Open Positions", "Closed Positions") for v in first_vals)
+    # Scan ALL rows for section names (case-insensitive) — "Trades" may appear far into the file
+    first_col_lower = {r[0].strip().lower() for r in rows if r}
+    is_multi = bool(first_col_lower & {"trades", "open positions", "closed positions"})
 
     if is_multi:
         headers = None
@@ -186,16 +188,16 @@ def _parse_csv_content(content: str) -> list[IBKRTrade]:
                 continue
             section  = row[0].strip()
             row_type = row[1].strip() if len(row) > 1 else ""
-            if section != "Trades":
+            if section.lower() != "trades":
                 headers = None
                 continue
-            if row_type == "Header":
+            if row_type.lower() == "header":
                 headers = [c.strip() for c in row[2:]]
                 continue
-            if row_type != "Data" or headers is None:
+            if row_type.lower() != "data" or headers is None:
                 continue
             data = row[2:]
-            # Asset category should be "Options"
+            # Asset category is "Equity and Index Options" — filter out non-option rows
             asset_idx = _find_col(headers, "asset")
             if asset_idx >= 0 and asset_idx < len(data):
                 if "option" not in data[asset_idx].lower():
@@ -203,7 +205,9 @@ def _parse_csv_content(content: str) -> list[IBKRTrade]:
             trade = _row_to_trade(headers, data)
             if trade:
                 trades.append(trade)
-        return trades
+        if trades:
+            return trades
+        # Fall through to Layout A if multi-section parse found no trades
 
     # ── Layout A: flat CSV ─────────────────────────────────────────────────
     # First non-empty row is the header
@@ -517,13 +521,58 @@ def parse_csv(csv_content: str) -> tuple[list[IBKRTrade], list[PositionSummary]]
     return trades, summaries
 
 
+def diagnose_csv(file_bytes: bytes) -> dict:
+    """
+    Return a diagnostic dict describing what was found in a CSV upload.
+    Used to show a helpful error when no option trades are detected.
+
+    Returns keys: sections, has_trades_section, sample_rows, asset_categories, symbol_samples
+    """
+    content = file_bytes.decode("utf-8-sig", errors="replace")
+    reader  = csv.reader(io.StringIO(content))
+    rows    = list(reader)
+
+    sections: set[str]  = set()
+    asset_cats: set[str] = set()
+    symbol_samples: list[str] = []
+    sample_rows: list[str] = []
+
+    for row in rows[:5]:
+        if row:
+            sample_rows.append(", ".join(row[:6]))
+
+    for row in rows:
+        if not row:
+            continue
+        sections.add(row[0].strip())
+        # Collect asset categories from multi-section format
+        if len(row) >= 3 and row[1].strip().lower() == "data":
+            asset_cats.add(row[2].strip())
+        # Collect candidate symbol values (anything matching option pattern)
+        for cell in row:
+            cell = cell.strip()
+            if _OPT_SYM_RE.match(cell.upper()):
+                if cell not in symbol_samples:
+                    symbol_samples.append(cell)
+                    if len(symbol_samples) >= 5:
+                        break
+
+    return {
+        "sections":          sorted(sections)[:20],
+        "has_trades_section": any(s.lower() == "trades" for s in sections),
+        "asset_categories":  sorted(asset_cats)[:20],
+        "symbol_samples":    symbol_samples,
+        "first_rows":        sample_rows,
+    }
+
+
 def parse_file(file_bytes: bytes, filename: str) -> tuple[list[IBKRTrade], list[PositionSummary]]:
     """Detect format from filename and route to the correct parser."""
     ext = filename.lower().rsplit(".", 1)[-1]
     if ext == "pdf":
         return parse_pdf(file_bytes)
     elif ext in ("csv", "txt"):
-        return parse_csv(file_bytes.decode("utf-8", errors="replace"))
+        return parse_csv(file_bytes.decode("utf-8-sig", errors="replace"))  # utf-8-sig strips BOM
     else:
         raise ValueError(f"Unsupported file type: .{ext}. Upload a PDF or CSV.")
 

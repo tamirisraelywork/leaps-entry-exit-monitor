@@ -3180,10 +3180,31 @@ elif page == "⚙️ Settings":
                 st.stop()
 
         if not _ibkr_trades:
-            st.warning(
-                "No option trades detected. Make sure the file contains a **Trades** section "
-                "with **Options** rows. Try the CSV Flex Report format for best results."
-            )
+            st.warning("No option trades detected.")
+            # Show diagnostics so the user can see what the parser actually found
+            try:
+                from ibkr_parser import diagnose_csv as _ibkr_diagnose
+                _diag = _ibkr_diagnose(_ibkr_bytes)
+                with st.expander("🔍 File diagnostics — click to troubleshoot", expanded=True):
+                    st.markdown(f"**Sections found:** `{'`, `'.join(_diag['sections']) or 'none'}`")
+                    st.markdown(f"**Trades section present:** {'✅ yes' if _diag['has_trades_section'] else '❌ no'}")
+                    if _diag['asset_categories']:
+                        st.markdown(f"**Asset categories:** `{'`, `'.join(_diag['asset_categories'])}`")
+                    if _diag['symbol_samples']:
+                        st.markdown(f"**Option symbols found:** `{'`, `'.join(_diag['symbol_samples'])}`")
+                    if _diag['first_rows']:
+                        st.markdown("**First rows of file:**")
+                        for _r in _diag['first_rows']:
+                            st.code(_r)
+                    st.markdown(
+                        "**Expected format:** `Trades,Data,Equity and Index Options,USD,AEHR 15JAN27 40 C,...`  \n"
+                        "Export from IBKR → Reports → Activity → Activity Statement → CSV."
+                    )
+            except Exception:
+                st.info(
+                    "Make sure the file contains a **Trades** section with **Equity and Index Options** rows. "
+                    "Export from IBKR → Reports → Activity → Activity Statement → CSV."
+                )
         else:
             st.success(
                 f"Parsed **{len(_ibkr_trades)} trades** across **{len(_ibkr_summaries)} contracts**"

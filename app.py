@@ -3772,9 +3772,9 @@ ALERT_RECIPIENT_EMAIL = "recipient@example.com"  # optional, defaults to sender
     # ── Earnings & News API Keys ───────────────────────────────────────────────
     st.subheader("Earnings Call & News Analysis")
 
-    _finnhub_key  = cfg("FINNHUB_API_KEY")
-    _aletheia_key = cfg("ALETHEIA_API_KEY")
-    _gemini_key   = cfg("GEMINI_API_KEY")
+    _finnhub_key  = _cfg("FINNHUB_API_KEY")
+    _aletheia_key = _cfg("ALETHEIA_API_KEY")
+    _gemini_key   = _cfg("GEMINI_API_KEY")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("GEMINI_API_KEY",   "✅ Set" if _gemini_key  else "❌ Missing",

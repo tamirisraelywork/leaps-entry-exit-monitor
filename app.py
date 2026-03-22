@@ -3147,249 +3147,222 @@ elif page == "⚙️ Settings":
         """)
 
     _ibkr_upload = st.file_uploader(
-        "Step 1 — Select your IBKR Activity Statement",
+        "Select your IBKR Activity Statement",
         type=["csv", "txt", "pdf"],
         key="settings_ibkr_upload",
         help="CSV Flex Report, default Activity Statement CSV, or Activity Statement PDF",
     )
 
-    _ibkr_parse_btn = st.button(
-        "📤 Upload & Analyze",
+    _ibkr_parse_col, _ibkr_clear_col = st.columns([3, 1])
+    _ibkr_parse_btn = _ibkr_parse_col.button(
+        "📤 Parse File",
         type="primary",
         disabled=(_ibkr_upload is None),
-        help="Select a file above, then click here to parse and preview changes",
         key="settings_ibkr_parse_btn",
     )
+    if _ibkr_clear_col.button("✖ Clear", key="settings_ibkr_clear_btn",
+                               disabled="ibkr_sync" not in st.session_state):
+        st.session_state.pop("ibkr_sync", None)
+        st.rerun()
 
-    if _ibkr_upload is not None and not _ibkr_parse_btn:
-        st.caption("File selected — click **📤 Upload & Analyze** to continue.")
-
+    # ── Step 1: Parse on button click → store in session_state ────────────
     if _ibkr_upload is not None and _ibkr_parse_btn:
-        _ibkr_bytes    = _ibkr_upload.read()
-        _ibkr_filename = _ibkr_upload.name
-
-        with st.spinner(f"Parsing {_ibkr_filename}…"):
+        _bytes    = _ibkr_upload.read()
+        _filename = _ibkr_upload.name
+        with st.spinner(f"Parsing {_filename}…"):
             try:
-                from ibkr_parser import parse_file as _ibkr_parse, reconcile_with_bq as _ibkr_reconcile
-                _ibkr_trades, _ibkr_summaries = _ibkr_parse(_ibkr_bytes, _ibkr_filename)
+                from ibkr_parser import (parse_file as _ibkr_parse,
+                                         reconcile_with_bq as _ibkr_reconcile,
+                                         diagnose_csv as _ibkr_diagnose)
+                _trades, _summaries = _ibkr_parse(_bytes, _filename)
+                _bq_positions       = _get_positions_cached()
+                _reconciled         = _ibkr_reconcile(_summaries, _bq_positions)
+                st.session_state["ibkr_sync"] = {
+                    "trades":     _trades,
+                    "summaries":  _summaries,
+                    "reconciled": _reconciled,
+                    "filename":   _filename,
+                    "bytes":      _bytes,
+                }
             except ImportError:
                 st.error("pdfplumber is required for PDF parsing. Run: `pip install pdfplumber`")
-                st.stop()
             except Exception as _pe:
                 st.error(f"Failed to parse file: {_pe}")
-                st.stop()
 
-        if not _ibkr_trades:
+    # ── Step 2: Show results (persists across rerenders via session_state) ─
+    if "ibkr_sync" in st.session_state:
+        _sync       = st.session_state["ibkr_sync"]
+        _trades     = _sync["trades"]
+        _reconciled = _sync["reconciled"]
+        _filename   = _sync["filename"]
+        _bytes      = _sync["bytes"]
+
+        if not _trades:
             st.warning("No option trades detected.")
-            # Show diagnostics so the user can see what the parser actually found
             try:
                 from ibkr_parser import diagnose_csv as _ibkr_diagnose
-                _diag = _ibkr_diagnose(_ibkr_bytes)
-                with st.expander("🔍 File diagnostics — click to troubleshoot", expanded=True):
+                _diag = _ibkr_diagnose(_bytes)
+                with st.expander("🔍 File diagnostics", expanded=True):
                     st.markdown(f"**Sections found:** `{'`, `'.join(_diag['sections']) or 'none'}`")
-                    st.markdown(f"**Trades section present:** {'✅ yes' if _diag['has_trades_section'] else '❌ no'}")
+                    st.markdown(f"**Trades section:** {'✅ yes' if _diag['has_trades_section'] else '❌ no'}")
                     if _diag['asset_categories']:
                         st.markdown(f"**Asset categories:** `{'`, `'.join(_diag['asset_categories'])}`")
                     if _diag['symbol_samples']:
                         st.markdown(f"**Option symbols found:** `{'`, `'.join(_diag['symbol_samples'])}`")
                     if _diag['first_rows']:
-                        st.markdown("**First rows of file:**")
+                        st.markdown("**First rows:**")
                         for _r in _diag['first_rows']:
                             st.code(_r)
-                    st.markdown(
-                        "**Expected format:** `Trades,Data,Equity and Index Options,USD,AEHR 15JAN27 40 C,...`  \n"
-                        "Export from IBKR → Reports → Activity → Activity Statement → CSV."
-                    )
+                    st.caption("Expected: `Trades,Data,Equity and Index Options,USD,AEHR 15JAN27 40 C,...`")
             except Exception:
-                st.info(
-                    "Make sure the file contains a **Trades** section with **Equity and Index Options** rows. "
-                    "Export from IBKR → Reports → Activity → Activity Statement → CSV."
-                )
+                pass
         else:
-            st.success(
-                f"Parsed **{len(_ibkr_trades)} trades** across **{len(_ibkr_summaries)} contracts**"
-            )
+            st.success(f"Parsed **{len(_trades)} trades** across **{len(_sync['summaries'])} contracts** from `{_filename}`")
 
-            with st.expander(f"Raw trades ({len(_ibkr_trades)})", expanded=False):
-                _rt_rows = [
+            with st.expander(f"Raw trades ({len(_trades)})", expanded=False):
+                st.dataframe(pd.DataFrame([
                     {"Date": t.trade_date.isoformat(), "Symbol": t.raw_symbol,
                      "Qty": t.quantity, "Price": f"${t.price:.2f}",
                      "Proceeds": f"${t.proceeds:,.2f}", "Code": t.code}
-                    for t in _ibkr_trades
-                ]
-                st.dataframe(pd.DataFrame(_rt_rows), use_container_width=True, hide_index=True)
+                    for t in _trades
+                ]), use_container_width=True, hide_index=True)
 
-            # Reconcile against BigQuery
-            _ibkr_bq_positions = _get_positions_cached()
-            _ibkr_reconciled   = _ibkr_reconcile(_ibkr_summaries, _ibkr_bq_positions)
+            # ── Build actionable table ─────────────────────────────────────
+            _ACT_ICON = {"CREATE": "🟢", "UPDATE": "🔵", "CLOSE": "🔴", "SKIP": "⚪"}
+            _actionable = [(i, r) for i, r in enumerate(_reconciled)
+                           if r["bq_action"] in ("CREATE", "UPDATE", "CLOSE")]
 
-            # ── Preview table ──────────────────────────────────────────────
-            st.subheader("Detected Changes")
-
-            _ACT_ICON = {"CREATE": "🟢", "UPDATE": "🔵", "CLOSE": "🔴",
-                         "ROLLED": "🔄", "SKIP": "⚪"}
-
-            _ibkr_display = []
-            _ibkr_apply   = []
-
-            for _ii, _rec in enumerate(_ibkr_reconciled):
-                _s   = _rec["summary"]
-                _act = _rec["bq_action"]
-                _chg = _rec["changes"]
-
-                _chg_parts = []
-                if "quantity"             in _chg: _chg_parts.append(f"qty→{_chg['quantity']}")
-                if "entry_price"          in _chg: _chg_parts.append(f"avg→${_chg['entry_price']:.2f}")
-                if "quantity_trimmed"     in _chg: _chg_parts.append(f"trimmed→{_chg['quantity_trimmed']}")
-                if "proceeds_from_trims"  in _chg: _chg_parts.append(f"proceeds→${_chg['proceeds_from_trims']:,.2f}")
-                if "mode"                 in _chg: _chg_parts.append(f"mode→{_chg['mode']}")
-
-                # Roll flag: IBKR activity shows a roll completed
-                _roll_note = ""
-                if _s.action in ("ROLLED", "ROLLED_INTO"):
-                    _roll_note = "ROLL DETECTED — position already rolled in IBKR"
-
-                _ibkr_display.append({
-                    "":        _ACT_ICON.get(_act, "⚪"),
-                    "Action":  _act,
-                    "Ticker":  _s.ticker,
-                    "Strike":  f"${_s.strike}",
-                    "Expiry":  _s.expiry.isoformat(),
-                    "Type":    _s.option_type,
-                    "Net Qty": _s.net_qty,
-                    "Avg Buy": f"${_s.avg_buy_price:.2f}" if _s.avg_buy_price else "-",
-                    "Sold":    _s.total_sold or "-",
-                    "Proceeds":f"${_s.gross_proceeds:,.2f}" if _s.gross_proceeds else "-",
-                    "IBKR Action": _s.action,
-                    "Changes": ", ".join(_chg_parts) if _chg_parts else "(no change)",
-                    "Note":    _rec["conflict"] or _roll_note,
-                })
-                _ibkr_apply.append(_rec)
-
-            st.dataframe(pd.DataFrame(_ibkr_display), use_container_width=True, hide_index=True)
-
-            # ── Actionable items with checkboxes ──────────────────────────
-            _ibkr_actionable = [
-                (_ii2, _r2) for _ii2, _r2 in enumerate(_ibkr_apply)
-                if _r2["bq_action"] in ("CREATE", "UPDATE", "CLOSE")
-            ]
-
-            if not _ibkr_actionable:
+            if not _actionable:
                 st.info("All positions are already up to date — nothing to apply.")
             else:
-                st.markdown(f"**{len(_ibkr_actionable)} change(s) to apply:**")
-                _ibkr_selected = []
-                for _ii2, _rec2 in _ibkr_actionable:
-                    _s2  = _rec2["summary"]
-                    _a2  = _rec2["bq_action"]
-                    _lbl = (
-                        f"{_ACT_ICON.get(_a2, '⚪')} **{_a2}** — "
-                        f"{_s2.ticker} {_s2.expiry} ${_s2.strike}{_s2.option_type} "
-                        f"(net {_s2.net_qty} contracts)"
-                        + (f" — ⚠️ {_rec2['conflict']}" if _rec2["conflict"] else "")
-                        + (f" — 🔄 ROLL" if _s2.action in ("ROLLED", "ROLLED_INTO") else "")
-                    )
-                    if st.checkbox(_lbl, value=(_a2 != "CLOSE"), key=f"settings_ibkr_chk_{_ii2}"):
-                        _ibkr_selected.append(_ii2)
+                st.subheader(f"Detected Changes ({len(_actionable)})")
 
-                st.markdown("---")
-                _ibkr_apply_btn = st.button(
-                    f"✅ Apply {len(_ibkr_selected)} Selected Change(s)",
+                _editor_rows = []
+                for _orig_idx, _rec in _actionable:
+                    _s   = _rec["summary"]
+                    _act = _rec["bq_action"]
+                    _chg = _rec["changes"]
+                    _chg_parts = []
+                    if "quantity"            in _chg: _chg_parts.append(f"qty→{_chg['quantity']}")
+                    if "entry_price"         in _chg: _chg_parts.append(f"avg→${_chg['entry_price']:.2f}")
+                    if "quantity_trimmed"    in _chg: _chg_parts.append(f"trimmed→{_chg['quantity_trimmed']}")
+                    if "proceeds_from_trims" in _chg: _chg_parts.append(f"proceeds→${_chg['proceeds_from_trims']:,.2f}")
+                    if "mode"                in _chg: _chg_parts.append(f"mode→{_chg['mode']}")
+                    _note = _rec["conflict"] or ("ROLL" if _s.action in ("ROLLED", "ROLLED_INTO") else "")
+                    _editor_rows.append({
+                        "Apply?":   _act != "CLOSE",
+                        "":         _ACT_ICON.get(_act, "⚪"),
+                        "Action":   _act,
+                        "Ticker":   _s.ticker,
+                        "Strike":   f"${_s.strike}",
+                        "Expiry":   _s.expiry.isoformat(),
+                        "C/P":      _s.option_type,
+                        "Net Qty":  _s.net_qty,
+                        "Avg Cost": f"${_s.avg_buy_price:.2f}" if _s.avg_buy_price else "-",
+                        "Changes":  ", ".join(_chg_parts) or "(no change)",
+                        "Note":     _note,
+                        "_idx":     _orig_idx,
+                    })
+
+                _edited_df = st.data_editor(
+                    pd.DataFrame(_editor_rows),
+                    column_config={
+                        "Apply?": st.column_config.CheckboxColumn("Apply?", default=True, width="small"),
+                        "_idx":   None,  # hide index column
+                    },
+                    disabled=["", "Action", "Ticker", "Strike", "Expiry", "C/P",
+                               "Net Qty", "Avg Cost", "Changes", "Note"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="ibkr_editor",
+                )
+
+                _n_selected = int(_edited_df["Apply?"].sum())
+
+                _btn_col1, _btn_col2 = st.columns([4, 1])
+                _apply_btn = _btn_col1.button(
+                    f"✅ Apply {_n_selected} Change(s)",
                     type="primary",
-                    disabled=not _ibkr_selected,
+                    disabled=(_n_selected == 0),
                     use_container_width=True,
                     key="settings_ibkr_apply_btn",
                 )
 
-                if _ibkr_apply_btn and _ibkr_selected:
-                    _ibkr_applied = 0
-                    _ibkr_errors  = []
-                    _ibkr_log     = []
+                if _apply_btn and _n_selected > 0:
+                    _applied = 0
+                    _errors  = []
+                    _log     = []
 
-                    for _idx in _ibkr_selected:
-                        _rec3 = _ibkr_apply[_idx]
-                        _s3   = _rec3["summary"]
-                        _a3   = _rec3["bq_action"]
-                        _chg3 = _rec3["changes"]
-
+                    for _, _erow in _edited_df[_edited_df["Apply?"]].iterrows():
+                        _rec = _reconciled[int(_erow["_idx"])]
+                        _s   = _rec["summary"]
+                        _act = _rec["bq_action"]
+                        _chg = _rec["changes"]
                         try:
-                            if _a3 == "CREATE":
+                            if _act == "CREATE":
                                 from options_data import to_occ as _to_occ
-                                _score3 = db.get_leaps_monitor_score(_s3.ticker)
                                 db.save_position({
-                                    "ticker":               _s3.ticker,
-                                    "contract":             _to_occ(_s3.ticker, _s3.expiry, _s3.option_type, _s3.strike),
-                                    "option_type":          "CALL" if _s3.option_type == "C" else "PUT",
-                                    "strike":               _s3.strike,
-                                    "expiration_date":      _s3.expiry,
-                                    "entry_price":          _s3.avg_buy_price,
-                                    "quantity":             _s3.net_qty,
-                                    "entry_delta":          None,
-                                    "entry_iv_rank":        None,
-                                    "entry_thesis_score":   _score3,
-                                    "position_type":        "STANDARD",
-                                    "target_return":        "5-10x",
-                                    "mode":                 "ACTIVE",
-                                    "quantity_trimmed":     _s3.total_sold,
-                                    "proceeds_from_trims":  _s3.gross_proceeds,
-                                    "notes": f"Imported from IBKR {_ibkr_filename}",
+                                    "ticker":              _s.ticker,
+                                    "contract":            _to_occ(_s.ticker, _s.expiry, _s.option_type, _s.strike),
+                                    "option_type":         "CALL" if _s.option_type == "C" else "PUT",
+                                    "strike":              _s.strike,
+                                    "expiration_date":     _s.expiry,
+                                    "entry_price":         _s.avg_buy_price,
+                                    "quantity":            _s.net_qty,
+                                    "entry_delta":         None,
+                                    "entry_iv_rank":       None,
+                                    "entry_thesis_score":  db.get_leaps_monitor_score(_s.ticker),
+                                    "position_type":       "STANDARD",
+                                    "target_return":       "5-10x",
+                                    "mode":                "ACTIVE",
+                                    "quantity_trimmed":    _s.total_sold,
+                                    "proceeds_from_trims": _s.gross_proceeds,
+                                    "notes":               f"Imported from IBKR {_filename}",
                                 })
-                                _ibkr_applied += 1
-                                _ibkr_log.append({"Ticker": _s3.ticker, "Action": "CREATED", "Detail": f"${_s3.strike} {_s3.expiry} ×{_s3.net_qty}"})
+                                _applied += 1
+                                _log.append({"Ticker": _s.ticker, "Action": "CREATED",
+                                             "Detail": f"${_s.strike} {_s.expiry} ×{_s.net_qty}"})
+                            elif _act in ("UPDATE", "CLOSE"):
+                                _bq = _rec["bq_pos"]
+                                if _bq and _chg:
+                                    db.update_position(str(_bq["id"]), _chg)
+                                    _applied += 1
+                                    _log.append({"Ticker": _s.ticker, "Action": _act,
+                                                 "Detail": " | ".join(f"{k}→{v}" for k, v in _chg.items())})
+                        except Exception as _err:
+                            _errors.append(f"{_s.ticker} ${_s.strike} {_s.expiry}: {_err}")
 
-                            elif _a3 in ("UPDATE", "CLOSE"):
-                                _bq3 = _rec3["bq_pos"]
-                                if _bq3 and _chg3:
-                                    db.update_position(str(_bq3["id"]), _chg3)
-                                    _ibkr_applied += 1
-                                    _detail3 = " | ".join(f"{k}→{v}" for k, v in _chg3.items())
-                                    _ibkr_log.append({"Ticker": _s3.ticker, "Action": _a3, "Detail": _detail3})
-
-                        except Exception as _err3:
-                            _ibkr_errors.append(f"{_s3.ticker} ${_s3.strike} {_s3.expiry}: {_err3}")
-
-                    # Set entry_thesis_score baselines for newly created positions
+                    # Backfill entry_thesis_score for newly created positions that lack one
                     _baseline_set = 0
                     try:
-                        _master_df   = get_eval_master_data()
                         _master_scores = {
                             row["Ticker"].upper(): int(row["Score"])
-                            for _, row in _master_df.iterrows()
+                            for _, row in get_eval_master_data().iterrows()
                             if row.get("Score") is not None
                         }
-                        _refreshed = db.get_positions()
-                        for _rp in _refreshed:
+                        for _rp in db.get_positions():
                             if _rp.get("entry_thesis_score"):
                                 continue
                             _rt = (_rp.get("ticker") or "").upper()
                             if _rt in _master_scores:
                                 db.update_position(str(_rp["id"]), {"entry_thesis_score": _master_scores[_rt]})
                                 _baseline_set += 1
-                                _ibkr_log.append({
-                                    "Ticker": _rt,
-                                    "Action": "BASELINE SET",
-                                    "Detail": f"entry_thesis_score → {_master_scores[_rt]}/100",
-                                })
-                    except Exception as _be:
-                        st.warning(f"Could not set entry thesis baselines: {_be}")
+                    except Exception:
+                        pass
 
                     _invalidate_positions_cache()
                     st.cache_data.clear()
+                    st.session_state.pop("ibkr_sync", None)
 
-                    if _ibkr_applied:
+                    if _applied:
                         st.success(
-                            f"Sync complete — {_ibkr_applied} position(s) updated"
+                            f"Sync complete — {_applied} position(s) updated"
                             + (f", {_baseline_set} thesis baseline(s) set." if _baseline_set else ".")
                         )
-                        st.dataframe(pd.DataFrame(_ibkr_log), use_container_width=True, hide_index=True)
-                    if _ibkr_errors:
-                        for _e3 in _ibkr_errors:
-                            st.error(f"Failed: {_e3}")
-                    if _baseline_set > 0:
-                        st.info(
-                            "Entry thesis baselines set from today's scores. "
-                            "Future re-analyses will show the Δ gap vs this baseline."
-                        )
+                        st.dataframe(pd.DataFrame(_log), use_container_width=True, hide_index=True)
+                    if _errors:
+                        for _e in _errors:
+                            st.error(f"Failed: {_e}")
 
 
 

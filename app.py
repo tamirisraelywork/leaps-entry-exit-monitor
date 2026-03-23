@@ -1732,22 +1732,62 @@ elif page == "📊 Dashboard":
 
     positions = _get_positions_cached()
 
+    # Deduplicate: if the same (ticker, strike, expiry, option_type) exists more than once,
+    # keep only the first (most recently created, since db returns ORDER BY created_at DESC).
+    _seen_contracts: dict = {}
+    _deduped: list = []
+    for _p in positions:
+        _dk = (
+            str(_p.get("ticker", "")).upper(),
+            round(float(_p.get("strike") or 0), 2),
+            str(_p.get("expiration_date", ""))[:10],
+            str(_p.get("option_type", "")).upper(),
+        )
+        if _dk not in _seen_contracts:
+            _seen_contracts[_dk] = True
+            _deduped.append(_p)
+    positions = _deduped
+
     active    = [p for p in positions if p.get("mode") == "ACTIVE"]
     watchlist = [p for p in positions if p.get("mode") == "WATCHLIST"]
+    # Closed option positions contribute to realized P&L total
+    _closed_opts = [
+        p for p in positions
+        if p.get("mode") in ("CLOSED", "ROLLED")
+        and p.get("strike") and p.get("expiration_date")
+    ]
 
     if not positions:
         st.info("No positions yet. Go to **Add Position** to add your first ticker or existing LEAPS.")
         st.stop()
 
-    # Portfolio summary strip
+    # ── Auto-refresh during market hours ──────────────────────────────────────
+    try:
+        from streamlit_autorefresh import st_autorefresh as _st_ar
+        import pytz as _ptz
+        from datetime import time as _dtime
+        _ny   = _ptz.timezone("America/New_York")
+        _net  = datetime.now(_ny)
+        _mkt  = _net.weekday() < 5 and _dtime(9, 25) <= _net.time() <= _dtime(16, 5)
+        if _mkt:
+            _st_ar(interval=300_000, key="dashboard_auto_refresh")
+            st.caption(f"🔄 Auto-refreshing every 5 min · market open · {_net.strftime('%H:%M ET')}")
+        else:
+            st.caption(f"Market closed · {_net.strftime('%a %H:%M ET')}")
+    except ImportError:
+        pass
+
+    # Portfolio summary strip — cost/realized (no live price needed)
     _strip_cost = sum(
         (p.get("entry_price") or 0) * (p.get("quantity") or 0) * 100
         for p in active
     )
+    # Realized P&L = active trims + fully closed option positions (options only, not ETF/stock)
     _strip_realized = sum(
         float(p.get("proceeds_from_trims") or 0)
         - (p.get("entry_price") or 0) * int(p.get("quantity_trimmed") or 0) * 100
-        for p in active
+        for p in active + _closed_opts
+        if p.get("entry_price") and p.get("strike")   # options only
     )
     _strip_net_cost = _strip_cost - sum(float(p.get("proceeds_from_trims") or 0) for p in active)
     _strip_house_ct = sum(
@@ -1762,10 +1802,11 @@ elif page == "📊 Dashboard":
     s3.metric("Portfolio Cost",   f"${_strip_cost:,.0f}" if _strip_cost else "N/A")
     s4.metric("Net At-Risk",      f"${max(0, _strip_net_cost):,.0f}" if _strip_cost else "N/A",
               help="Cost basis minus proceeds already recovered via trims")
-    s5.metric("Total Realized P&L",
+    s5.metric("Realized P&L",
               f"${_strip_realized:+,.0f}" if _strip_realized != 0 else "$0",
               delta=f"{'▲' if _strip_realized >= 0 else '▼'} {abs(_strip_realized):,.0f}" if _strip_realized != 0 else None,
-              delta_color="normal" if _strip_realized >= 0 else "inverse")
+              delta_color="normal" if _strip_realized >= 0 else "inverse",
+              help="Options only · includes fully closed positions")
     s6.metric("House Money", f"{_strip_house_ct} / {len(active)}",
               help="Positions where trims have fully recovered original cost")
 
@@ -1779,6 +1820,42 @@ elif page == "📊 Dashboard":
         # This is the key performance win: N positions in ~T seconds instead of N×T.
         with st.spinner("Loading live market data…"):
             _prefetched = _prefetch_active_data(active, force_check=force_check)
+
+        # ── Unrealized P&L summary (needs live prices from prefetch) ──────────
+        _strip_unrealized = 0.0
+        _strip_live_count = 0
+        for _sp in active:
+            _sp_id   = str(_sp.get("id", ""))
+            _sp_snap = (_prefetched.get(_sp_id) or {}).get("snap") or {}
+            _sp_mid  = _sp_snap.get("mid")
+            _sp_ep   = _sp.get("entry_price")
+            if _sp_mid is not None and _sp_ep and float(_sp_ep) > 0:
+                _sp_rem = int(_sp.get("quantity") or 0) - int(_sp.get("quantity_trimmed") or 0)
+                _strip_unrealized += (_sp_mid - float(_sp_ep)) * max(0, _sp_rem) * 100
+                _strip_live_count += 1
+        _strip_total_pnl = _strip_realized + _strip_unrealized
+
+        if _strip_live_count > 0:
+            _ur1, _ur2, _ur3 = st.columns(3)
+            _ur1.metric(
+                "Unrealized P&L",
+                f"${_strip_unrealized:+,.0f}",
+                help=f"Live mark-to-market on {_strip_live_count} position(s) with current prices",
+                delta_color="normal" if _strip_unrealized >= 0 else "inverse",
+            )
+            _ur2.metric(
+                "Total P&L",
+                f"${_strip_total_pnl:+,.0f}",
+                help="Realized (options, incl. closed) + Unrealized (live prices)",
+                delta_color="normal" if _strip_total_pnl >= 0 else "inverse",
+            )
+            _ur3.metric(
+                "Return on Cost",
+                f"{(_strip_total_pnl / _strip_cost * 100):+.1f}%" if _strip_cost else "N/A",
+                help="Total P&L ÷ original portfolio cost basis",
+                delta_color="normal",
+            )
+        st.markdown("---")
 
         # Batch-fetch thesis scores: one BigQuery query for all tickers at once.
         _active_tickers   = [p.get("ticker", "") for p in active]
@@ -2567,6 +2644,11 @@ elif page == "📊 Dashboard":
                             f"**${strike}C  ·  {exp_date}**  \n"
                             f"Premium: **${mid_val:.2f}**/share  ·  {dte_val}d DTE  \n"
                             f"Delta: **{delta_val:.2f}**  ·  OTM: {otm_pct}%  ·  OI: {oi_val or '—'}  \n"
+                            f"10x needs stock at: **+{move10}%** from ${sp:.2f}"
+                            if delta_val is not None else
+                            f"**${strike}C  ·  {exp_date}**  \n"
+                            f"Premium: **${mid_val:.2f}**/share  ·  {dte_val}d DTE  \n"
+                            f"OTM: {otm_pct}%  ·  OI: {oi_val or '—'}  \n"
                             f"10x needs stock at: **+{move10}%** from ${sp:.2f}"
                         )
                         if len(contracts) > 1:
@@ -3769,16 +3851,13 @@ ALERT_RECIPIENT_EMAIL = "recipient@example.com"  # optional, defaults to sender
     st.subheader("Earnings Call & News Analysis")
 
     _finnhub_key  = _cfg("FINNHUB_API_KEY")
-    _aletheia_key = _cfg("ALETHEIA_API_KEY")
     _gemini_key   = _cfg("GEMINI_API_KEY")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.metric("GEMINI_API_KEY",   "✅ Set" if _gemini_key  else "❌ Missing",
               help="Required for earnings call analysis (LLM)")
     c2.metric("FINNHUB_API_KEY",  "✅ Set" if _finnhub_key  else "⚪ Optional",
               help="Free tier — adds EPS beat/miss context to earnings analysis. finnhub.io")
-    c3.metric("ALETHEIA_API_KEY", "✅ Set" if _aletheia_key else "⚪ Optional",
-              help="Free tier — pre-computed earnings call sentiment. aletheia-api.com")
 
     with st.expander("Earnings analysis source pipeline", expanded=False):
         st.markdown("""
@@ -3786,13 +3865,12 @@ ALERT_RECIPIENT_EMAIL = "recipient@example.com"  # optional, defaults to sender
 
 | # | Source | Key needed | What it provides |
 |---|--------|-----------|-----------------|
-| 1 | **Aletheia API** | `ALETHEIA_API_KEY` | Pre-computed call sentiment & guidance |
-| 2 | **SEC EDGAR 8-K** | None (free) | Actual management text from official filing |
-| 2b| **Finnhub EPS** | `FINNHUB_API_KEY` | Beat/miss %, prior quarter comparison |
+| 1 | **SEC EDGAR 8-K** | None (free) | Actual management text from official filing |
+| 2 | **Finnhub EPS** | `FINNHUB_API_KEY` | Beat/miss %, prior quarter comparison |
 | 3 | **Gemini + Google Search** | `GEMINI_API_KEY` | Fallback: LLM searches for transcript |
 
-Sources 1 & 2 give Gemini **actual text to analyze** rather than guessing from training data.
 SEC EDGAR 8-K is always available for free — no API key required.
+Gemini analyzes the actual filing text rather than guessing from training data.
         """)
 
     with st.expander("Add optional API keys to secrets.toml"):
@@ -3800,10 +3878,6 @@ SEC EDGAR 8-K is always available for free — no API key required.
 # Finnhub — free tier at finnhub.io (60 calls/min)
 # Provides: EPS actual vs estimate, surprise %, analyst recommendations
 FINNHUB_API_KEY = "your_finnhub_key"
-
-# Aletheia — free tier at aletheia-api.com
-# Provides: earnings call sentiment analysis, insider trading, congressional trades
-ALETHEIA_API_KEY = "your_aletheia_key"
         """, language="toml")
 
     st.divider()

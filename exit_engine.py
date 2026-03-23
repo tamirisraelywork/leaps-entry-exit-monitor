@@ -959,8 +959,8 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 remaining_val = round(mid * qty * 100) if mid else None
                 val_str = f"  Current value of {qty} remaining contracts: ${remaining_val:,.0f}\n" if remaining_val else ""
                 alerts.append(Alert(
-                    type="PROFIT_100", severity="BLUE",
-                    subject=f"🔵 BONUS PROFIT — {ticker} Up 2x on Remaining Contracts: {pnl:+.1f}%",
+                    type="PROFIT_100", severity="GREEN",
+                    subject=f"🟢 BONUS PROFIT — {ticker} Up 2x on Remaining Contracts: {pnl:+.1f}%",
                     body=(
                         hdr()
                         + "SIGNAL: BONUS PROFIT — REMAINING CONTRACTS AT 2x\n"

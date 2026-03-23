@@ -3146,6 +3146,25 @@ elif page == "⚙️ Settings":
 > The CSV Flex Report is more reliably parsed. Use a date range that covers your full history.
         """)
 
+    # ── Show persistent apply result from previous run ─────────────────────
+    if "ibkr_result" in st.session_state:
+        _res = st.session_state["ibkr_result"]
+        if _res.get("applied", 0) > 0:
+            st.success(
+                f"Sync complete — **{_res['applied']}** position(s) updated from `{_res.get('filename','')}`"
+                + (f", {_res['baseline_set']} thesis baseline(s) set." if _res.get("baseline_set") else ".")
+            )
+            if _res.get("log"):
+                st.dataframe(pd.DataFrame(_res["log"]), use_container_width=True, hide_index=True)
+        for _e in _res.get("errors", []):
+            st.error(f"Failed: {_e}")
+        if not _res.get("applied") and not _res.get("errors"):
+            st.warning("No changes were written — positions may already be up to date or no matching records found.")
+        if st.button("Dismiss", key="ibkr_result_dismiss"):
+            st.session_state.pop("ibkr_result", None)
+            st.rerun()
+        st.divider()
+
     _ibkr_upload = st.file_uploader(
         "Select your IBKR Activity Statement",
         type=["csv", "txt", "pdf"],
@@ -3162,6 +3181,10 @@ elif page == "⚙️ Settings":
     )
     if _ibkr_clear_col.button("✖ Clear", key="settings_ibkr_clear_btn",
                                disabled="ibkr_sync" not in st.session_state):
+        # clean up checkbox keys too
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("ibkr_chk_"):
+                del st.session_state[_k]
         st.session_state.pop("ibkr_sync", None)
         st.rerun()
 
@@ -3171,12 +3194,14 @@ elif page == "⚙️ Settings":
         _filename = _ibkr_upload.name
         with st.spinner(f"Parsing {_filename}…"):
             try:
-                from ibkr_parser import (parse_file as _ibkr_parse,
-                                         reconcile_with_bq as _ibkr_reconcile,
-                                         diagnose_csv as _ibkr_diagnose)
+                from ibkr_parser import parse_file as _ibkr_parse, reconcile_with_bq as _ibkr_reconcile
                 _trades, _summaries = _ibkr_parse(_bytes, _filename)
                 _bq_positions       = _get_positions_cached()
                 _reconciled         = _ibkr_reconcile(_summaries, _bq_positions)
+                # clear stale checkbox state from any prior run
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("ibkr_chk_"):
+                        del st.session_state[_k]
                 st.session_state["ibkr_sync"] = {
                     "trades":     _trades,
                     "summaries":  _summaries,
@@ -3184,6 +3209,7 @@ elif page == "⚙️ Settings":
                     "filename":   _filename,
                     "bytes":      _bytes,
                 }
+                st.rerun()
             except ImportError:
                 st.error("pdfplumber is required for PDF parsing. Run: `pip install pdfplumber`")
             except Exception as _pe:
@@ -3227,7 +3253,7 @@ elif page == "⚙️ Settings":
                     for t in _trades
                 ]), use_container_width=True, hide_index=True)
 
-            # ── Build actionable table ─────────────────────────────────────
+            # ── Build actionable list ──────────────────────────────────────
             _ACT_ICON = {"CREATE": "🟢", "UPDATE": "🔵", "CLOSE": "🔴", "SKIP": "⚪"}
             _actionable = [(i, r) for i, r in enumerate(_reconciled)
                            if r["bq_action"] in ("CREATE", "UPDATE", "CLOSE")]
@@ -3237,8 +3263,9 @@ elif page == "⚙️ Settings":
             else:
                 st.subheader(f"Detected Changes ({len(_actionable)})")
 
-                _editor_rows = []
-                for _orig_idx, _rec in _actionable:
+                # ── Per-row checkboxes stored in session_state ─────────────
+                # Default: apply CREATE/UPDATE, skip CLOSE (safer default)
+                for _ci, (_orig_idx, _rec) in enumerate(_actionable):
                     _s   = _rec["summary"]
                     _act = _rec["bq_action"]
                     _chg = _rec["changes"]
@@ -3249,38 +3276,24 @@ elif page == "⚙️ Settings":
                     if "proceeds_from_trims" in _chg: _chg_parts.append(f"proceeds→${_chg['proceeds_from_trims']:,.2f}")
                     if "mode"                in _chg: _chg_parts.append(f"mode→{_chg['mode']}")
                     _note = _rec["conflict"] or ("ROLL" if _s.action in ("ROLLED", "ROLLED_INTO") else "")
-                    _editor_rows.append({
-                        "Apply?":   _act != "CLOSE",
-                        "":         _ACT_ICON.get(_act, "⚪"),
-                        "Action":   _act,
-                        "Ticker":   _s.ticker,
-                        "Strike":   f"${_s.strike}",
-                        "Expiry":   _s.expiry.isoformat(),
-                        "C/P":      _s.option_type,
-                        "Net Qty":  _s.net_qty,
-                        "Avg Cost": f"${_s.avg_buy_price:.2f}" if _s.avg_buy_price else "-",
-                        "Changes":  ", ".join(_chg_parts) or "(no change)",
-                        "Note":     _note,
-                        "_idx":     _orig_idx,
-                    })
+                    _chk_key = f"ibkr_chk_{_ci}"
+                    if _chk_key not in st.session_state:
+                        st.session_state[_chk_key] = (_act != "CLOSE")
+                    _label = (
+                        f"{_ACT_ICON.get(_act,'⚪')} **{_act}** — "
+                        f"{_s.ticker}  ${_s.strike} {_s.expiry} {_s.option_type}  "
+                        f"×{_s.net_qty}"
+                        + (f"  |  {', '.join(_chg_parts)}" if _chg_parts else "")
+                        + (f"  ⚠️ {_note}" if _note else "")
+                    )
+                    st.checkbox(_label, key=_chk_key)
 
-                _edited_df = st.data_editor(
-                    pd.DataFrame(_editor_rows),
-                    column_config={
-                        "Apply?": st.column_config.CheckboxColumn("Apply?", default=True, width="small"),
-                        "_idx":   None,  # hide index column
-                    },
-                    disabled=["", "Action", "Ticker", "Strike", "Expiry", "C/P",
-                               "Net Qty", "Avg Cost", "Changes", "Note"],
-                    hide_index=True,
-                    use_container_width=True,
-                    key="ibkr_editor",
+                st.markdown("---")
+                _n_selected = sum(
+                    1 for _ci in range(len(_actionable))
+                    if st.session_state.get(f"ibkr_chk_{_ci}", False)
                 )
-
-                _n_selected = int(_edited_df["Apply?"].sum())
-
-                _btn_col1, _btn_col2 = st.columns([4, 1])
-                _apply_btn = _btn_col1.button(
+                _apply_btn = st.button(
                     f"✅ Apply {_n_selected} Change(s)",
                     type="primary",
                     disabled=(_n_selected == 0),
@@ -3288,13 +3301,14 @@ elif page == "⚙️ Settings":
                     key="settings_ibkr_apply_btn",
                 )
 
-                if _apply_btn and _n_selected > 0:
+                if _apply_btn:
                     _applied = 0
                     _errors  = []
                     _log     = []
 
-                    for _, _erow in _edited_df[_edited_df["Apply?"]].iterrows():
-                        _rec = _reconciled[int(_erow["_idx"])]
+                    for _ci, (_orig_idx, _rec) in enumerate(_actionable):
+                        if not st.session_state.get(f"ibkr_chk_{_ci}", False):
+                            continue
                         _s   = _rec["summary"]
                         _act = _rec["bq_action"]
                         _chg = _rec["changes"]
@@ -3329,10 +3343,14 @@ elif page == "⚙️ Settings":
                                     _applied += 1
                                     _log.append({"Ticker": _s.ticker, "Action": _act,
                                                  "Detail": " | ".join(f"{k}→{v}" for k, v in _chg.items())})
+                                elif not _bq:
+                                    _errors.append(f"{_s.ticker} ${_s.strike} {_s.expiry}: no matching position found in BigQuery")
+                                elif not _chg:
+                                    _errors.append(f"{_s.ticker} ${_s.strike} {_s.expiry}: no fields to update")
                         except Exception as _err:
                             _errors.append(f"{_s.ticker} ${_s.strike} {_s.expiry}: {_err}")
 
-                    # Backfill entry_thesis_score for newly created positions that lack one
+                    # Backfill entry_thesis_score for newly created positions
                     _baseline_set = 0
                     try:
                         _master_scores = {
@@ -3352,17 +3370,22 @@ elif page == "⚙️ Settings":
 
                     _invalidate_positions_cache()
                     st.cache_data.clear()
-                    st.session_state.pop("ibkr_sync", None)
 
-                    if _applied:
-                        st.success(
-                            f"Sync complete — {_applied} position(s) updated"
-                            + (f", {_baseline_set} thesis baseline(s) set." if _baseline_set else ".")
-                        )
-                        st.dataframe(pd.DataFrame(_log), use_container_width=True, hide_index=True)
-                    if _errors:
-                        for _e in _errors:
-                            st.error(f"Failed: {_e}")
+                    # Clean up checkbox keys
+                    for _k in list(st.session_state.keys()):
+                        if _k.startswith("ibkr_chk_"):
+                            del st.session_state[_k]
+
+                    # Store result for display after rerun, then clear sync
+                    st.session_state["ibkr_result"] = {
+                        "applied":      _applied,
+                        "errors":       _errors,
+                        "log":          _log,
+                        "baseline_set": _baseline_set,
+                        "filename":     _filename,
+                    }
+                    st.session_state.pop("ibkr_sync", None)
+                    st.rerun()
 
 
 

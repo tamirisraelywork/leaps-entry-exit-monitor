@@ -235,12 +235,26 @@ def send_daily_summary(
         iv_rank     = sig.get("iv_rank")
         price       = sig.get("price")
         rsi         = sig.get("rsi")
+        pct_from_low = sig.get("pct_from_low")
         entry_alert = sig.get("entry_alert")
 
         score_str  = f"Score {score}/100" if score    is not None else "Score N/A"
         ivr_str    = f"IVR {iv_rank:.0f}%" if iv_rank is not None else "IVR N/A"
         price_str  = f"${price:.2f}"       if price   is not None else "N/A"
         rsi_str    = f"RSI {rsi:.0f}"      if rsi     is not None else ""
+
+        # 52wk position with calibrated buy-zone label (backtest-derived thresholds)
+        if pct_from_low is not None:
+            if pct_from_low <= 0.10:
+                wk52_str = f"52wk {pct_from_low:.2f} ★BUY"
+            elif pct_from_low <= 0.25:
+                wk52_str = f"52wk {pct_from_low:.2f} BUY"
+            elif pct_from_low <= 0.50:
+                wk52_str = f"52wk {pct_from_low:.2f} WAIT"
+            else:
+                wk52_str = f"52wk {pct_from_low:.2f} HOLD"
+        else:
+            wk52_str = "52wk N/A"
 
         if entry_alert:
             e_emoji = _ENTRY_EMOJI.get(entry_alert.severity, "⚪")
@@ -269,7 +283,7 @@ def send_daily_summary(
 
         line = (
             f"  {ticker:<6}  {price_str:<8} | {score_str:<14} | {ivr_str:<10}"
-            f"| {rsi_str:<8}| {signal_str}"
+            f"| {rsi_str:<8}| {wk52_str:<16}| {signal_str}"
         )
         if rec_str:
             line += f"\n{rec_str}"

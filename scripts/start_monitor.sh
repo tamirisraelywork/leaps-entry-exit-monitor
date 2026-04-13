@@ -66,39 +66,51 @@ if [ ! -f "$SECRETS_FILE" ]; then
     exit 1
 fi
 
-# Use Python (no external toml package needed) to export secrets as env vars.
-# Handles KEY = "value" and KEY = 'value' lines.
-# SERVICE_ACCOUNT_JSON is handled by shared/config.cfg_dict() which reads TOML tables.
+# Use Python (no external toml package needed) to export simple secrets as env vars.
+# SERVICE_ACCOUNT_JSON is intentionally skipped here — cfg_dict() reads it directly
+# from the TOML file to avoid JSON corruption from shell escaping.
 _load_secrets() {
     "$PYTHON" - "$SECRETS_FILE" <<'EOF'
-import re, sys, os
+import re, sys
 
 secrets_file = sys.argv[1]
 with open(secrets_file, "r") as f:
     content = f.read()
 
+# Keys whose values are JSON objects — skip env export to avoid shell escaping
+# corrupting the JSON (especially \n sequences in the private_key field).
+# cfg_dict() reads these directly from the TOML file instead.
+SKIP_JSON_KEYS = {"SERVICE_ACCOUNT_JSON"}
+
 exported = set()
 
-# Simple KEY = "value" or KEY = 'value'
+# KEY = "value"
 for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*"([^"]*)"', content, re.MULTILINE):
     k, v = m.group(1), m.group(2)
     exported.add(k)
-    # Escape for shell: replace ' with '\''
-    safe_v = v.replace("\\n", "\n").replace("'", "'\\''")
+    if k in SKIP_JSON_KEYS:
+        continue
+    # Do NOT replace \n — preserve escape sequences exactly as stored
+    safe_v = v.replace("'", "'\\''")
     print(f"export {k}='{safe_v}'")
 
+# KEY = 'value'
 for m in re.finditer(r"^([A-Za-z_]\w*)\s*=\s*'([^']*)'", content, re.MULTILINE):
     k, v = m.group(1), m.group(2)
     if k not in exported:
         exported.add(k)
+        if k in SKIP_JSON_KEYS:
+            continue
         safe_v = v.replace("'", "'\\''")
         print(f"export {k}='{safe_v}'")
 
-# Triple-quoted strings: KEY = """..."""
+# KEY = """..."""
 for m in re.finditer(r'^([A-Za-z_]\w*)\s*=\s*"""(.*?)"""', content, re.MULTILINE | re.DOTALL):
     k, v = m.group(1), m.group(2).strip()
     if k not in exported:
         exported.add(k)
+        if k in SKIP_JSON_KEYS:
+            continue
         safe_v = v.replace("'", "'\\''")
         print(f"export {k}='{safe_v}'")
 EOF

@@ -384,6 +384,7 @@ def _fetch_watchlist_signal(pos: dict) -> tuple[str, dict]:
             "iv_rank":      iv_rank,
             "price":        price,
             "rsi":          stock_data.get("weekly_rsi"),
+            "pct_from_low": stock_data.get("pct_from_low"),   # 52wk position: 0=low,1=high
             "rec_strike":   rec_strike,
             "rec_expiry":   rec_expiry,
             "rec_premium":  rec_premium,

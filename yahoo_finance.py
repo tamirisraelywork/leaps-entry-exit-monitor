@@ -199,6 +199,11 @@ def run_comprehensive_analysis(ticker_symbol):
                 except Exception as e:
                     logging.error(f"AV Price Backup Error for {ticker_symbol}: {e}")
 
+            # 52-week position: 0.0 = at 52wk low, 1.0 = at 52wk high
+            wk52_position_val = "N/A"
+            if current_price and low_52 and high_52 and high_52 > low_52:
+                wk52_position_val = round((current_price - low_52) / (high_52 - low_52), 4)
+
             # 4. Latest expiration date — Yahoo first, Polygon.io as fallback
             try:
                 if _yf_rate_limited:
@@ -329,6 +334,11 @@ def run_comprehensive_analysis(ticker_symbol):
                     runway_val = f"{runway_months:.1f} Months"
                 else:
                     runway_val = "Positive OCF (No Burn)"
+
+            # OCF Per Share (TTM OCF / shares outstanding)
+            ocf_per_share_val = "N/A"
+            if ttm_ocf is not None and shares_outstanding and shares_outstanding > 0:
+                ocf_per_share_val = round(ttm_ocf / shares_outstanding, 4)
 
             # --- Pre-fetch AV Income Statement ONCE — reused for EBITDA fallback,
             #     Share Count Tier 2, DOL, Revenue Growth, and Gross Margin ---
@@ -531,6 +541,47 @@ def run_comprehensive_analysis(ticker_symbol):
                 except Exception:
                     pass
 
+            # Annual revenue (for EBITDA Margin) — reuse what's already loaded
+            annual_revenue_raw = None
+            if a_financials is not None and 'Total Revenue' in a_financials.index:
+                try:
+                    annual_revenue_raw = float(a_financials.loc['Total Revenue'].dropna().iloc[0])
+                except Exception:
+                    pass
+            if annual_revenue_raw is None and av_income_reports:
+                try:
+                    raw_rev = av_income_reports[0].get("totalRevenue")
+                    if raw_rev and str(raw_rev).lower() not in ("none", "0", ""):
+                        annual_revenue_raw = av_clean(raw_rev)
+                except Exception:
+                    pass
+
+            # EBITDA Margin
+            ebitda_margin_val = "N/A"
+            if ebitda is not None and annual_revenue_raw and annual_revenue_raw > 0:
+                ebitda_margin_val = f"{(ebitda / annual_revenue_raw) * 100:.2f}%"
+
+            # Operating ROA (operating income / total assets)
+            operating_income_raw = None
+            if a_financials is not None:
+                try:
+                    operating_income_raw, _ = get_latest_metric(
+                        a_financials, ['EBIT', 'Operating Income']
+                    )
+                except Exception:
+                    pass
+            if operating_income_raw is None and av_income_reports:
+                try:
+                    v = av_clean(av_income_reports[0].get("operatingIncome"))
+                    if v != 0.0:
+                        operating_income_raw = v
+                except Exception:
+                    pass
+
+            operating_roa_val = "N/A"
+            if operating_income_raw is not None and total_assets and total_assets > 0:
+                operating_roa_val = f"{(operating_income_raw / total_assets) * 100:.2f}%"
+
             # 16. Growth-to-Valuation Score (Revenue Growth YoY / P-S Ratio)
             try:
                 ps_ratio = info.get('priceToSalesTrailingTwelveMonths')
@@ -605,7 +656,11 @@ def run_comprehensive_analysis(ticker_symbol):
                 "Capital Structure Pressure": csp_status,
                 "Revenue Growth YoY (%)": revenue_growth_val,
                 "Gross Margin (%)": gross_margin_val,
-                "Growth-to-Valuation Score": growth_to_val_score
+                "Growth-to-Valuation Score": growth_to_val_score,
+                "OCF Per Share": ocf_per_share_val,
+                "52-Week Position (0=low,1=high)": wk52_position_val,
+                "EBITDA Margin (%)": ebitda_margin_val,
+                "Operating ROA (%)": operating_roa_val
             }
 
             results["data"] = {"Summary": final_metrics}

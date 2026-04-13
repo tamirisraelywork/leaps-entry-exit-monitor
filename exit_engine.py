@@ -1420,17 +1420,44 @@ def evaluate_entry(position: dict, stock_data: dict, iv_rank: float | None) -> A
             score -= 20   # Penalty: buying expensive options is a drag on LEAPS returns
             reasons.append(f"IV Rank = {iv_rank:.1f}% ⚠️ — options are expensive, reduces entry quality")
 
-    # Price vs 52-week range
+    # 52-week position — PRIMARY entry timing signal (backtest r=-0.117 to -0.245)
+    # pct_from_low: 0.0 = at 52wk low, 1.0 = at 52wk high
+    # Calibrated thresholds from 46K sample backtest:
+    #   ≤0.10 = near lows → r=-0.245 in 2021, max mean-reversion potential
+    #   ≤0.25 = buy zone  → confirmed entry window
+    #   0.25–0.50 = wait  → neutral, keep watching
+    #   >0.50 = avoid now → stock already re-rated, wait for pullback
     if pct_from_low is not None:
-        if pct_from_low < 0.15:
-            score += 30
-            reasons.append(f"Stock near 52-week low ({pct_from_low*100:.0f}% from low) — maximum asymmetry")
-        elif pct_from_low < 0.30:
-            score += 15
-            reasons.append(f"Stock in lower third of 52-week range ({pct_from_low*100:.0f}% from low)")
-        elif pct_from_low > 0.80:
+        if pct_from_low <= 0.10:
+            score += 35
+            reasons.append(
+                f"52wk position = {pct_from_low:.2f} ★ NEAR ANNUAL LOW — "
+                "maximum mean-reversion potential (backtest top signal)"
+            )
+        elif pct_from_low <= 0.25:
+            score += 25
+            reasons.append(
+                f"52wk position = {pct_from_low:.2f} — IN BUY ZONE "
+                "(bottom quarter of annual range, entry window open)"
+            )
+        elif pct_from_low <= 0.50:
+            score += 5
+            reasons.append(
+                f"52wk position = {pct_from_low:.2f} — mid-range, "
+                "wait for pullback toward 0.25 before entering"
+            )
+        elif pct_from_low <= 0.75:
             score -= 10
-            reasons.append(f"Stock near 52-week high ({pct_from_low*100:.0f}% from low) — limited upside room")
+            reasons.append(
+                f"52wk position = {pct_from_low:.2f} — upper range, "
+                "stock has recovered; wait for a pullback"
+            )
+        else:
+            score -= 20
+            reasons.append(
+                f"52wk position = {pct_from_low:.2f} — NEAR 52WK HIGH, "
+                "thesis not yet priced in but entry timing is poor"
+            )
 
     # Trend structure signal (MA50 / MA200)
     # For LEAPS, the ideal scenario is beaten-down stock starting to recover.

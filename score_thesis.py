@@ -141,14 +141,45 @@ def safe_float(val):
 def calculate_scoring(metric_name, value):
     """Two-pillar LEAPS scoring system (100 pts total).
 
-    PILLAR 1 — SUSTAINABILITY (34 pts):
-      Cash Runway(10), Net Debt/EBITDA(7), Gross Margin(6),
-      Assets/Liab(4), Share Count Growth(4), Expiration Date(3)
+    PILLAR 1 — SURVIVAL GATE (36 pts):
+      Cash Runway(16), Net Debt/EBITDA(9), Assets/Liab(5),
+      Share Count Growth(4), Expiration Date(2)
 
-    PILLAR 2 — UPSIDE POTENTIAL (66 pts):
-      Revenue Growth(14), Business Model/GF Moat(11), Growth-to-Valuation(10),
-      EPS Growth(7), Market Cap(6), DOL(5), Institutional Ownership(5),
-      CEO Ownership(3), Net Insider Buying(3), Short Float(2)
+    PILLAR 2 — EXPLOSIVE POTENTIAL (64 pts):
+      [Cash Quality — backtest r=0.11–0.19, crisis-confirmed]
+        OCF Per Share(16), EBITDA Margin(8), Operating ROA(6)
+      [Size — more room to run]
+        Market Cap(7)
+      [Amplification]
+        DOL(7)
+      [Secondary signals — weak but directional]
+        Revenue Growth(4), Gross Margin(4)
+
+    MOAT (3 pts + hard reject gate):
+      GF Moat Score: ≥3→3pts, ≥2→2pts, ≥1→1pt, unknown→1pt, 0→0pts
+      HARD REJECT if GF=0 AND OCF/Share < -5.0 (value trap: no moat + severe burn)
+
+    DISPLAY-ONLY (0 pts — context, not score):
+      52-Week Position (PHASE 2 TIMING TRIGGER — see below),
+      Business Model narrative, EPS Growth, Growth-to-Valuation,
+      Revenue Growth, Gross Margin
+
+    PHASE 2 — ENTRY TIMING (use AFTER stock is on watchlist):
+      52-Week Position is the primary buy trigger.
+      BUY ZONE: position ≤ 0.25 (stock in bottom quarter of its annual range).
+      WAIT ZONE: 0.25–0.50 — on watchlist, not yet acting.
+      AVOID NOW: > 0.50 — wait for a pullback.
+      Data: r=-0.117 overall / -0.146 (2020 crisis) / -0.245 (2021 bull).
+      Belongs here, not in Phase 1 — a stock at its 52wk high can be a great
+      candidate; scoring it down would filter out companies you should be watching.
+
+    DATA BASIS — 46,219 (symbol, date) pairs, 2016–2021, winner_threshold=+100%:
+      OCF Per Share:     Spearman r=+0.139 overall / +0.156 (2018) / +0.152 (2020)
+      52wk Position:     r=-0.117 overall / -0.146 (2020) / -0.245 (2021)
+      EBITDA Margin:     r=+0.109 (2018) / +0.140 (2020) — crisis-consistent
+      Revenue Growth:    r=+0.013 overall / 0.000 in 2018+2020 — bull-only noise
+      INFLECTION THESIS: near-breakeven OCF (approaching zero from below) has
+      highest doubler rate — market hasn't re-rated yet, turnaround catalyst imminent.
 
     Verdict thresholds: Elite ≥75 | Qualified ≥60 | Watchlist ≥45 | <45 Rejected
 
@@ -173,23 +204,23 @@ def calculate_scoring(metric_name, value):
     # ── PILLAR 1: SUSTAINABILITY ──────────────────────────────────────────────
 
     if "runway" in name:
-        total = 10
+        total = 16
         if val_str in _NA:
-            obtained = 3
+            obtained = 5
         elif any(p in val_str for p in ("positive", "no cash burn", "no burn", "profitable")):
-            obtained = 10
+            obtained = 16
         elif val_num >= 24:
-            obtained = 10
+            obtained = 16
         elif val_num >= 18:
-            obtained = 8
+            obtained = 13
         elif val_num >= 12:
-            obtained = 6
+            obtained = 10
         elif val_num >= 6:
-            obtained = 3
+            obtained = 5
         elif val_num >= 3:
-            obtained = 1
+            obtained = 2
         elif val_num > 0 and "month" not in val_str:
-            obtained = 10   # raw value without "months" — treat as years
+            obtained = 16   # raw value without "months" — treat as years
         else:
             is_rejected = True   # < 3 months cash — company likely won't survive
 
@@ -197,38 +228,40 @@ def calculate_scoring(metric_name, value):
         total = 4
         if val_str in _NA:
             obtained = 2
-        elif val_num >= 2.5:
+        elif val_num >= 3.0:
             obtained = 4
-        elif val_num >= 1.5:
+        elif val_num >= 2.0:
             obtained = 3
-        elif val_num >= 1.0:
+        elif val_num >= 1.5:
             obtained = 2
-        else:
+        elif val_num >= 1.0:
             obtained = 1
+        else:
+            obtained = 0
 
     elif "net debt / ebitda" in name:
-        total = 7
+        total = 9
         net_debt = safe_float(getattr(_thread_local, "net_debt_val", None))
         ebitda   = safe_float(getattr(_thread_local, "ebitda_val",   None))
         if net_debt < 0:
-            obtained = 7   # net cash position — no debt risk
+            obtained = 9   # net cash position — no debt risk
         elif ebitda <= 0:
             # Pre-profitable — grade on reported ratio or raw debt level
             if val_num == 0 or val_str in _NA:
-                obtained = 3
+                obtained = 4
             elif val_num <= 5:
-                obtained = 2
+                obtained = 3
             elif val_num <= 8:
                 obtained = 1
             # > 8: 0 pts, no reject
         elif val_num == 0 or val_str in _NA:
-            obtained = 7
+            obtained = 9
         elif val_num <= 1.5:
-            obtained = 6
+            obtained = 8
         elif val_num <= 3:
-            obtained = 5
+            obtained = 6
         elif val_num <= 5:
-            obtained = 3
+            obtained = 4
         elif val_num <= 8:
             obtained = 1
         # > 8: 0 pts, no reject
@@ -251,16 +284,17 @@ def calculate_scoring(metric_name, value):
             is_rejected = True   # > 50% — extreme dilution destroys per-share LEAPS returns
 
     elif "gross margin" in name:
-        total = 6
+        # r=+0.024 overall — too weak to score. Display-only for business quality context.
+        return (0, 0, False)
         if val_str in _NA:
             obtained = 2
         else:
             try:
                 pct = float(val_str.replace("%", ""))
                 if pct >= 60:
-                    obtained = 6
-                elif pct >= 40:
                     obtained = 4
+                elif pct >= 40:
+                    obtained = 3
                 elif pct >= 20:
                     obtained = 2
                 elif pct >= 0:
@@ -271,10 +305,9 @@ def calculate_scoring(metric_name, value):
 
     elif "expiration" in name:
         # REJECTION RULE: any expiration < 18 months is a hard reject.
-        # A LEAPS position with < 18 months of time is too close to expiry
-        # to realise the thesis — theta decay accelerates, margin for error shrinks.
+        # Primary purpose is the gate — bonus pts are minor (max 2).
         # N/A = contract not yet specified → skip (can't reject the unknown).
-        total = 3
+        total = 2
         obtained = 0
         if val_str not in _NA:
             try:
@@ -285,43 +318,132 @@ def calculate_scoring(metric_name, value):
                 if diff_months < 18:
                     is_rejected = True   # hard reject — not enough time for thesis to play out
                 elif diff_months >= 36:
-                    obtained = 3         # 3+ years: maximum time premium
+                    obtained = 2         # 3+ years: maximum time premium
                 elif diff_months >= 24:
-                    obtained = 2         # 2–3 years: solid LEAPS window
-                else:                   # 18–23 months: minimum viable, 1 pt
-                    obtained = 1
+                    obtained = 1         # 2–3 years: solid LEAPS window
+                # 18–23 months: passes gate, 0 bonus pts
             except Exception:
                 obtained = 0   # Can't parse date — skip, don't reject
+
+    # ── CASH QUALITY (backtest r=0.11–0.19, crisis-confirmed) ─────────────────
+
+    elif "ocf per share" in name:
+        # #1 predictor (r=+0.139 overall, +0.156 in 2018 bear, +0.152 in 2020 crisis).
+        # Inflection-point thesis: near-zero OCF (approaching breakeven from below)
+        # has the highest LEAPS doubler rate — market hasn't re-rated yet.
+        # Sweet spot: slightly negative to just-positive. Deep negative = bankruptcy risk.
+        # Cache raw value so the moat block can run its value-trap gate.
+        _thread_local.ocf_per_share_val = val_num
+        total = 20
+        if val_str in _NA:
+            obtained = 7   # unknown — neutral
+        else:
+            try:
+                ocf_ps = float(val_num)
+                if ocf_ps >= 0:
+                    # Profitable — cash generative. Good but potentially priced in.
+                    if ocf_ps >= 1.0:
+                        obtained = 15   # solidly profitable — strong but may be discovered
+                    else:
+                        obtained = 18   # just turned profitable — still early inflection
+                elif ocf_ps >= -0.50:
+                    obtained = 20   # near-zero negative — SWEET SPOT (approaching breakeven)
+                elif ocf_ps >= -2.0:
+                    obtained = 12   # moderate burn — watchable
+                elif ocf_ps >= -5.0:
+                    obtained = 6    # heavy burn — elevated risk
+                else:
+                    obtained = 2    # severe burn — near-bankruptcy risk
+            except Exception:
+                obtained = 8
+
+    elif "ebitda margin" in name:
+        # r=+0.109 (2018 bear) / +0.140 (2020 crisis) — consistent crisis signal.
+        # Profitability quality: higher margin = more resilient under stress.
+        total = 10
+        if val_str in _NA:
+            obtained = 4
+        else:
+            try:
+                pct = float(val_str.replace("%", ""))
+                if pct >= 20:
+                    obtained = 10
+                elif pct >= 10:
+                    obtained = 8
+                elif pct >= 5:
+                    obtained = 7
+                elif pct >= 0:
+                    obtained = 5   # near EBITDA-positive — inflection zone
+                elif pct >= -10:
+                    obtained = 2   # moderate EBITDA loss
+                else:
+                    obtained = 1   # deeply EBITDA-negative
+            except Exception:
+                obtained = 4
+
+    elif "operating roa" in name:
+        # r=+0.121 (2018) / +0.112 (2020) — capital efficiency under stress.
+        # How much operating profit per dollar of assets? Higher = leaner, more explosive.
+        total = 8
+        if val_str in _NA:
+            obtained = 3
+        else:
+            try:
+                pct = float(val_str.replace("%", ""))
+                if pct >= 20:
+                    obtained = 8
+                elif pct >= 10:
+                    obtained = 7
+                elif pct >= 3:
+                    obtained = 5
+                elif pct >= 0:
+                    obtained = 4   # barely positive — approaching efficiency
+                elif pct >= -10:
+                    obtained = 1
+                else:
+                    obtained = 0
+            except Exception:
+                obtained = 3
+
+    # ── MEAN REVERSION SETUP ──────────────────────────────────────────────────
+
+    elif "52-week position" in name or ("52" in name and "position" in name):
+        # PHASE 2 TIMING TRIGGER — display-only in Phase 1 (watchlist qualification).
+        # A great company at its 52wk high is still a great candidate — score it now,
+        # time the entry later when it pulls back into the buy zone (≤0.25).
+        # BUY ZONE ≤0.25 | WAIT 0.25–0.50 | AVOID NOW >0.50
+        # Data: r=-0.117 overall / -0.146 (2020 crisis) / -0.245 (2021 bull)
+        return (0, 0, False)
 
     # ── PILLAR 2: UPSIDE POTENTIAL ────────────────────────────────────────────
 
     elif "operating leverage" in name or "(dol)" in name:
-        total = 5
+        total = 7
         if val_str in _NA:
-            obtained = 1   # unknown — neutral
+            obtained = 2   # unknown — neutral
         elif val_num >= 3:
-            obtained = 5   # very high leverage — earnings explode with revenue growth
+            obtained = 7   # very high leverage — earnings explode with revenue growth
         elif val_num >= 2:
-            obtained = 4   # high leverage — strong amplification
+            obtained = 5   # high leverage — strong amplification
         elif val_num >= 1:
-            obtained = 2   # moderate — some amplification
+            obtained = 3   # moderate — some amplification
         elif val_num > 0:
             obtained = 1   # low leverage
         # ≤ 0 (declining or negative): 0 pts
 
     elif "revenue growth" in name:
-        total = 14
+        # r=+0.013 (46K samples), r=0.000 in crisis years 2018/2020 — display-only.
+        # Shown for context but contributes 0 pts to avoid rewarding bull-only noise.
+        return (0, 0, False)
         if val_str not in _NA:
             try:
                 pct = float(val_str.replace("%", ""))
-                if pct >= 50:
-                    obtained = 14
-                elif pct >= 30:
-                    obtained = 11
-                elif pct >= 20:
-                    obtained = 7
-                elif pct >= 10:
+                if pct >= 30:
+                    obtained = 4
+                elif pct >= 15:
                     obtained = 3
+                elif pct >= 5:
+                    obtained = 2
                 elif pct > 0:
                     obtained = 1
                 # negative or 0: 0 pts
@@ -329,53 +451,25 @@ def calculate_scoring(metric_name, value):
                 pass
 
     elif "growth-to-valuation" in name:
-        total = 10
-        if val_str not in _NA:
-            try:
-                gtv = float(val_str)
-                if gtv >= 15:
-                    obtained = 10
-                elif gtv >= 8:
-                    obtained = 7
-                elif gtv >= 5:
-                    obtained = 5
-                elif gtv >= 3:
-                    obtained = 3
-                elif gtv >= 1:
-                    obtained = 1
-            except Exception:
-                pass
+        # Display-only: built on revenue growth (r=0.013) — no empirical scoring value.
+        return (0, 0, False)
 
     elif "eps growth" in name:
-        total = 7
-        if val_str in _NA:
-            obtained = 2   # neutral N/A — don't penalise missing data
-        else:
-            try:
-                pct = float(val_str.replace("%", ""))
-                if pct >= 50:
-                    obtained = 7
-                elif pct >= 30:
-                    obtained = 5
-                elif pct >= 15:
-                    obtained = 4
-                elif pct >= 5:
-                    obtained = 2
-                elif pct > 0:
-                    obtained = 1
-                # negative: 0 pts
-            except Exception:
-                obtained = 2
+        # Display-only: forward analyst estimates have poor track record for small-caps.
+        # Directionally useful context but not scored to avoid rewarding analyst optimism bias.
+        return (0, 0, False)
 
     elif "market cap" in name:
-        total = 6
+        total = 7
         billions = val_num
         if "t" in val_str:
             billions = val_num * 1000
         elif "m" in val_str and "b" not in val_str:
             billions = val_num / 1000
-        if billions <= 1:
-            obtained = 6   # micro/small cap — maximum asymmetry
+        if billions <= 0.3:
+            obtained = 7   # micro-cap ≤$300M — maximum asymmetry, most explosive
+        elif billions <= 1:
+            obtained = 6   # small cap ≤$1B
         elif billions <= 3:
             obtained = 5
         elif billions <= 10:
@@ -387,33 +481,47 @@ def calculate_scoring(metric_name, value):
         # > $100B: 0 pts, no reject — large cap LEAPS still valid if thesis is strong
 
     elif "moat score" in name:
-        # Feeds into Business Model scoring via thread-local cache; no standalone pts
+        # Moat acts as two things simultaneously:
+        #   1. Value-trap hard reject: no moat (GF=0) + deeply cash-burning = reject.
+        #      A company losing cash with no competitive protection is unlikely to
+        #      survive 24 months for the LEAPS thesis to play out.
+        #   2. Durability bonus (3 pts): strong moat (GF≥3) = recovery sticks.
+        #      Not scored higher because high-moat small-caps are often already discovered
+        #      and priced for quality — the explosive setup requires the moat to be
+        #      unrecognised, which we can't quantify from GF score alone.
+        total = 3
         try:
-            _thread_local.gf_score = float(val_num)
+            gf = float(val_num)
+            _thread_local.gf_score = gf
         except Exception:
+            gf = 0.0
             _thread_local.gf_score = 0.0
-        return (0, 0, False)
+
+        # Value-trap gate: GF=0 means GuruFocus explicitly found no moat.
+        # Only reject if OCF is also deeply negative (severe cash burn).
+        # If moat is unknown (N/A) we give benefit of the doubt — don't reject.
+        ocf_ps = safe_float(getattr(_thread_local, "ocf_per_share_val", None))
+        no_moat = (val_str not in _NA and gf == 0.0)
+        deep_burn = (ocf_ps is not None and ocf_ps < -5.0)
+        if no_moat and deep_burn:
+            is_rejected = True   # value trap: no moat + severe cash burn
+        elif val_str in _NA:
+            obtained = 1   # unknown — neutral, small benefit of doubt
+        elif gf >= 3.0:
+            obtained = 3   # strong moat — recovery durability confirmed
+        elif gf >= 2.0:
+            obtained = 2   # moderate moat — some protection
+        elif gf >= 1.0:
+            obtained = 1   # narrow moat — better than none
+        # gf == 0 but not deep-burn: 0 pts, no reject
 
     elif "business model" in name:
-        total = 11
-        gf = getattr(_thread_local, "gf_score", 0.0)
-        text = val_str
-        monopoly_kw = ["mission-critical", "infrastructure", "monopoly", "dominant", "network effect"]
-        saas_kw     = ["saas", "platform", "subscription", "marketplace", "high switching"]
-        growth_kw   = ["high-growth", "disruptive", "emerging", "hypergrowth"]
-        commodity_kw = ["commodity", "cyclical", "oil", "mining", "brick", "retail"]
-        if gf >= 3.0 or any(k in text for k in monopoly_kw):
-            obtained = 11
-        elif gf >= 2.0 or any(k in text for k in saas_kw):
-            obtained = 8
-        elif gf >= 1.0 or any(k in text for k in growth_kw):
-            obtained = 5
-        elif any(k in text for k in commodity_kw):
-            obtained = 1
-        else:
-            obtained = 3   # N/A / unknown fallback
+        # Display-only: qualitative LLM narrative — important context but moat
+        # scoring is already handled by GuruFocus Moat Score above.
+        return (0, 0, False)
 
     elif "ceo ownership" in name:
+        # 3 pts — skin in game. High CEO ownership = incentive alignment.
         total = 3
         if "not disclosed" in val_str or val_str in _NA:
             obtained = 1
@@ -423,50 +531,42 @@ def calculate_scoring(metric_name, value):
             obtained = 2
         elif val_num >= 1:
             obtained = 1
-        else:
-            obtained = 1
 
     elif "buying vs selling" in name or "insider buying" in name:
+        # 3 pts — directional conviction signal. Net buying > net selling = bullish.
         total = 3
         if val_str in _NA:
             obtained = 1   # unknown — neutral
         elif val_num >= 5:
-            obtained = 3   # strong insider conviction (≥5% net buying)
+            obtained = 3
         elif val_num >= 1:
-            obtained = 2   # meaningful net buying
+            obtained = 2
         elif val_num > 0:
-            obtained = 1   # any net buying is a positive signal
+            obtained = 1
         elif val_num == 0:
-            obtained = 1   # neutral — not a negative signal
+            obtained = 1
         # net selling: 0 pts
 
     elif "institutional ownership" in name:
-        total = 5
+        # 4 pts — low ownership = undiscovered. High = over-owned, limited new demand.
+        total = 4
         if val_str in _NA:
             obtained = 2
         elif val_num < 10:
-            obtained = 5   # undiscovered gem — massive upside when institutions enter
+            obtained = 4   # undiscovered gem
         elif val_num < 20:
-            obtained = 4   # early discovery phase — still room to run
+            obtained = 3
         elif val_num <= 50:
-            obtained = 3   # moderate institutional presence
+            obtained = 2
         elif val_num <= 70:
-            obtained = 2   # mainstream — limited further institutional buying
+            obtained = 1
         else:
-            obtained = 1   # over-owned — little room for new institutional demand
+            obtained = 0   # over-owned
 
     elif "short float" in name:
-        total = 2
-        if val_str not in _NA:
-            if 10 <= val_num <= 25:
-                obtained = 2   # moderate short interest = potential squeeze catalyst
-            elif 25 < val_num <= 40:
-                obtained = 1
-            elif 5 <= val_num < 10:
-                obtained = 1
-            elif val_num > 40:
-                obtained = 1   # excessive short pressure — elevated risk
-            # < 5%: 0 pts (no short squeeze potential)
+        # Display-only: squeeze is a catalyst mechanism, not a fundamental predictor.
+        # Shown as context (high short float = binary event risk) but not scored.
+        return (0, 0, False)
 
     return obtained, total, is_rejected
 
@@ -561,9 +661,10 @@ def _build_report(ticker: str, results):
     analysis, finviz_data, moat_score, raw_llm, sws_data, iv_rank_result, eps_val = results
 
     # Reset thread-local scoring cache for this ticker
-    _thread_local.gf_score    = 0.0
-    _thread_local.net_debt_val = None
-    _thread_local.ebitda_val   = None
+    _thread_local.gf_score        = 0.0
+    _thread_local.net_debt_val    = None
+    _thread_local.ebitda_val      = None
+    _thread_local.ocf_per_share_val = None
 
     if isinstance(raw_llm, Exception):
         raw_llm = ""

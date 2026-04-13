@@ -552,6 +552,11 @@ def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: 
 def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
     """Re-apply current scoring rules to stored VALUES. No API calls. Returns (old, new, old_v, new_v)."""
     try:
+        # Always reload score_thesis so scoring rule changes take effect without
+        # restarting Streamlit (module is cached by Python's import system otherwise).
+        import importlib
+        importlib.reload(score_thesis)
+
         client      = db.get_client()
         ticker_path = _eval_table_path(client, _ticker_table_name(ticker))
         master_path = _eval_table_path(client, "master_table")
@@ -587,9 +592,10 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
         # Net Debt / EBITDA sign check and Business Model (uses GF moat score)
         # both depend on values from other metric rows.
         tl = score_thesis._thread_local
-        tl.gf_score     = 0.0
-        tl.net_debt_val = None
-        tl.ebitda_val   = None
+        tl.gf_score           = 0.0
+        tl.net_debt_val       = None
+        tl.ebitda_val         = None
+        tl.ocf_per_share_val  = None
         for _, row in detail_df.iterrows():
             mn  = str(row.get(m_col, "")).lower()
             val = str(row.get("Value", ""))
@@ -598,10 +604,14 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
             elif mn == "ebitda":
                 tl.ebitda_val = val
             elif "moat score" in mn:
-                # Pre-seed GF moat score so Business Model scores correctly even if
-                # BQ returns it after the Business Model row.
                 try:
                     tl.gf_score = float(score_thesis.safe_float(val))
+                except Exception:
+                    pass
+            elif "ocf per share" in mn:
+                # Pre-seed for moat value-trap gate (GF=0 + OCF < -5 = hard reject)
+                try:
+                    tl.ocf_per_share_val = score_thesis.safe_float(val)
                 except Exception:
                     pass
 
@@ -613,6 +623,19 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
         # appear expired and falsely trigger rejection.  Preserve the stored
         # score/total for this metric instead of re-evaluating with today's date.
         SKIP_RESCORE = {"latest expiration date", "expiration date"}
+
+        # New metrics added in the scoring overhaul that may not exist in older
+        # BigQuery rows. Inject placeholder rows so they appear in the UI with
+        # a clear "needs re-analyze" value rather than silently missing.
+        NEW_METRICS = {
+            "OCF Per Share":    ("Yahoo Finance", "N/A — re-analyze to populate"),
+            "EBITDA Margin (%)": ("Yahoo Finance", "N/A — re-analyze to populate"),
+            "Operating ROA (%)": ("Yahoo Finance", "N/A — re-analyze to populate"),
+            "52-Week Position (0=low,1=high)": ("Yahoo Finance", "N/A — re-analyze to populate"),
+        }
+        existing_metric_names = {
+            str(row.get(m_col, "")).strip() for _, row in detail_df.iterrows()
+        }
 
         for _, row in detail_df.iterrows():
             r           = row.to_dict()
@@ -644,6 +667,19 @@ def rescore_ticker_in_bq(ticker: str) -> tuple[int, int, str, str]:
                 if total_pts > 0:
                     total_score += pts
             new_rows.append(r)
+
+        # Inject placeholder rows for new metrics not yet in this ticker's BQ table
+        # Use an existing row as a template to match column schema
+        _template = {col: None for col in detail_df.columns}
+        for new_metric, (source, placeholder_val) in NEW_METRICS.items():
+            if new_metric not in existing_metric_names:
+                stub = dict(_template)
+                stub[m_col]  = new_metric
+                stub["Source"] = source
+                stub["Value"]  = placeholder_val
+                stub[s_col]  = ""
+                stub[t_col]  = ""
+                new_rows.append(stub)
 
         # Replace NaN with None so BigQuery doesn't reject string columns
         rows_df = pd.DataFrame(new_rows).where(pd.notnull(pd.DataFrame(new_rows)), None)
@@ -762,6 +798,8 @@ def _single_worker(ticker: str):
 
 
 def _batch_worker(tickers: list, delay_seconds: int):
+    import importlib
+    importlib.reload(score_thesis)
     bj = _ES["batch_job"]
     bl = _ES["batch_lock"]
     try:
@@ -1869,6 +1907,7 @@ elif page == "📊 Dashboard":
             and p.get("ticker")
         ]
         if _missing_score_tickers:
+            import importlib; importlib.reload(score_thesis)
             from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
             with st.spinner(
                 f"Computing first-time thesis scores for "
@@ -2121,6 +2160,7 @@ elif page == "📊 Dashboard":
                     if st.button("↻ Re-score", key=f"rescore_{pos_id}",
                                  help="Re-compute thesis score using yfinance + Gemini"):
                         with st.spinner(f"Scoring {ticker} (~30s)..."):
+                            import importlib; importlib.reload(score_thesis)
                             new_score, new_verdict = score_thesis.compute_and_save_score(ticker)
                         if new_score is not None:
                             st.success(f"Score updated: {new_score}/100 ({new_verdict})")
@@ -2597,16 +2637,21 @@ elif page == "📊 Dashboard":
                     else:
                         st.markdown("📉 IV Rank: N/A")
 
-                    # 52w position
+                    # 52-week position — Phase 2 entry timing trigger
+                    # Thresholds calibrated from 46K sample backtest (r=-0.117 to -0.245)
                     if pfl is not None:
-                        if pfl < 0.15:
-                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low** 🔥 Near 52w low")
-                        elif pfl < 0.30:
-                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low** (lower third)")
+                        if pfl <= 0.10:
+                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** 🔥 NEAR ANNUAL LOW — buy zone ★")
+                        elif pfl <= 0.25:
+                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ✅ BUY ZONE (bottom quarter)")
+                        elif pfl <= 0.50:
+                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** 🟡 WAIT — mid-range, watch for pullback")
+                        elif pfl <= 0.75:
+                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ⚠️ Upper range — wait for pullback")
                         else:
-                            st.markdown(f"📍 52w Position: **{pfl*100:.0f}% from low**")
+                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ⛔ NEAR 52WK HIGH — hold off")
                     else:
-                        st.markdown("📍 52w Position: N/A")
+                        st.markdown("📍 52wk Position: N/A")
 
                     # Entry score bar
                     bar_val = min(entry_score, 100)
@@ -3655,6 +3700,7 @@ elif page == "⚙️ Settings":
         if not active_tickers:
             st.info("No active positions to rescore.")
         else:
+            import importlib; importlib.reload(score_thesis)
             results = []
             prog    = st.progress(0.0, text=f"Rescoring 0/{len(active_tickers)}...")
             for i, tk in enumerate(active_tickers):

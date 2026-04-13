@@ -11,3 +11,4 @@ apscheduler>=3.10.4
 pytz>=2024.1
 beautifulsoup4>=4.12.0
 pdfplumber>=0.10.0
+scipy>=1.11.0

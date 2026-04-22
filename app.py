@@ -2778,6 +2778,13 @@ elif page == "📊 Dashboard":
                             f"⚠️ {_rec_err}</td></tr>"
                         )
                     else:
+                        # Show fallback note when outside ideal OTM range
+                        if rec.get("_fallback_note") or top_c.get("_nearest_available"):
+                            contract_rows += (
+                                f"<tr><td colspan='4' style='padding:2px 4px 4px;font-size:0.78em;color:#b45309'>"
+                                f"⚠️ Nearest available — ideal range (35-65% OTM) has no contracts</td></tr>"
+                            )
+
                         _dte = top_c.get("dte")
                         if _dte is not None:
                             if _dte >= 720:

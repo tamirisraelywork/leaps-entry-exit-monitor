@@ -200,38 +200,67 @@ def recommend_asymmetric(ticker: str) -> dict:
             "contracts": [],
         }
 
+    def _score_contract(c: dict, otm_pct: float) -> float:
+        closeness  = max(0, 10 - abs(otm_pct - 45))
+        dte_bonus  = 15 if c.get("dte", 0) >= 600 else 5
+        oi_bonus   = 8  if (c.get("open_interest") or 0) >= 500 else 0
+        iv_penalty = -5 if (c.get("implied_volatility") or 0) > 0.80 else 0
+        return closeness + dte_bonus + oi_bonus + iv_penalty
+
     candidates = []
-    # Widen tolerance: accept strikes 35-60% OTM so we always return something
+    fallback_pool = []  # all priced OTM calls — used when primary range is empty
+
     for c in chain:
         strike = c.get("strike")
         mid    = c.get("mid")
         if not (strike and mid and mid > 0):
             continue
         otm_pct = (strike / stock_price - 1) * 100
-        if not (35 <= otm_pct <= 65):
-            continue
 
         targets = calculate_return_targets(stock_price, strike, mid)
         c.update(targets)
+        c["otm_pct"] = round(otm_pct, 1)
+        c["role"]    = "ASYMMETRIC"
 
-        # Quality score: prefer strikes closer to 40-50% band + longer expiry + liquidity
-        closeness = max(0, 10 - abs(otm_pct - 45))        # 0-10: perfect = 45% OTM
-        dte_bonus  = 15 if c.get("dte", 0) >= 600 else 5  # prefer 20+ months
-        oi_bonus   = 8  if (c.get("open_interest") or 0) >= 500 else 0
-        iv_penalty = -5 if (c.get("implied_volatility") or 0) > 0.80 else 0
-        c["otm_pct"]      = round(otm_pct, 1)
-        c["rec_score"]    = closeness + dte_bonus + oi_bonus + iv_penalty
-        c["role"]         = "ASYMMETRIC"
-        candidates.append(c)
+        if 35 <= otm_pct <= 65:
+            c["rec_score"] = _score_contract(c, otm_pct)
+            candidates.append(c)
+        elif otm_pct > 0:
+            # Keep as fallback: any OTM call with a price
+            c["rec_score"] = _score_contract(c, otm_pct)
+            fallback_pool.append(c)
 
-    candidates.sort(key=lambda x: x["rec_score"], reverse=True)
+    if candidates:
+        candidates.sort(key=lambda x: x["rec_score"], reverse=True)
+        return {
+            "stock_price":      stock_price,
+            "target_strike_lo": target_lo,
+            "target_strike_hi": target_hi,
+            "error":            None,
+            "contracts":        candidates[:3],
+        }
+
+    # ── Fallback: pick the 3 contracts closest to 45% OTM ──────────────────
+    if fallback_pool:
+        fallback_pool.sort(key=lambda x: abs(x["otm_pct"] - 45))
+        best3 = fallback_pool[:3]
+        for c in best3:
+            c["_nearest_available"] = True  # UI can show a note
+        return {
+            "stock_price":      stock_price,
+            "target_strike_lo": target_lo,
+            "target_strike_hi": target_hi,
+            "error":            None,
+            "_fallback_note":   "No contracts in 35-65% OTM ideal range — showing nearest available",
+            "contracts":        best3,
+        }
 
     return {
         "stock_price":      stock_price,
         "target_strike_lo": target_lo,
         "target_strike_hi": target_hi,
-        "error":            None if candidates else f"No contracts found in 35-65% OTM range for {ticker}.",
-        "contracts":        candidates[:3],
+        "error":            f"No LEAPS call contracts with a price found for {ticker}.",
+        "contracts":        [],
     }
 
 

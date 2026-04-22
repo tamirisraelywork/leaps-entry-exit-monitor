@@ -358,6 +358,8 @@ def _fetch_watchlist_signal(pos: dict) -> tuple[str, dict]:
             if result and "Success" in result:
                 m = re.search(r"([\d.]+)", result.split("is:")[-1])
                 iv_rank = float(m.group(1)) if m else None
+                if iv_rank is not None and iv_rank < 1:
+                    iv_rank = None  # < 1% is a fallback proxy, not real IV data
         except Exception:
             pass
 

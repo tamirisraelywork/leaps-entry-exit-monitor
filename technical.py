@@ -102,4 +102,35 @@ def get_price_and_range(ticker: str) -> dict:
             result["ma50_above_ma200"] = float(ma50) > float(ma200)
     except Exception:
         pass
+
+    # Fallback: compute 52wk range from 1-year history when .info omits those fields
+    if result["pct_from_low"] is None and result["price"]:
+        try:
+            with _yf_sem:
+                _technical_yf_throttle()
+                hist = yf.download(ticker, period="1y", interval="1d",
+                                   auto_adjust=True, progress=False)
+            if not hist.empty and len(hist) >= 20:
+                closes = hist["Close"].squeeze().dropna()
+                low52  = float(closes.min())
+                high52 = float(closes.max())
+                price  = result["price"]
+                if high52 > low52:
+                    result["pct_from_low"] = round((price - low52) / (high52 - low52), 3)
+                result["low_52w"]  = result["low_52w"]  or low52
+                result["high_52w"] = result["high_52w"] or high52
+                # Compute MAs from history if also missing
+                if result["ma_50"] is None and len(closes) >= 50:
+                    ma50 = float(closes.iloc[-50:].mean())
+                    result["ma_50"]        = round(ma50, 2)
+                    result["above_ma50"]   = price > ma50
+                if result["ma_200"] is None and len(closes) >= 200:
+                    ma200 = float(closes.iloc[-200:].mean())
+                    result["ma_200"]       = round(ma200, 2)
+                    result["above_ma200"]  = price > ma200
+                if result["ma_50"] and result["ma_200"]:
+                    result["ma50_above_ma200"] = result["ma_50"] > result["ma_200"]
+        except Exception:
+            pass
+
     return result

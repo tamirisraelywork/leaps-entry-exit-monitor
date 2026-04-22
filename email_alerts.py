@@ -257,12 +257,16 @@ def send_daily_summary(
             wk52_str = "52wk N/A"
 
         if entry_alert:
-            e_emoji = _ENTRY_EMOJI.get(entry_alert.severity, "⚪")
-            if entry_alert.severity == "GREEN":
+            _entry_score = entry_alert.context.get("entry_score", 0) if entry_alert.context else 0
+            _is_iv_floor = entry_alert.severity == "GREEN" and "IV" in (entry_alert.type or "")
+            if entry_alert.severity == "GREEN" and _entry_score >= 60:
                 signal_str = f"🟢 BUY NOW — {entry_alert.type}"
+            elif _is_iv_floor:
+                signal_str = f"⭐ IV FLOOR — WATCH ({_entry_score}/100)"
             elif entry_alert.severity == "AMBER":
                 signal_str = f"🟡 IMPROVING — {entry_alert.type}"
             else:
+                e_emoji = _ENTRY_EMOJI.get(entry_alert.severity, "⚪")
                 signal_str = f"{e_emoji} {entry_alert.type}"
         else:
             signal_str = "⚪ Waiting — entry conditions not met yet"
@@ -273,10 +277,18 @@ def send_daily_summary(
         rec_premium = sig.get("rec_premium")
         rec_delta   = sig.get("rec_delta")
         rec_otm     = sig.get("rec_otm_pct")
+        # Filter out clearly bad greeks (yfinance placeholder 0.0004-level deltas)
+        if rec_delta is not None:
+            try:
+                if abs(float(rec_delta)) < 0.01:
+                    rec_delta = None
+            except (TypeError, ValueError):
+                rec_delta = None
+        delta_str = f"Δ {rec_delta:.4f}" if rec_delta is not None else "Δ N/A"
         if rec_strike and rec_expiry:
             rec_str = (
                 f"  → Rec contract: ${rec_strike}C {rec_expiry} | "
-                f"${rec_premium:.2f}/share | Δ {rec_delta} | {rec_otm}% OTM"
+                f"${rec_premium:.2f}/share | {delta_str} | {rec_otm}% OTM"
             ) if rec_premium else f"  → Rec contract: ${rec_strike}C {rec_expiry}"
         else:
             rec_str = ""

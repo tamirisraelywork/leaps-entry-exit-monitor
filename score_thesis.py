@@ -696,17 +696,16 @@ def _build_report(ticker: str, results):
                 "Total points": str(total_pts) if total_pts > 0 else "",
             })
 
-    if finviz_data and not isinstance(finviz_data, Exception):
-        for mk in ("Net Insider Buying vs Selling (%)",
-                   "Institutional Ownership (%)", "Short Float (%)"):
-            if mk in finviz_data:
-                val = str(finviz_data[mk])
-                p, tp, r = calculate_scoring(mk, val)
-                table_rows.append({
-                    "Metric Name": mk, "Source": "Finviz", "Value": val,
-                    "Obtained points": "rejected" if r else str(p),
-                    "Total points": str(tp),
-                })
+    finviz_ok = finviz_data and not isinstance(finviz_data, Exception)
+    for mk in ("Net Insider Buying vs Selling (%)",
+               "Institutional Ownership (%)", "Short Float (%)"):
+        val = str(finviz_data[mk]) if finviz_ok and mk in finviz_data else "N/A"
+        p, tp, r = calculate_scoring(mk, val)
+        table_rows.append({
+            "Metric Name": mk, "Source": "Finviz", "Value": val,
+            "Obtained points": "rejected" if r else (str(p) if tp > 0 else ""),
+            "Total points": str(tp) if tp > 0 else "",
+        })
 
     eps_str = (
         f"{eps_val:.2f}%"

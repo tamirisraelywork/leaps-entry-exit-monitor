@@ -18,7 +18,7 @@ from __future__ import annotations
 import requests
 import time
 import threading
-from datetime import date
+from datetime import date, timedelta
 
 from shared.config import cfg
 
@@ -180,3 +180,91 @@ def get_option_quote(ticker: str, contract: str) -> dict:
 
     except Exception as e:
         return {"_error": f"marketdata.app: failed to parse response: {e}"}
+
+
+def get_options_chain(
+    ticker: str,
+    min_dte: int = 270,
+    side: str = "call",
+) -> list[dict]:
+    """
+    Fetch options chain from marketdata.app /v1/options/chain/{symbol}/.
+
+    Returns a list of contract dicts in the same format as options_data.get_leaps_chain().
+    IV is returned as decimal by marketdata.app (0.35 = 35%).
+
+    Used as fallback when yfinance has no options data for a ticker.
+    """
+    token = _token()
+    if not token:
+        return []
+
+    min_expiry = (date.today() + timedelta(days=min_dte)).isoformat()
+    _throttle()
+
+    try:
+        resp = requests.get(
+            f"https://api.marketdata.app/v1/options/chain/{ticker.upper()}/",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            params={"side": side, "minExpiry": min_expiry},
+            timeout=20,
+        )
+    except Exception:
+        return []
+
+    if not (200 <= resp.status_code < 300):
+        return []
+
+    try:
+        body = resp.json()
+        if body.get("s") not in ("ok",):
+            return []
+
+        def _col(key, idx):
+            arr = body.get(key, [])
+            try:
+                v = arr[idx]
+                return None if v is None else v
+            except IndexError:
+                return None
+
+        symbols      = body.get("optionSymbol", [])
+        expirations  = body.get("expiration", [])   # Unix timestamps
+
+        contracts = []
+        for i in range(len(symbols)):
+            bid = _safe(_col("bid", i)) or 0.0
+            ask = _safe(_col("ask", i)) or 0.0
+            raw_mid = _safe(_col("mid", i))
+            mid = raw_mid if raw_mid else (round((bid + ask) / 2, 2) if bid > 0 and ask > 0 else None)
+
+            exp_ts = _col("expiration", i)
+            try:
+                from datetime import datetime as _dtt
+                exp_date = _dtt.utcfromtimestamp(float(exp_ts)).date() if exp_ts else None
+            except Exception:
+                exp_date = None
+
+            raw_dte = _col("dte", i)
+            dte = int(raw_dte) if raw_dte is not None else (
+                max(0, (exp_date - date.today()).days) if exp_date else None
+            )
+
+            contracts.append({
+                "contract":           _col("optionSymbol", i),
+                "strike":             _safe(_col("strike", i)),
+                "expiration_date":    exp_date,
+                "dte":                dte,
+                "delta":              _safe(_col("delta", i)),
+                "implied_volatility": _safe(_col("iv", i)),   # decimal, e.g. 0.35
+                "bid":                _safe(bid),
+                "ask":                _safe(ask),
+                "mid":                mid,
+                "open_interest":      int(_safe(_col("openInterest", i)) or 0) or None,
+                "_source":            "marketdata.app",
+            })
+
+        return [c for c in contracts if c.get("mid") is not None]
+
+    except Exception:
+        return []

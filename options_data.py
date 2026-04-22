@@ -503,10 +503,25 @@ def _fetch_leaps_chain(ticker: str, min_dte: int) -> list[dict]:
             except Exception:
                 continue
 
+        # marketdata.app fallback — used when yfinance returns no chain data
+        if not chain_out:
+            try:
+                import marketdata_app as _mda
+                md_chain = _mda.get_options_chain(ticker, min_dte=min_dte, side="call")
+                if md_chain:
+                    return md_chain
+            except Exception:
+                pass
+
         return chain_out
 
     except Exception:
-        return []
+        # Still try marketdata.app if yfinance threw entirely
+        try:
+            import marketdata_app as _mda
+            return _mda.get_options_chain(ticker, min_dte=min_dte, side="call")
+        except Exception:
+            return []
 
 
 def get_stock_price(ticker: str) -> float | None:

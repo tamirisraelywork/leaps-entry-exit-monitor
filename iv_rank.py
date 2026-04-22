@@ -91,6 +91,32 @@ def get_iv_rank_advanced(ticker: str, current_iv_pct: float | None = None) -> st
             except Exception:
                 pass   # fall through — use realized vol as proxy below
 
+        # ── 1b. marketdata.app fallback for ATM IV ───────────────────────────
+        # Used when yfinance has no option chain (illiquid small-caps, data gaps).
+        if current_iv_pct is None or current_iv_pct <= 0:
+            try:
+                import marketdata_app as _mda
+                md_chain = _mda.get_options_chain(ticker, min_dte=7, side="call")
+                if md_chain:
+                    # Get current price to find ATM contract
+                    try:
+                        _s = t.fast_info.last_price or t.fast_info.previous_close
+                    except Exception:
+                        _s = None
+                    if _s:
+                        atm = min(
+                            (c for c in md_chain if c.get("implied_volatility")),
+                            key=lambda c: abs((c.get("strike") or 9999) - _s),
+                            default=None,
+                        )
+                        if atm and atm.get("implied_volatility"):
+                            _iv = float(atm["implied_volatility"])
+                            if _iv > 0:
+                                # marketdata.app returns IV as decimal (0.35 = 35%)
+                                current_iv_pct = _iv * 100 if _iv < 5 else _iv
+            except Exception:
+                pass
+
         # ── 2. 1-year realized volatility range ──────────────────────────────
         hist, _ = _yf_call(t.history, period="1y", interval="1d", auto_adjust=True)
 

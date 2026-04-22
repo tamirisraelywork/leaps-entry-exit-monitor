@@ -103,12 +103,18 @@ def _fetch_market_data(position: dict) -> dict:
     iv_rank = None
     try:
         from iv_rank import get_iv_rank_advanced
-        _iv_hint = (snapshot.get("implied_volatility") or 0) * 100 or None
+        # Pass the ATM IV from the snapshot as a hint (avoids an extra option-chain round-trip).
+        # Guard: implied_volatility of 0 or near-0 is unusable — pass None so iv_rank
+        # fetches its own chain rather than ranking a zero-IV against history.
+        _raw_iv = snapshot.get("implied_volatility")
+        _iv_hint = float(_raw_iv) * 100 if (_raw_iv and float(_raw_iv) >= 0.01) else None
         result = get_iv_rank_advanced(ticker, current_iv_pct=_iv_hint)
         if result and "Success" in result:
             m = re.search(r"([\d.]+)", result.split("is:")[-1])
             if m:
                 iv_rank = float(m.group(1))
+                if iv_rank < 1:
+                    iv_rank = None   # < 1% is a data artifact, not a real floor
             else:
                 logger.warning(f"IV rank parse failed for {ticker}: unexpected format '{result}'")
         elif result:

@@ -821,12 +821,17 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
             ))
 
         elif pnl >= _T["profit_600"]:
+            # Trim 75% — but when qty is small (e.g. 2), 75% rounds to all contracts.
+            # Always leave at least 1 to hold unless the position is a single contract.
             n_trim = max(1, round(qty * 0.75))
+            if qty > 1:
+                n_trim = min(n_trim, qty - 1)   # guarantee at least 1 trailing contract
             n_hold = qty - n_trim
+            trim_pct = int(round(n_trim / qty * 100))
             roll_note = (
                 "\n  TIME NOTE: You still have enough DTE to roll the trailing\n"
                 f"  {n_hold} contract{'s' if n_hold != 1 else ''} to a further-dated contract if you want to stay in the trade.\n"
-                if dte_days and dte_days > _T["dte_urgent"] else
+                if n_hold > 0 and dte_days and dte_days > _T["dte_urgent"] else
                 "\n  TIME NOTE: DTE is short — exit the full position rather than rolling.\n"
             )
             alerts.append(Alert(
@@ -838,14 +843,14 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                     + f"{'─'*50}\n"
                     + f"  Position is up {pnl:+.1f}% — a 7x return. Outstanding.\n\n"
                     + "  RECOMMENDED ACTION:\n"
-                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} (75%) now to lock in the 7x gains\n"
-                    + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} (25%) trailing toward the 10x target\n" if n_hold > 0 else "")
+                    + f"  → Sell {n_trim} contract{'s' if n_trim > 1 else ''} ({trim_pct}%) now to lock in the 7x gains\n"
+                    + (f"  → Keep {n_hold} contract{'s' if n_hold > 1 else ''} ({100 - trim_pct}%) trailing toward the 10x target\n" if n_hold > 0 else "")
                     + "  → Set a mental stop on the trailing position: if it gives back\n"
                     + "    50% of gains, exit the remainder\n"
                     + roll_note
                     + _divider("IV TIMING")
                     + _iv_sell_context(iv_rank)
-                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — 75% trim)")
+                    + _divider(f"TRADE INSTRUCTION  ({n_trim}/{qty} contracts — {trim_pct}% trim)")
                     + _exit_order(n_trim)
                     + (f"  Keep remaining: {n_hold} contract{'s' if n_hold != 1 else ''} — trailing to 10x\n" if n_hold > 0 else "")
                 ),
@@ -1288,13 +1293,16 @@ def evaluate(position: dict, market: dict) -> list[Alert]:
                 ))
 
             if has_trim and not has_exit and pnl is not None:
-                # Match trim size to whichever profit level is active
+                # Match trim size to whichever profit level is active.
+                # When qty > 1, cap trim so at least 1 contract trails.
                 if "PROFIT_600" in posture_types or "PROFIT_900" in posture_types:
                     iv_n_trim = max(1, round(qty * 0.75))
                 elif "PROFIT_300" in posture_types:
                     iv_n_trim = max(1, round(qty * 0.50))
                 else:   # PROFIT_100
                     iv_n_trim = max(1, round(qty * 0.20))
+                if qty > 1:
+                    iv_n_trim = min(iv_n_trim, qty - 1)
                 iv_n_hold = qty - iv_n_trim
                 alerts.append(Alert(
                     type="IV_TRIM_NOW", severity="BLUE",

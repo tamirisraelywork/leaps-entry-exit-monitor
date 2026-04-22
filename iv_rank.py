@@ -112,8 +112,10 @@ def get_iv_rank_advanced(ticker: str, current_iv_pct: float | None = None) -> st
                         if atm and atm.get("implied_volatility"):
                             _iv = float(atm["implied_volatility"])
                             if _iv > 0:
-                                # marketdata.app returns IV as decimal (0.35 = 35%)
-                                current_iv_pct = _iv * 100 if _iv < 5 else _iv
+                                # marketdata.app always returns IV as decimal (0.35 = 35%).
+                                # Threshold < 2 covers up to 200% annualized — anything ≥ 2
+                                # is already a percentage (e.g. 35.0 from a different source).
+                                current_iv_pct = _iv * 100 if _iv < 2 else _iv
             except Exception:
                 pass
 
@@ -138,9 +140,13 @@ def get_iv_rank_advanced(ticker: str, current_iv_pct: float | None = None) -> st
                 return f"Success! The IV Rank for {ticker} is: {current_iv_pct:.1f}"
             return f"Could not find IV Rank for {ticker} after all attempts."
 
-        # If option chain was unavailable, use current realized vol as proxy
+        # If no real IV from any option chain, do not fabricate an IV Rank.
+        # Ranking realized vol against itself produces a number that looks like
+        # IV Rank but carries no information about option pricing. Returning
+        # failure here prevents spurious "cheap options" buy signals for tickers
+        # whose chains yfinance and marketdata.app both failed to return.
         if current_iv_pct is None or current_iv_pct <= 0:
-            current_iv_pct = float(rolling_vol.iloc[-1])
+            return f"Could not find IV Rank for {ticker} after all attempts."
 
         vol_min = float(rolling_vol.min())
         vol_max = float(rolling_vol.max())

@@ -170,6 +170,10 @@ def send_daily_summary(
         score       = mkt.get("thesis_score")
         entry_price = pos.get("entry_price")
 
+        # Fallback: if live BQ score unavailable use the stored score on the position row
+        if score is None:
+            score = pos.get("current_thesis_score") or pos.get("entry_thesis_score")
+
         # DTE fallback — compute from stored expiration_date if snapshot missing
         if dte is None:
             _exp = pos.get("expiration_date")
@@ -237,6 +241,10 @@ def send_daily_summary(
         rsi         = sig.get("rsi")
         pct_from_low = sig.get("pct_from_low")
         entry_alert = sig.get("entry_alert")
+
+        # Fallback: if live BQ score unavailable use the stored entry score on the position row
+        if score is None:
+            score = pos.get("entry_thesis_score") or pos.get("current_thesis_score")
 
         score_str  = f"Score {score}/100" if score    is not None else "Score N/A"
         ivr_str    = f"IVR {iv_rank:.0f}%" if iv_rank is not None else "IVR N/A"

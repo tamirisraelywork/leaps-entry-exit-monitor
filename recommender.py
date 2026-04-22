@@ -143,7 +143,7 @@ def recommend_options(ticker: str) -> dict:
 
         # Classify into role
         is_moonshot = (0.08 <= delta <= 0.28) and (30 <= move10 <= 120)
-        is_core     = (0.28 <= delta <= 0.58) and (20 <= move3  <= 80)
+        is_core     = (0.28 <  delta <= 0.58) and (20 <= move3  <= 80)
 
         if is_moonshot:
             c["role"]  = "MOONSHOT"

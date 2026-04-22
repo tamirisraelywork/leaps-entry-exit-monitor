@@ -277,7 +277,8 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
         mid  = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else None
 
         raw_iv = float(row.get("impliedVolatility") or 0)
-        iv = min(raw_iv, 2.0) if raw_iv > 0 else None
+        # Cap at 5.0 (500%) to reject yfinance placeholder garbage values; real IV rarely > 300%
+        iv = min(raw_iv, 5.0) if raw_iv > 0 else None
 
         # Step 3: stock price from cache for BS greeks
         greeks = {}
@@ -285,7 +286,8 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             S = _yf_get_price(ticker)
             if S and iv and iv > 0.01:
                 T = max((actual_expiry - date.today()).days, 1) / 365.0
-                greeks = _bs_greeks(float(S), float(strike), T, 0.045, iv, option_type)
+                # ~4.3% approximates 2-year US Treasury yield as of 2025
+                greeks = _bs_greeks(float(S), float(strike), T, 0.043, iv, option_type)
         except Exception:
             pass
 
@@ -310,7 +312,7 @@ def _snapshot_via_yfinance(ticker: str, expiry: date, strike: float, option_type
             "expiration_date":    actual_expiry,
             "dte":                (actual_expiry - date.today()).days,
             "strike":             float(row.get("strike", strike)),
-            "open_interest":      int(row.get("openInterest") or 0) or None,
+            "open_interest":      int(row.get("openInterest") or 0),
             "_source":            "yfinance+BS",
             "_mid_source":        mid_source,
             "_mid_is_live":       mid_is_live,
@@ -485,7 +487,7 @@ def _fetch_leaps_chain(ticker: str, min_dte: int) -> list[dict]:
                     delta = None
                     if S and iv:
                         T = max(dte, 1) / 365.0
-                        delta = _bs_delta(S, strike, T, 0.045, iv, "C")
+                        delta = _bs_delta(S, strike, T, 0.043, iv, "C")
 
                     contract = to_occ(ticker, expiry, "C", strike)
                     chain_out.append({
@@ -498,7 +500,7 @@ def _fetch_leaps_chain(ticker: str, min_dte: int) -> list[dict]:
                         "bid":                bid,
                         "ask":                ask,
                         "mid":                mid,
-                        "open_interest":      int(row.get("openInterest") or 0) or None,
+                        "open_interest":      int(row.get("openInterest") or 0),
                     })
             except Exception:
                 continue

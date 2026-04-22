@@ -278,7 +278,7 @@ def run_thesis_refresh():
     """
     logger.info("Running thesis refresh check…")
     try:
-        positions = db.get_positions(mode="ACTIVE")
+        positions = db.get_positions()   # ACTIVE + WATCHLIST both need fresh scores
     except Exception as e:
         logger.error(f"Thesis refresh: could not fetch positions: {e}")
         return

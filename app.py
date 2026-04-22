@@ -2544,13 +2544,20 @@ elif page == "📊 Dashboard":
                         except Exception:
                             pass
                         _entry = evaluate_entry(pos, _sd, _ivr)
+                        import datetime as _dt
                         st.session_state[sig_key] = {
-                            "price":      _sd.get("price"),
-                            "pfl":        _sd.get("pct_from_low"),
-                            "rsi":        _rsi,
-                            "iv_rank":    _ivr,
-                            "entry":      _entry,
-                            "entry_score": _entry.context.get("entry_score", 0) if _entry else 0,
+                            "price":            _sd.get("price"),
+                            "pfl":              _sd.get("pct_from_low"),
+                            "rsi":              _rsi,
+                            "iv_rank":          _ivr,
+                            "entry":            _entry,
+                            "entry_score":      _entry.context.get("entry_score", 0) if _entry else 0,
+                            "above_ma50":       _sd.get("above_ma50"),
+                            "above_ma200":      _sd.get("above_ma200"),
+                            "ma50_above_ma200": _sd.get("ma50_above_ma200"),
+                            "ma_50":            _sd.get("ma_50"),
+                            "ma_200":           _sd.get("ma_200"),
+                            "fetched_at":       _dt.datetime.now().strftime("%b %d %I:%M %p"),
                         }
                     except Exception as _e:
                         st.session_state[sig_key] = {"error": str(_e)}
@@ -2565,14 +2572,28 @@ elif page == "📊 Dashboard":
             sig = st.session_state.get(sig_key, {})
             rec = st.session_state.get(rec_key, {})
 
-            price   = sig.get("price")
-            pfl     = sig.get("pfl")
-            rsi     = sig.get("rsi")
-            iv_rank = sig.get("iv_rank")
-            entry   = sig.get("entry")
-            entry_score = sig.get("entry_score", 0)
+            price            = sig.get("price")
+            pfl              = sig.get("pfl")
+            rsi              = sig.get("rsi")
+            iv_rank          = sig.get("iv_rank")
+            entry            = sig.get("entry")
+            entry_score      = sig.get("entry_score", 0)
+            above_ma50       = sig.get("above_ma50")
+            above_ma200      = sig.get("above_ma200")
+            ma50_above_ma200 = sig.get("ma50_above_ma200")
+            ma_50            = sig.get("ma_50")
+            ma_200           = sig.get("ma_200")
+            fetched_at       = sig.get("fetched_at", "")
 
-            thesis_score = db.get_leaps_monitor_score(ticker)
+            thesis_score, thesis_age = db.get_leaps_monitor_score_with_age(ticker)
+            if thesis_age is None:
+                thesis_age_str = ""
+            elif thesis_age == 0:
+                thesis_age_str = " · scored today"
+            elif thesis_age <= 7:
+                thesis_age_str = f" · scored {thesis_age}d ago"
+            else:
+                thesis_age_str = f" · scored {thesis_age}d ago ⚠️"
 
             # Derive BUY/WAIT badge
             if entry and entry.severity == "GREEN":
@@ -2593,7 +2614,8 @@ elif page == "📊 Dashboard":
                 hc1, hc2, hc3, hc4, hc5 = st.columns([2, 2, 2, 3, 1])
                 hc1.metric("Ticker", ticker)
                 hc2.metric("Price",  f"${price:.2f}" if price else "N/A")
-                hc3.metric("Thesis", f"{thesis_score}/100" if thesis_score else "N/A")
+                thesis_label = f"{thesis_score}/100{thesis_age_str}" if thesis_score else "N/A"
+                hc3.metric("Thesis", thesis_label, help=f"Signals refreshed: {fetched_at}" if fetched_at else None)
                 hc4.markdown(
                     f"<div style='padding-top:6px'>"
                     f"<span style='font-size:1.15em;font-weight:700;color:{badge_color}'>{action_badge}</span>"
@@ -2610,50 +2632,199 @@ elif page == "📊 Dashboard":
                 sc1, sc2 = st.columns(2)
 
                 with sc1:
-                    st.markdown("**Entry Signals**")
-                    # RSI
-                    if rsi is not None:
-                        if rsi < 30:
-                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** 🔥 Oversold — strong buy")
-                        elif rsi < 40:
-                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** ⚠️ Approaching oversold")
-                        elif rsi > 70:
-                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** ⛔ Overbought — wait")
-                        else:
-                            st.markdown(f"📊 Weekly RSI: **{rsi:.0f}** (neutral)")
-                    else:
-                        st.markdown("📊 Weekly RSI: N/A")
+                    # ── Entry Checklist ─────────────────────────────────────
+                    # Each row: badge | criterion | value+zone | what's needed
+                    # Two groups: TIMING (affects entry score) and CONTRACT QUALITY
 
-                    # IV Rank
-                    if iv_rank is not None:
-                        if iv_rank < 20:
-                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ⭐ Options very cheap — great time to buy")
-                        elif iv_rank < 30:
-                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ✅ Options cheap")
-                        elif iv_rank < 50:
-                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** (neutral)")
-                        else:
-                            st.markdown(f"📉 IV Rank: **{iv_rank:.0f}%** ⚠️ Options expensive — reduces entry quality")
-                    else:
-                        st.markdown("📉 IV Rank: N/A")
+                    def _ck_row(badge, label, val_str, note):
+                        """Render one checklist row as an HTML table row."""
+                        badge_colors = {"🟢": "#16a34a", "✅": "#16a34a", "⏳": "#d97706",
+                                        "❌": "#6b7280", "⚠️": "#dc2626"}
+                        c = badge_colors.get(badge, "#6b7280")
+                        return (
+                            f"<tr style='border-bottom:1px solid #f3f4f6'>"
+                            f"<td style='padding:5px 6px;font-size:1.1em;width:28px'>{badge}</td>"
+                            f"<td style='padding:5px 4px;font-size:0.82em;color:#6b7280;white-space:nowrap'>{label}</td>"
+                            f"<td style='padding:5px 4px;font-size:0.88em;font-weight:600;color:{c}'>{val_str}</td>"
+                            f"<td style='padding:5px 4px;font-size:0.78em;color:#9ca3af'>{note}</td>"
+                            f"</tr>"
+                        )
 
-                    # 52-week position — Phase 2 entry timing trigger
-                    # Thresholds calibrated from 46K sample backtest (r=-0.117 to -0.245)
+                    timing_rows = ""
+                    blockers = []
+
+                    # ── 1. 52wk Position ──────────────────────────────────
                     if pfl is not None:
                         if pfl <= 0.10:
-                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** 🔥 NEAR ANNUAL LOW — buy zone ★")
+                            b, vstr, note = "🟢", f"{pfl:.2f} — near annual low ★", "Best zone"
                         elif pfl <= 0.25:
-                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ✅ BUY ZONE (bottom quarter)")
-                        elif pfl <= 0.50:
-                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** 🟡 WAIT — mid-range, watch for pullback")
+                            b, vstr, note = "✅", f"{pfl:.2f} — buy zone", "Bottom quarter"
+                        elif pfl <= 0.40:
+                            b, vstr, note = "⏳", f"{pfl:.2f} — approaching", "Need ≤ 0.25"
+                            blockers.append(f"52wk pullback to ≤0.25 (now {pfl:.2f})")
                         elif pfl <= 0.75:
-                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ⚠️ Upper range — wait for pullback")
+                            b, vstr, note = "❌", f"{pfl:.2f} — mid/upper range", "Wait for pullback"
+                            blockers.append(f"52wk pullback to ≤0.25 (now {pfl:.2f})")
                         else:
-                            st.markdown(f"📍 52wk Position: **{pfl:.2f}** ⛔ NEAR 52WK HIGH — hold off")
+                            b, vstr, note = "⚠️", f"{pfl:.2f} — near 52wk high", "Avoid entry now"
+                            blockers.append(f"52wk pullback (now {pfl:.2f} — near high)")
                     else:
-                        st.markdown("📍 52wk Position: N/A")
+                        b, vstr, note = "❌", "N/A", "Data unavailable"
+                    timing_rows += _ck_row(b, "📍 52wk Position", vstr, note)
 
-                    # Entry score bar
+                    # ── 2. IV Rank ─────────────────────────────────────────
+                    if iv_rank is not None:
+                        if iv_rank < 20:
+                            b, vstr, note = "🟢", f"{iv_rank:.0f}% — floor level ★", "Options very cheap"
+                        elif iv_rank < 30:
+                            b, vstr, note = "✅", f"{iv_rank:.0f}% — cheap", "Good entry pricing"
+                        elif iv_rank < 40:
+                            b, vstr, note = "⏳", f"{iv_rank:.0f}% — approaching", "Need < 30%"
+                            blockers.append(f"IV below 30% (now {iv_rank:.0f}%)")
+                        elif iv_rank < 60:
+                            b, vstr, note = "❌", f"{iv_rank:.0f}% — expensive", "Wait for IV drop"
+                            blockers.append(f"IV below 30% (now {iv_rank:.0f}%)")
+                        else:
+                            b, vstr, note = "⚠️", f"{iv_rank:.0f}% — very expensive", "High IV crush risk"
+                            blockers.append(f"IV well below 60% (now {iv_rank:.0f}% — avoid)")
+                    else:
+                        b, vstr, note = "❌", "N/A", "Data unavailable"
+                    timing_rows += _ck_row(b, "📉 IV Rank", vstr, note)
+
+                    # ── 3. Weekly RSI ──────────────────────────────────────
+                    if rsi is not None:
+                        if rsi < 30:
+                            b, vstr, note = "🟢", f"{rsi:.0f} — oversold ★", "Strong reversal signal"
+                        elif rsi < 40:
+                            b, vstr, note = "✅", f"{rsi:.0f} — approaching oversold", "Good momentum setup"
+                        elif rsi < 50:
+                            b, vstr, note = "⏳", f"{rsi:.0f} — neutral", "Need < 40"
+                            blockers.append(f"RSI below 40 (now {rsi:.0f})")
+                        elif rsi < 70:
+                            b, vstr, note = "❌", f"{rsi:.0f} — overbought territory", "Wait for pullback"
+                            blockers.append(f"RSI below 50 (now {rsi:.0f} — elevated)")
+                        else:
+                            b, vstr, note = "⚠️", f"{rsi:.0f} — overbought", "Strong wait signal"
+                            blockers.append(f"RSI below 70 (now {rsi:.0f} — overbought)")
+                    else:
+                        b, vstr, note = "❌", "N/A", "Data unavailable"
+                    timing_rows += _ck_row(b, "📊 Weekly RSI", vstr, note)
+
+                    # ── 4. MA Structure ────────────────────────────────────
+                    if above_ma50 is not None:
+                        ma50_str  = f"${ma_50:.2f}"  if ma_50  else "MA50"
+                        ma200_str = f"${ma_200:.2f}" if ma_200 else "MA200"
+                        if above_ma50 and above_ma200 and ma50_above_ma200:
+                            b, vstr, note = "🟢", f"Above {ma50_str} & {ma200_str} ★", "Clean uptrend"
+                        elif above_ma50 and not above_ma200:
+                            b, vstr, note = "✅", f"Above {ma50_str}, below {ma200_str}", "Early recovery"
+                        elif not above_ma50 and rsi is not None and rsi < 35:
+                            b, vstr, note = "⏳", f"Below {ma50_str} (oversold)", "Capitulation zone"
+                        else:
+                            b, vstr, note = "❌", f"Below {ma50_str} & {ma200_str}", "Wait for MA50 reclaim"
+                            blockers.append(f"Price above MA50 ({ma50_str})")
+                    else:
+                        b, vstr, note = "❌", "N/A", "Data unavailable"
+                    timing_rows += _ck_row(b, "📈 Trend (MA)", vstr, note)
+
+                    # ── 5. Earnings Proximity ──────────────────────────────
+                    _estate = _earnings_state_from_pos(pos)
+                    _ed_raw = pos.get("earnings_date")
+                    if _ed_raw:
+                        try:
+                            _ed_d = _ed_raw if hasattr(_ed_raw, "toordinal") else date.fromisoformat(str(_ed_raw))
+                            _days_to_e = (_ed_d - date.today()).days
+                        except Exception:
+                            _days_to_e = None
+                    else:
+                        _days_to_e = None
+
+                    if _estate in ("day_of", "week_of"):
+                        b, vstr, note = "⚠️", f"In {_days_to_e}d — avoid entry", "IV crush after earnings"
+                        blockers.insert(0, f"Wait for earnings to pass ({_days_to_e}d away)")
+                    elif _estate == "imminent":
+                        b, vstr, note = "⏳", f"In {_days_to_e}d — caution", "Watch IV crush risk"
+                        blockers.append(f"Earnings in {_days_to_e}d — watch IV")
+                    elif _estate == "upcoming" and _days_to_e is not None:
+                        b, vstr, note = "✅", f"In {_days_to_e}d", "Clear window"
+                    elif _estate == "post":
+                        b, vstr, note = "✅", "Post-earnings", "IV crush already passed"
+                    else:
+                        b, vstr, note = "✅", "No date / far out", "Clear"
+                    timing_rows += _ck_row(b, "📅 Earnings", vstr, note)
+
+                    # ── Contract quality rows ──────────────────────────────
+                    contracts_list = rec.get("contracts", [])
+                    top_c = contracts_list[0] if contracts_list else {}
+                    contract_rows = ""
+
+                    _dte = top_c.get("dte")
+                    if _dte is not None:
+                        if _dte >= 720:
+                            b, vstr, note = "🟢", f"{_dte}d (~{_dte//30}mo) ★", "24+ months"
+                        elif _dte >= 540:
+                            b, vstr, note = "✅", f"{_dte}d (~{_dte//30}mo)", "18+ months"
+                        elif _dte >= 365:
+                            b, vstr, note = "⏳", f"{_dte}d (~{_dte//30}mo)", "Short for thesis"
+                        else:
+                            b, vstr, note = "❌", f"{_dte}d — too short", "Need ≥ 540d"
+                    else:
+                        b, vstr, note = "❌", "N/A", "No contract found"
+                    contract_rows += _ck_row(b, "⏰ DTE", vstr, note)
+
+                    _delta = top_c.get("delta")
+                    if _delta is not None:
+                        _dabs = abs(float(_delta))
+                        if 0.15 <= _dabs <= 0.35:
+                            b, vstr, note = "🟢", f"Δ {_dabs:.2f} ★", "Sweet spot (asymmetric)"
+                        elif 0.10 <= _dabs < 0.15 or 0.35 < _dabs <= 0.50:
+                            b, vstr, note = "✅", f"Δ {_dabs:.2f}", "Acceptable range"
+                        elif _dabs < 0.10:
+                            b, vstr, note = "⚠️", f"Δ {_dabs:.2f} — very deep OTM", "High risk/reward"
+                        else:
+                            b, vstr, note = "⏳", f"Δ {_dabs:.2f} — near money", "Less leverage"
+                    else:
+                        b, vstr, note = "❌", "N/A", "No contract found"
+                    contract_rows += _ck_row(b, "Δ Delta", vstr, note)
+
+                    _oi = top_c.get("open_interest")
+                    if _oi is not None:
+                        _oi_int = int(_oi)
+                        if _oi_int >= 1000:
+                            b, vstr, note = "🟢", f"{_oi_int:,} ★", "Highly liquid"
+                        elif _oi_int >= 500:
+                            b, vstr, note = "✅", f"{_oi_int:,}", "Liquid"
+                        elif _oi_int >= 200:
+                            b, vstr, note = "⏳", f"{_oi_int:,} — thin", "Use limit orders"
+                        else:
+                            b, vstr, note = "⚠️", f"{_oi_int:,} — illiquid", "Spread risk"
+                    else:
+                        b, vstr, note = "❌", "N/A", "No contract found"
+                    contract_rows += _ck_row(b, "📊 Open Interest", vstr, note)
+
+                    # ── Render checklist ───────────────────────────────────
+                    table_style = "width:100%;border-collapse:collapse;margin-bottom:6px"
+                    st.markdown(
+                        f"<div style='font-size:0.78em;font-weight:700;color:#6b7280;letter-spacing:.05em;margin-bottom:2px'>TIMING</div>"
+                        f"<table style='{table_style}'>{timing_rows}</table>"
+                        f"<div style='font-size:0.78em;font-weight:700;color:#6b7280;letter-spacing:.05em;margin:8px 0 2px'>CONTRACT</div>"
+                        f"<table style='{table_style}'>{contract_rows}</table>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # ── "Waiting for" summary ──────────────────────────────
+                    if entry_score >= 60:
+                        st.success("All timing conditions met — ready to buy", icon="🟢")
+                    elif iv_rank is not None and iv_rank < 20 and entry_score < 40:
+                        st.info("⭐ IV at floor — options very cheap; consider small entry even if waiting on other signals")
+                    elif blockers:
+                        st.markdown(
+                            f"<div style='font-size:0.85em;color:#d97706;margin-top:4px'>"
+                            f"⏳ <b>Waiting for:</b> {' · '.join(blockers)}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # ── Entry score bar ────────────────────────────────────
                     bar_val = min(entry_score, 100)
                     bar_color = "#16a34a" if bar_val >= 60 else "#f59e0b" if bar_val >= 40 else "#6b7280"
                     st.markdown(
@@ -3718,13 +3889,60 @@ elif page == "⚙️ Settings":
     # ── Position Manager email ─────────────────────────────────────────────────
     st.subheader("📧 Position Manager Alerts (Exit / Entry)")
     from shared.config import cfg as _cfg
-    _sender    = _cfg("GMAIL_SENDER") or _cfg("ALERT_EMAIL_FROM") or "not configured"
-    _recipient = _cfg("ALERT_RECIPIENT_EMAIL") or _sender
-    if _sender != "not configured":
-        st.info(f"Alerts sent from **{_sender}** to **{_recipient}**  \n"
-                f"Change via Streamlit Cloud → App settings → Secrets.")
-    else:
-        st.warning("Gmail not configured. Add **GMAIL_SENDER** and **GMAIL_APP_PASSWORD** to Streamlit Cloud secrets.")
+
+    # ── Diagnostic grid: credentials | monitor process | last email ───────────
+    _diag_c1, _diag_c2, _diag_c3 = st.columns(3)
+
+    with _diag_c1:
+        st.markdown("**Credentials**")
+        _sender    = _cfg("GMAIL_SENDER") or _cfg("ALERT_EMAIL_FROM") or ""
+        _password  = _cfg("GMAIL_APP_PASSWORD") or _cfg("ALERT_EMAIL_PASS") or ""
+        _recipient = _cfg("ALERT_RECIPIENT_EMAIL") or _sender or ""
+        st.markdown(f"{'✅' if _sender    else '❌'} **GMAIL_SENDER** {('— ' + _sender) if _sender else '— missing'}")
+        st.markdown(f"{'✅' if _password  else '❌'} **GMAIL_APP_PASSWORD** {'— configured' if _password else '— missing ⚠️'}")
+        st.markdown(f"{'✅' if _recipient else '❌'} **ALERT_RECIPIENT_EMAIL** {('— ' + _recipient) if _recipient else '— missing'}")
+        if not _sender or not _password:
+            st.caption("Add missing secrets to `.streamlit/secrets.toml`")
+
+    with _diag_c2:
+        st.markdown("**Monitor Process**")
+        try:
+            import psutil as _psutil
+            _pid_file = os.path.join(os.path.dirname(__file__), "monitor.pid")
+            if os.path.exists(_pid_file):
+                _pid = int(open(_pid_file).read().strip())
+                if _psutil.pid_exists(_pid):
+                    st.markdown(f"✅ **Running** (PID {_pid})")
+                    st.caption("Daily emails + alerts active")
+                else:
+                    st.markdown(f"❌ **Not running** (stale PID {_pid})")
+                    st.caption("`bash scripts/start_monitor.sh --daemon`")
+            else:
+                st.markdown("❌ **Not started**")
+                st.caption("`bash scripts/start_monitor.sh --daemon`")
+        except Exception:
+            st.markdown("⚠️ Status unknown")
+
+    with _diag_c3:
+        st.markdown("**Last Email Sent**")
+        try:
+            _bq = db.get_client()
+            _last_email = _bq.query(
+                f"SELECT MAX(created_at) AS ts "
+                f"FROM `{_bq.project}.leaps_exit_agent.alerts` "
+                f"WHERE email_sent = TRUE"
+            ).result()
+            _last_ts = next(iter(_last_email), None)
+            if _last_ts and _last_ts["ts"]:
+                import pytz as _pytz
+                _et = _pytz.timezone("America/New_York")
+                _ts_et = _last_ts["ts"].astimezone(_et)
+                st.markdown(f"✅ {_ts_et.strftime('%b %d, %Y %I:%M %p')} ET")
+            else:
+                st.markdown("⚠️ No emails sent yet")
+                st.caption("Run monitor or click 'Send Daily Summary Now'")
+        except Exception:
+            st.markdown("⚠️ Unable to query")
 
     _email_btn_c1, _email_btn_c2 = st.columns(2)
     if _email_btn_c1.button("✉️ Send Test Email", key="send_test_email_monitor"):

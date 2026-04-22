@@ -2541,6 +2541,8 @@ elif page == "📊 Dashboard":
                                 import re as _re
                                 _m = _re.search(r"([\d.]+)", _ivr_raw.split("is:")[-1])
                                 _ivr = float(_m.group(1)) if _m else None
+                                if _ivr is not None and _ivr < 1:
+                                    _ivr = None  # 0% IV rank = yfinance data gap, not real floor
                         except Exception:
                             pass
                         _entry = evaluate_entry(pos, _sd, _ivr)
@@ -2596,14 +2598,20 @@ elif page == "📊 Dashboard":
                 thesis_age_str = f" · scored {thesis_age}d ago ⚠️"
 
             # Derive BUY/WAIT badge
-            if entry and entry.severity == "GREEN":
+            # Differentiate ENTRY_SIGNAL (score ≥60, all criteria met) from
+            # IV_ENTRY_OPTIMAL (IV floor special case, score may still be low)
+            _entry_type = entry.type if entry else ""
+            if entry and entry.severity == "GREEN" and entry_score >= 60:
                 action_badge = "🟢 BUY NOW"
                 badge_color  = "green"
+            elif entry and entry.severity == "GREEN" and "IV" in _entry_type:
+                action_badge = "⭐ IV FLOOR — WATCH"
+                badge_color  = "#b45309"  # amber-brown
             elif entry and entry.severity == "AMBER":
                 action_badge = "🟡 ENTRY IMPROVING"
                 badge_color  = "orange"
             elif entry:
-                action_badge = "🔵 LOW IV — CONSIDER ENTRY"
+                action_badge = "🔵 LOW IV"
                 badge_color  = "blue"
             else:
                 action_badge = "⚪ WAIT"
@@ -2711,7 +2719,8 @@ elif page == "📊 Dashboard":
                     timing_rows += _ck_row(b, "📊 Weekly RSI", vstr, note)
 
                     # ── 4. MA Structure ────────────────────────────────────
-                    if above_ma50 is not None:
+                    _ma_in_cache = "above_ma50" in sig  # key present = cache is fresh
+                    if _ma_in_cache and above_ma50 is not None:
                         ma50_str  = f"${ma_50:.2f}"  if ma_50  else "MA50"
                         ma200_str = f"${ma_200:.2f}" if ma_200 else "MA200"
                         if above_ma50 and above_ma200 and ma50_above_ma200:
@@ -2723,8 +2732,10 @@ elif page == "📊 Dashboard":
                         else:
                             b, vstr, note = "❌", f"Below {ma50_str} & {ma200_str}", "Wait for MA50 reclaim"
                             blockers.append(f"Price above MA50 ({ma50_str})")
+                    elif not _ma_in_cache:
+                        b, vstr, note = "⏳", "Stale cache", "Click 🔄 Refresh All Signals"
                     else:
-                        b, vstr, note = "❌", "N/A", "Data unavailable"
+                        b, vstr, note = "⏳", "Insufficient price history", "Ticker may be too new"
                     timing_rows += _ck_row(b, "📈 Trend (MA)", vstr, note)
 
                     # ── 5. Earnings Proximity ──────────────────────────────
@@ -2757,50 +2768,59 @@ elif page == "📊 Dashboard":
                     contracts_list = rec.get("contracts", [])
                     top_c = contracts_list[0] if contracts_list else {}
                     contract_rows = ""
+                    _no_contracts = not top_c
 
-                    _dte = top_c.get("dte")
-                    if _dte is not None:
-                        if _dte >= 720:
-                            b, vstr, note = "🟢", f"{_dte}d (~{_dte//30}mo) ★", "24+ months"
-                        elif _dte >= 540:
-                            b, vstr, note = "✅", f"{_dte}d (~{_dte//30}mo)", "18+ months"
-                        elif _dte >= 365:
-                            b, vstr, note = "⏳", f"{_dte}d (~{_dte//30}mo)", "Short for thesis"
-                        else:
-                            b, vstr, note = "❌", f"{_dte}d — too short", "Need ≥ 540d"
+                    if _no_contracts:
+                        # No qualifying LEAPS contracts found — show single info row
+                        _rec_err = rec.get("error", "No liquid LEAPS found in target OTM range")
+                        contract_rows = (
+                            f"<tr><td colspan='4' style='padding:6px 4px;font-size:0.82em;color:#9ca3af'>"
+                            f"⚠️ {_rec_err}</td></tr>"
+                        )
                     else:
-                        b, vstr, note = "❌", "N/A", "No contract found"
-                    contract_rows += _ck_row(b, "⏰ DTE", vstr, note)
+                        _dte = top_c.get("dte")
+                        if _dte is not None:
+                            if _dte >= 720:
+                                b, vstr, note = "🟢", f"{_dte}d (~{_dte//30}mo) ★", "24+ months"
+                            elif _dte >= 540:
+                                b, vstr, note = "✅", f"{_dte}d (~{_dte//30}mo)", "18+ months"
+                            elif _dte >= 365:
+                                b, vstr, note = "⏳", f"{_dte}d (~{_dte//30}mo)", "Short for thesis"
+                            else:
+                                b, vstr, note = "❌", f"{_dte}d — too short", "Need ≥ 540d"
+                        else:
+                            b, vstr, note = "⏳", "Fetching…", ""
+                        contract_rows += _ck_row(b, "⏰ DTE", vstr, note)
 
-                    _delta = top_c.get("delta")
-                    if _delta is not None:
-                        _dabs = abs(float(_delta))
-                        if 0.15 <= _dabs <= 0.35:
-                            b, vstr, note = "🟢", f"Δ {_dabs:.2f} ★", "Sweet spot (asymmetric)"
-                        elif 0.10 <= _dabs < 0.15 or 0.35 < _dabs <= 0.50:
-                            b, vstr, note = "✅", f"Δ {_dabs:.2f}", "Acceptable range"
-                        elif _dabs < 0.10:
-                            b, vstr, note = "⚠️", f"Δ {_dabs:.2f} — very deep OTM", "High risk/reward"
+                        _delta = top_c.get("delta")
+                        if _delta is not None:
+                            _dabs = abs(float(_delta))
+                            if 0.15 <= _dabs <= 0.35:
+                                b, vstr, note = "🟢", f"Δ {_dabs:.2f} ★", "Sweet spot (asymmetric)"
+                            elif 0.10 <= _dabs < 0.15 or 0.35 < _dabs <= 0.50:
+                                b, vstr, note = "✅", f"Δ {_dabs:.2f}", "Acceptable range"
+                            elif _dabs < 0.10:
+                                b, vstr, note = "⚠️", f"Δ {_dabs:.2f} — very deep OTM", "High risk/reward"
+                            else:
+                                b, vstr, note = "⏳", f"Δ {_dabs:.2f} — near money", "Less leverage"
                         else:
-                            b, vstr, note = "⏳", f"Δ {_dabs:.2f} — near money", "Less leverage"
-                    else:
-                        b, vstr, note = "❌", "N/A", "No contract found"
-                    contract_rows += _ck_row(b, "Δ Delta", vstr, note)
+                            b, vstr, note = "⏳", "Fetching…", ""
+                        contract_rows += _ck_row(b, "Δ Delta", vstr, note)
 
-                    _oi = top_c.get("open_interest")
-                    if _oi is not None:
-                        _oi_int = int(_oi)
-                        if _oi_int >= 1000:
-                            b, vstr, note = "🟢", f"{_oi_int:,} ★", "Highly liquid"
-                        elif _oi_int >= 500:
-                            b, vstr, note = "✅", f"{_oi_int:,}", "Liquid"
-                        elif _oi_int >= 200:
-                            b, vstr, note = "⏳", f"{_oi_int:,} — thin", "Use limit orders"
+                        _oi = top_c.get("open_interest")
+                        if _oi is not None:
+                            _oi_int = int(_oi)
+                            if _oi_int >= 1000:
+                                b, vstr, note = "🟢", f"{_oi_int:,} ★", "Highly liquid"
+                            elif _oi_int >= 500:
+                                b, vstr, note = "✅", f"{_oi_int:,}", "Liquid"
+                            elif _oi_int >= 200:
+                                b, vstr, note = "⏳", f"{_oi_int:,} — thin", "Use limit orders"
+                            else:
+                                b, vstr, note = "⚠️", f"{_oi_int:,} — illiquid", "Spread risk"
                         else:
-                            b, vstr, note = "⚠️", f"{_oi_int:,} — illiquid", "Spread risk"
-                    else:
-                        b, vstr, note = "❌", "N/A", "No contract found"
-                    contract_rows += _ck_row(b, "📊 Open Interest", vstr, note)
+                            b, vstr, note = "⏳", "Fetching…", ""
+                        contract_rows += _ck_row(b, "📊 Open Interest", vstr, note)
 
                     # ── Render checklist ───────────────────────────────────
                     table_style = "width:100%;border-collapse:collapse;margin-bottom:6px"

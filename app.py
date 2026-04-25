@@ -85,49 +85,61 @@ _POSTURE_LABEL = {"RED": "EXIT / STOP", "BLUE": "ROLL", "AMBER": "WATCH", "GREEN
 _POSTURE_EMOJI = {"RED": "🔴", "BLUE": "🔵", "AMBER": "⚠️", "GREEN": "🟢"}
 
 
+@st.cache_data(ttl=3600)
+def _get_vol_range_cached(ticker: str) -> tuple[float, float] | None:
+    """
+    Fetch 1-year rolling 30-day realized vol min/max for a ticker.
+    Cached 1 hour — this range barely changes day-to-day and is the most
+    expensive part of IV rank computation (full yfinance history download).
+    Separating it from the per-IV ranking call means we only download once
+    per hour instead of once per page load.
+    """
+    import yfinance as yf
+    import math as _math
+    try:
+        hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+        if hist is None or hist.empty or len(hist) < 31:
+            return None
+        rolling = (
+            hist["Close"].pct_change().dropna()
+            .rolling(30).std().dropna()
+            * _math.sqrt(252) * 100
+        )
+        if rolling.empty:
+            return None
+        return float(rolling.min()), float(rolling.max())
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300)
 def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> float | None:
     """
     IV Rank cached 5 min.
 
-    Fast path (current_iv_pct known): rank the given IV directly against the
-    1-year rolling realized-vol range — one price-history call, no option chain.
+    Fast path (current_iv_pct known): rank against the cached vol range
+    (_get_vol_range_cached, 1h TTL) — zero extra API calls.
 
-    Slow path (no IV): delegate to iv_rank module which tries the option chain
-    first then falls back to realized-vol percentile.
-
-    Last-resort fallback: inline realized-vol percentile from price history only.
+    Slow path (no IV from snapshot): delegate to iv_rank module which fetches
+    the option chain to get real ATM implied vol, then ranks it.
     """
-    import yfinance as yf
-    import math as _math
+    def _rank_against_range(iv_pct: float) -> float | None:
+        """Rank iv_pct vs cached 1-year realized-vol range. O(1) — no API call."""
+        vol_range = _get_vol_range_cached(ticker)
+        if vol_range is None:
+            return None
+        vmin, vmax = vol_range
+        if vmax > vmin:
+            return round(max(0.0, min(100.0, (iv_pct - vmin) / (vmax - vmin) * 100)), 1)
+        return 50.0   # flat vol environment — neutral rank
 
-    def _hist_rank(iv_pct: float) -> float | None:
-        """Rank iv_pct vs 1-year rolling realized-vol range. Returns 0-100 or None."""
-        try:
-            hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
-            if hist is None or hist.empty or len(hist) < 31:
-                return round(iv_pct, 1)   # no history — return raw IV as rank
-            rolling = (
-                hist["Close"].pct_change().dropna()
-                .rolling(30).std().dropna()
-                * _math.sqrt(252) * 100
-            )
-            if rolling.empty:
-                return round(iv_pct, 1)
-            vmin, vmax = float(rolling.min()), float(rolling.max())
-            if vmax > vmin:
-                return round(max(0.0, min(100.0, (iv_pct - vmin) / (vmax - vmin) * 100)), 1)
-            return 50.0   # flat vol — neutral
-        except Exception:
-            return round(iv_pct, 1)   # absolute fallback: return IV itself as rank
-
-    # ── Fast path: we already have IV from the option snapshot ───────────────
+    # ── Fast path: snapshot already has ATM IV ────────────────────────────────
     if current_iv_pct and current_iv_pct > 0:
-        result = _hist_rank(current_iv_pct)
+        result = _rank_against_range(current_iv_pct)
         if result is not None:
             return result
 
-    # ── Slow path: no IV — try iv_rank module (option chain + history) ───────
+    # ── Slow path: no IV — try iv_rank module (fetches option chain) ─────────
     try:
         from iv_rank import get_iv_rank_advanced
         result = get_iv_rank_advanced(ticker, current_iv_pct=current_iv_pct)
@@ -136,24 +148,6 @@ def _get_iv_rank_cached(ticker: str, current_iv_pct: float | None = None) -> flo
             val = float(m.group(1)) if m else None
             if val is not None:
                 return val
-    except Exception:
-        pass
-
-    # ── Last resort: realized-vol percentile — no options needed ─────────────
-    try:
-        hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
-        if hist is not None and not hist.empty and len(hist) >= 31:
-            rolling = (
-                hist["Close"].pct_change().dropna()
-                .rolling(30).std().dropna()
-                * _math.sqrt(252) * 100
-            )
-            if len(rolling) >= 2:
-                cur  = float(rolling.iloc[-1])
-                vmin = float(rolling.min())
-                vmax = float(rolling.max())
-                if vmax > vmin:
-                    return round(max(0.0, min(100.0, (cur - vmin) / (vmax - vmin) * 100)), 1)
     except Exception:
         pass
 
@@ -332,7 +326,11 @@ def _prefetch_active_data(active: list[dict], force_check: bool = False) -> dict
                     snap = raw
 
         iv_pct   = (snap.get("implied_volatility") or 0) * 100 or None
-        iv_rank  = _get_iv_rank_cached(ticker, iv_pct)     # @st.cache_data — thread-safe
+        # Round iv_pct to nearest 5% before caching — prevents float noise (35.21 vs 35.22)
+        # from creating a new cache key and triggering a redundant yfinance history download
+        # on every page load. IV rank resolution of 5% is more than sufficient.
+        _iv_key  = round(iv_pct / 5) * 5 if iv_pct else None
+        iv_rank  = _get_iv_rank_cached(ticker, _iv_key)     # @st.cache_data — thread-safe
         earnings = _get_earnings_data_cached(ticker)        # @st.cache_data — thread-safe
 
         return pos_id, contract, snap, iv_rank, earnings
@@ -1855,9 +1853,21 @@ elif page == "📊 Dashboard":
         st.subheader("Active Positions")
 
         # Pre-fetch ALL market data in parallel before rendering any card.
-        # This is the key performance win: N positions in ~T seconds instead of N×T.
-        with st.spinner("Loading live market data…"):
-            _prefetched = _prefetch_active_data(active, force_check=force_check)
+        # Session-state TTL (5 min) prevents re-fetching on every Streamlit rerun
+        # (widget click, page scroll, etc.) — only re-fetch when stale or forced.
+        import time as _pf_t
+        _pf_cache_key = "_prefetch_result"
+        _pf_ts_key    = "_prefetch_ts"
+        _pf_age = _pf_t.time() - st.session_state.get(_pf_ts_key, 0)
+        _pf_stale = _pf_age > 300   # 5-minute TTL matches @st.cache_data(ttl=300)
+
+        if force_check or _pf_stale or _pf_cache_key not in st.session_state:
+            with st.spinner("Loading live market data…"):
+                _prefetched = _prefetch_active_data(active, force_check=force_check)
+            st.session_state[_pf_cache_key] = _prefetched
+            st.session_state[_pf_ts_key]    = _pf_t.time()
+        else:
+            _prefetched = st.session_state[_pf_cache_key]
 
         # ── Unrealized P&L summary (needs live prices from prefetch) ──────────
         _strip_unrealized = 0.0

@@ -460,21 +460,23 @@ def _ticker_table_name(ticker: str) -> str:
     return ticker.strip().upper().replace("-", "_").replace(".", "_")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_eval_master_data() -> pd.DataFrame:
+    """Cached 30 min — historical analysis data changes only when a new analysis is saved."""
     try:
         client = db.get_client()
         path = _eval_table_path(client, "master_table")
         return client.query(
-            f"SELECT Ticker, date, Score, Verdict FROM `{path}`"
+            f"SELECT Ticker, date, Score, Verdict FROM `{path}` ORDER BY date DESC"
         ).to_dataframe()
     except Exception as e:
         logger.error(f"master_table read error: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
+    """Cached 30 min — per-ticker analysis rows don't change between analysis runs."""
     try:
         client = db.get_client()
         path = _eval_table_path(client, _ticker_table_name(ticker))
@@ -540,6 +542,9 @@ def save_eval_analysis(ticker: str, table_rows: list, sws_data: dict, llm_data: 
             f"INSERT INTO `{master_path}` (Ticker, Score, Verdict, date) VALUES (@ticker,@score,@verdict,@date)"
         )
         client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        # Bust the 30-min caches so the list and detail view reflect the new analysis immediately
+        get_eval_master_data.clear()
+        get_eval_ticker_detail.clear()
         return True, None
 
     except Exception as e:
@@ -1200,7 +1205,8 @@ elif page == "📋 Past Analyses":
     if st.session_state.past_view == "history":
         st.title("Past Analyses")
 
-        master_df = get_eval_master_data()
+        with st.spinner("Loading analyses…"):
+            master_df = get_eval_master_data()
 
         if master_df.empty:
             st.info("No analyses yet. Run a **New Analysis** to get started.")
@@ -1432,8 +1438,8 @@ elif page == "📋 Past Analyses":
             st.session_state.past_selected = None
             st.rerun()
 
-        # Load current position state for this ticker
-        existing_pos     = db.get_positions()
+        # Load current position state for this ticker (use session cache — avoids BQ on every rerun)
+        existing_pos     = _get_positions_cached()
         existing_by_mode = {p.get("ticker","").upper(): p for p in existing_pos}
         cur_pos          = existing_by_mode.get(ticker)
         cur_mode         = cur_pos.get("mode") if cur_pos else None

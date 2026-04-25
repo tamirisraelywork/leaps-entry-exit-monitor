@@ -460,9 +460,9 @@ def _ticker_table_name(ticker: str) -> str:
     return ticker.strip().upper().replace("-", "_").replace(".", "_")
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=None, show_spinner=False)
 def get_eval_master_data() -> pd.DataFrame:
-    """Cached 30 min — historical analysis data changes only when a new analysis is saved."""
+    """Cached indefinitely — only invalidated by save_eval_analysis() / delete_eval_ticker()."""
     try:
         client = db.get_client()
         path = _eval_table_path(client, "master_table")
@@ -474,9 +474,9 @@ def get_eval_master_data() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=None, show_spinner=False)
 def get_eval_ticker_detail(ticker: str) -> pd.DataFrame:
-    """Cached 30 min — per-ticker analysis rows don't change between analysis runs."""
+    """Cached indefinitely — only invalidated by save_eval_analysis() / delete_eval_ticker()."""
     try:
         client = db.get_client()
         path = _eval_table_path(client, _ticker_table_name(ticker))
